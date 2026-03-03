@@ -220,7 +220,7 @@ impl App {
     pub fn new(goal: String) -> Self {
         Self {
             phase: Phase::Idle,
-            active_agent: AgentSource::Worker,
+            active_agent: AgentSource::Reviewer,
             worker_stream: VecDeque::new(),
             reviewer_stream: VecDeque::new(),
             agent_scroll: 0,
@@ -255,10 +255,16 @@ impl App {
 
     /// Toggle which agent is displayed in the main pane.
     pub fn toggle_agent(&mut self) {
-        self.active_agent = self.active_agent.toggle();
-        // Reset scroll to bottom when switching.
-        self.agent_scroll = u16::MAX;
-        self.auto_scroll_agent = true;
+        self.switch_to_agent(self.active_agent.toggle());
+    }
+
+    /// Switch the active agent view (only if actually changing).
+    fn switch_to_agent(&mut self, agent: AgentSource) {
+        if self.active_agent != agent {
+            self.active_agent = agent;
+            self.agent_scroll = u16::MAX;
+            self.auto_scroll_agent = true;
+        }
     }
 
     /// Submit the current input buffer as a queued message.
@@ -283,15 +289,18 @@ impl App {
     pub fn handle_event(&mut self, event: OrchestratorEvent) {
         match event {
             OrchestratorEvent::PhaseChanged(ref phase) => {
-                // Insert phase-change separator into the relevant agent stream.
+                // Insert phase-change separator into the relevant agent stream
+                // and auto-switch the active agent view to follow the action.
                 let sep = format!("--- {} ---", phase_label(phase));
                 match phase {
                     Phase::Working | Phase::Revising => {
                         self.current_cycle += 1;
                         self.push_stream(AgentSource::Worker, StreamEntry::Separator(sep));
+                        self.switch_to_agent(AgentSource::Worker);
                     }
                     Phase::Planning | Phase::Reviewing => {
                         self.push_stream(AgentSource::Reviewer, StreamEntry::Separator(sep));
+                        self.switch_to_agent(AgentSource::Reviewer);
                     }
                     _ => {}
                 }
@@ -501,7 +510,10 @@ impl App {
     // Helpers for tool call detail extraction
     // -----------------------------------------------------------------------
 
-    /// Extract the most useful one-liner from a tool call for inline display.
+    /// Extract detail from a tool call for inline display.
+    ///
+    /// Priority: file location > known key shortcuts > all params as key=value.
+    /// Never falls back to just the title — always shows parameters if available.
     fn extract_tool_detail(
         kind: &ToolKind,
         title: &str,
@@ -514,44 +526,73 @@ impl App {
             return format!("{}{line_suffix}", loc.path);
         }
 
-        // For execute, try to find a "command" key in raw_input.
         if let Some(serde_json::Value::Object(map)) = raw_input {
+            // For execute, try to find a "command" key.
             if matches!(kind, ToolKind::Execute) {
                 if let Some(serde_json::Value::String(cmd)) = map.get("command") {
-                    let truncated = if cmd.len() > 120 {
-                        format!("{}...", &cmd[..117])
-                    } else {
-                        cmd.clone()
-                    };
-                    return truncated;
+                    return truncate(cmd, 120);
                 }
             }
-            // For read/edit, try "path" or "file" keys.
+
+            // For read/edit, try "path" or "file" keys — show as primary detail.
             for key in &["path", "file", "filePath", "file_path"] {
                 if let Some(serde_json::Value::String(p)) = map.get(*key) {
                     return p.clone();
                 }
             }
-            // For search, try "pattern" or "query".
-            for key in &["pattern", "query", "regex"] {
-                if let Some(serde_json::Value::String(q)) = map.get(*key) {
-                    let truncated = if q.len() > 80 {
-                        format!("{}...", &q[..77])
-                    } else {
-                        q.clone()
-                    };
-                    return truncated;
-                }
+
+            // Fallback: show ALL parameters as compact key=value pairs.
+            if !map.is_empty() {
+                return Self::format_params_inline(map);
             }
         }
 
         title.to_string()
+    }
+
+    /// Format a JSON object's key-value pairs as a compact inline string.
+    /// e.g. `query="foo" include="*.rs" path="/src"`
+    fn format_params_inline(map: &serde_json::Map<String, serde_json::Value>) -> String {
+        let mut parts = Vec::new();
+        let mut total_len = 0;
+        let max_len = 200;
+
+        for (k, v) in map {
+            if total_len > max_len {
+                parts.push("...".to_string());
+                break;
+            }
+            let val_str = match v {
+                serde_json::Value::String(s) => {
+                    let t = truncate(s, 60);
+                    format!("\"{t}\"")
+                }
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Null => "null".to_string(),
+                serde_json::Value::Array(a) => format!("[{} items]", a.len()),
+                serde_json::Value::Object(m) => format!("{{{} keys}}", m.len()),
+            };
+            let part = format!("{k}={val_str}");
+            total_len += part.len() + 1;
+            parts.push(part);
+        }
+
+        parts.join(" ")
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max.saturating_sub(3)])
+    }
+}
 
 fn phase_label(phase: &Phase) -> &str {
     match phase {

@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/ratio", "exodus/pic-disasm",
+    "crates/ratio",
     "vendor/acp-rust-sdk/src/agent-client-protocol",
 ]
 resolver = "3"

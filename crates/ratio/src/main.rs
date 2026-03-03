@@ -15,6 +15,7 @@ use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use tokio::sync::mpsc;
 
+use agent_client_protocol as acp;
 use ratio::config::{CliOverrides, Config};
 use ratio::orchestrator::{Orchestrator, OrchestratorEvent};
 use ratio::protocol::AgentEvent;
@@ -66,6 +67,10 @@ struct Cli {
     /// Run in headless mode (no TUI, output to stdout).
     #[arg(long)]
     headless: bool,
+
+    /// Log all ACP protocol messages to stderr (headless mode only).
+    #[arg(long)]
+    debug: bool,
 
     /// Resume a previous session from saved state.
     #[arg(long)]
@@ -121,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     let resume = cli.resume;
 
     if cli.headless {
-        run_headless(config, resume).await
+        run_headless(config, resume, cli.debug).await
     } else {
         run_tui(config, resume).await
     }
@@ -294,7 +299,7 @@ async fn run_tui_inner(
 // Headless mode
 // ---------------------------------------------------------------------------
 
-async fn run_headless(config: Config, resume: bool) -> anyhow::Result<()> {
+async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Result<()> {
     let local_set = tokio::task::LocalSet::new();
 
     local_set
@@ -355,6 +360,28 @@ async fn run_headless(config: Config, resume: bool) -> anyhow::Result<()> {
                     .await?;
             } else {
                 worker_conn.handshake(&config.cwd).await?;
+            }
+
+            // Subscribe to raw ACP streams before moving connections
+            // into the orchestrator (--debug mode).
+            if debug {
+                eprintln!("[ratio] debug: ACP protocol logging enabled");
+
+                let mut worker_stream = worker_conn.subscribe();
+                tokio::task::spawn_local(async move {
+                    while let Ok(msg) = worker_stream.recv().await {
+                        let json = format_stream_message(&msg);
+                        eprintln!("[acp:worker] {json}");
+                    }
+                });
+
+                let mut reviewer_stream = reviewer_conn.subscribe();
+                tokio::task::spawn_local(async move {
+                    while let Ok(msg) = reviewer_stream.recv().await {
+                        let json = format_stream_message(&msg);
+                        eprintln!("[acp:reviewer] {json}");
+                    }
+                });
             }
 
             // Spawn orchestrator.
@@ -423,4 +450,43 @@ async fn run_headless(config: Config, resume: bool) -> anyhow::Result<()> {
             anyhow::Ok(())
         })
         .await
+}
+
+// ---------------------------------------------------------------------------
+// Debug helpers
+// ---------------------------------------------------------------------------
+
+/// Format an ACP stream message as a compact string for debug logging.
+fn format_stream_message(msg: &acp::StreamMessage) -> String {
+    use acp::{StreamMessageContent, StreamMessageDirection};
+
+    let dir = match msg.direction {
+        StreamMessageDirection::Incoming => "recv",
+        StreamMessageDirection::Outgoing => "send",
+    };
+
+    match &msg.message {
+        StreamMessageContent::Request { id, method, params } => {
+            let params_str = params
+                .as_ref()
+                .map(|p| serde_json::to_string(p).unwrap_or_else(|_| format!("{p:?}")))
+                .unwrap_or_default();
+            format!("{dir} request id={id:?} method={method} params={params_str}")
+        }
+        StreamMessageContent::Response { id, result } => {
+            let result_str = match result {
+                Ok(Some(val)) => serde_json::to_string(val).unwrap_or_else(|_| format!("{val:?}")),
+                Ok(None) => "null".to_string(),
+                Err(e) => format!("error: {e:?}"),
+            };
+            format!("{dir} response id={id:?} result={result_str}")
+        }
+        StreamMessageContent::Notification { method, params } => {
+            let params_str = params
+                .as_ref()
+                .map(|p| serde_json::to_string(p).unwrap_or_else(|_| format!("{p:?}")))
+                .unwrap_or_default();
+            format!("{dir} notification method={method} params={params_str}")
+        }
+    }
 }
