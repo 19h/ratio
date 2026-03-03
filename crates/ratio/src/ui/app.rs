@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use chrono::Local;
 
 use crate::orchestrator::{LogLevel, OrchestratorEvent, Phase, ReviewVerdict};
-use crate::protocol::{AgentEvent, PlanEntry, ToolCallState, ToolKind};
+use crate::protocol::{AgentEvent, PlanEntry, ToolCallLocation, ToolCallState, ToolKind};
 
 /// Maximum number of log lines retained.
 const MAX_LOG_LINES: usize = 2000;
@@ -59,6 +59,7 @@ pub struct ToolCallRecord {
     pub content: Option<String>,
     pub raw_input: Option<serde_json::Value>,
     pub raw_output: Option<serde_json::Value>,
+    pub locations: Vec<ToolCallLocation>,
     pub timestamp: String,
 }
 
@@ -290,7 +291,12 @@ impl App {
                 title,
                 kind,
                 raw_input,
+                locations,
             } => {
+                // Inject a progress line into the agent's output pane.
+                let inline = Self::format_tool_inline(&kind, &title, &locations, &raw_input);
+                self.append_agent_output(source, &format!("\n{inline}"));
+
                 let record = ToolCallRecord {
                     id,
                     title,
@@ -300,6 +306,7 @@ impl App {
                     content: None,
                     raw_input,
                     raw_output: None,
+                    locations,
                     timestamp: Local::now().format("%H:%M:%S").to_string(),
                 };
                 self.tool_calls.push_back(record);
@@ -312,18 +319,53 @@ impl App {
             }
             AgentEvent::ToolCallUpdated {
                 id,
+                title,
                 status,
                 content,
+                raw_input,
                 raw_output,
+                locations,
             } => {
-                if let Some(tc) = self.tool_calls.iter_mut().rev().find(|tc| tc.id == id) {
-                    tc.status = status;
-                    if content.is_some() {
-                        tc.content = content;
+                // Extract completion marker info outside the mutable borrow of self.tool_calls.
+                let completion_marker: Option<(AgentSource, String)> = {
+                    if let Some(tc) = self.tool_calls.iter_mut().rev().find(|tc| tc.id == id) {
+                        let was_in_progress = tc.status == ToolCallState::InProgress;
+                        if let Some(t) = title {
+                            tc.title = t;
+                        }
+                        tc.status = status.clone();
+                        if content.is_some() {
+                            tc.content = content;
+                        }
+                        if raw_input.is_some() {
+                            tc.raw_input = raw_input;
+                        }
+                        if raw_output.is_some() {
+                            tc.raw_output = raw_output;
+                        }
+                        if !locations.is_empty() {
+                            tc.locations = locations.clone();
+                        }
+
+                        if was_in_progress
+                            && (status == ToolCallState::Completed
+                                || status == ToolCallState::Failed)
+                        {
+                            let marker = if status == ToolCallState::Completed {
+                                format!("  [ok] {}\n", tc.title)
+                            } else {
+                                format!("  [FAIL] {}\n", tc.title)
+                            };
+                            Some((tc.source, marker))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
                     }
-                    if raw_output.is_some() {
-                        tc.raw_output = raw_output;
-                    }
+                };
+                if let Some((agent_source, marker)) = completion_marker {
+                    self.append_agent_output(agent_source, &marker);
                 }
                 if self.auto_scroll_tools {
                     self.tool_scroll = u16::MAX;
@@ -422,5 +464,101 @@ impl App {
                 self.auto_scroll_log = true;
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers for inline tool call progress
+    // -----------------------------------------------------------------------
+
+    /// Append text to the appropriate agent's output pane and auto-scroll.
+    fn append_agent_output(&mut self, source: AgentSource, text: &str) {
+        match source {
+            AgentSource::Worker => {
+                self.worker_output.push_str(text);
+                if self.auto_scroll_worker {
+                    self.worker_scroll = u16::MAX;
+                }
+            }
+            AgentSource::Reviewer => {
+                self.reviewer_output.push_str(text);
+                if self.auto_scroll_reviewer {
+                    self.reviewer_scroll = u16::MAX;
+                }
+            }
+        }
+    }
+
+    /// Format a tool call as an inline progress line for the output pane.
+    fn format_tool_inline(
+        kind: &ToolKind,
+        title: &str,
+        locations: &[ToolCallLocation],
+        raw_input: &Option<serde_json::Value>,
+    ) -> String {
+        let kind_label = match kind {
+            ToolKind::Read => "read",
+            ToolKind::Edit => "edit",
+            ToolKind::Delete => "delete",
+            ToolKind::Move => "move",
+            ToolKind::Search => "search",
+            ToolKind::Execute => "exec",
+            ToolKind::Think => "think",
+            ToolKind::Fetch => "fetch",
+            ToolKind::SwitchMode => "mode",
+            ToolKind::Other => "tool",
+        };
+
+        // Try to extract the most useful detail: file path from locations,
+        // or a command from raw_input, or fall back to title.
+        let detail = Self::extract_tool_detail(kind, locations, raw_input)
+            .unwrap_or_else(|| title.to_string());
+
+        format!("  [{kind_label}] {detail}\n")
+    }
+
+    /// Extract the most useful one-liner from a tool call.
+    fn extract_tool_detail(
+        kind: &ToolKind,
+        locations: &[ToolCallLocation],
+        raw_input: &Option<serde_json::Value>,
+    ) -> Option<String> {
+        // For file-oriented operations, show the path.
+        if let Some(loc) = locations.first() {
+            let line_suffix = loc.line.map(|l| format!(":{l}")).unwrap_or_default();
+            return Some(format!("{}{line_suffix}", loc.path));
+        }
+
+        // For execute, try to find a "command" key in raw_input.
+        if let Some(serde_json::Value::Object(map)) = raw_input {
+            if matches!(kind, ToolKind::Execute) {
+                if let Some(serde_json::Value::String(cmd)) = map.get("command") {
+                    let truncated = if cmd.len() > 120 {
+                        format!("{}...", &cmd[..117])
+                    } else {
+                        cmd.clone()
+                    };
+                    return Some(truncated);
+                }
+            }
+            // For read/edit, try "path" or "file" keys.
+            for key in &["path", "file", "filePath", "file_path"] {
+                if let Some(serde_json::Value::String(p)) = map.get(*key) {
+                    return Some(p.clone());
+                }
+            }
+            // For search, try "pattern" or "query".
+            for key in &["pattern", "query", "regex"] {
+                if let Some(serde_json::Value::String(q)) = map.get(*key) {
+                    let truncated = if q.len() > 80 {
+                        format!("{}...", &q[..77])
+                    } else {
+                        q.clone()
+                    };
+                    return Some(truncated);
+                }
+            }
+        }
+
+        None
     }
 }

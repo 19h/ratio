@@ -29,14 +29,18 @@ pub enum AgentEvent {
         title: String,
         kind: ToolKind,
         raw_input: Option<serde_json::Value>,
+        locations: Vec<ToolCallLocation>,
     },
 
     /// A tool call was updated (progress, completion, etc.).
     ToolCallUpdated {
         id: String,
+        title: Option<String>,
         status: ToolCallState,
         content: Option<String>,
+        raw_input: Option<serde_json::Value>,
         raw_output: Option<serde_json::Value>,
+        locations: Vec<ToolCallLocation>,
     },
 
     /// The agent's plan was updated (list of tasks with status).
@@ -93,6 +97,13 @@ pub enum PlanEntryPriority {
     High,
     Medium,
     Low,
+}
+
+/// A file location referenced by a tool call.
+#[derive(Debug, Clone)]
+pub struct ToolCallLocation {
+    pub path: String,
+    pub line: Option<u32>,
 }
 
 /// Simplified tool-call status for display.
@@ -201,6 +212,16 @@ impl OrchestratorClient {
             _ => PlanEntryPriority::Medium,
         }
     }
+
+    fn map_locations(locations: &[acp::ToolCallLocation]) -> Vec<ToolCallLocation> {
+        locations
+            .iter()
+            .map(|loc| ToolCallLocation {
+                path: loc.path.to_string_lossy().to_string(),
+                line: loc.line,
+            })
+            .collect()
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -281,11 +302,13 @@ impl acp::Client for OrchestratorClient {
                 let title = tc.title.clone();
                 let kind = Self::map_tool_kind(&tc.kind);
                 let raw_input = tc.raw_input.clone();
+                let locations = Self::map_locations(&tc.locations);
                 self.emit(AgentEvent::ToolCallStarted {
                     id,
                     title,
                     kind,
                     raw_input,
+                    locations,
                 });
             }
             acp::SessionUpdate::ToolCallUpdate(update) => {
@@ -309,13 +332,23 @@ impl acp::Client for OrchestratorClient {
                     })
                 });
 
+                let title = update.fields.title.clone();
+                let raw_input = update.fields.raw_input.clone();
                 let raw_output = update.fields.raw_output.clone();
+                let locations = update
+                    .fields
+                    .locations
+                    .as_deref()
+                    .map_or_else(Vec::new, Self::map_locations);
 
                 self.emit(AgentEvent::ToolCallUpdated {
                     id,
+                    title,
                     status,
                     content,
+                    raw_input,
                     raw_output,
+                    locations,
                 });
             }
             acp::SessionUpdate::Plan(plan) => {
@@ -417,6 +450,47 @@ impl WorkerConnection {
             .map_err(|e| anyhow::anyhow!("ACP new_session failed: {e}"))?;
 
         self.session_id = Some(response.session_id);
+        Ok(())
+    }
+
+    /// Return the current session ID, if established.
+    pub fn session_id(&self) -> Option<&acp::SessionId> {
+        self.session_id.as_ref()
+    }
+
+    /// Load an existing session by ID (for `--resume`).
+    ///
+    /// Performs ACP `initialize` + `load_session` instead of `new_session`.
+    /// The agent will replay conversation history as session notifications.
+    pub async fn load_existing_session(
+        &mut self,
+        session_id: String,
+        cwd: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        use acp::Agent as _;
+
+        self.conn
+            .initialize(
+                acp::InitializeRequest::new(acp::ProtocolVersion::LATEST)
+                    .client_info(
+                        acp::Implementation::new(
+                            "ratio-orchestrator",
+                            env!("CARGO_PKG_VERSION"),
+                        )
+                        .title("Ratio Orchestrator"),
+                    ),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP initialize failed: {e}"))?;
+
+        let sid: acp::SessionId = session_id.into();
+
+        self.conn
+            .load_session(acp::LoadSessionRequest::new(sid.clone(), cwd))
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP load_session failed: {e}"))?;
+
+        self.session_id = Some(sid);
         Ok(())
     }
 

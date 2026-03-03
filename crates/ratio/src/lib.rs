@@ -17,5 +17,6 @@
 pub mod config;
 pub mod orchestrator;
 pub mod protocol;
+pub mod session;
 pub mod subprocess;
 pub mod ui;

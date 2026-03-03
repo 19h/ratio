@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use ratio::config::{CliOverrides, Config};
 use ratio::orchestrator::{Orchestrator, OrchestratorEvent};
 use ratio::protocol::AgentEvent;
+use ratio::session::SessionState;
 use ratio::subprocess::{AgentRole, spawn_agent};
 use ratio::ui::{App, EventLoop};
 use ratio::ui::events::Action;
@@ -65,6 +66,13 @@ struct Cli {
     /// Run in headless mode (no TUI, output to stdout).
     #[arg(long)]
     headless: bool,
+
+    /// Resume a previous session from saved state.
+    ///
+    /// Loads session IDs from .ratio-session.json in the working directory
+    /// and reconnects to both agents, continuing from where we left off.
+    #[arg(long)]
+    resume: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,10 +121,12 @@ async fn main() -> anyhow::Result<()> {
 
     config.validate()?;
 
+    let resume = cli.resume;
+
     if cli.headless {
-        run_headless(config).await
+        run_headless(config, resume).await
     } else {
-        run_tui(config).await
+        run_tui(config, resume).await
     }
 }
 
@@ -124,13 +134,13 @@ async fn main() -> anyhow::Result<()> {
 // TUI mode
 // ---------------------------------------------------------------------------
 
-async fn run_tui(config: Config) -> anyhow::Result<()> {
+async fn run_tui(config: Config, resume: bool) -> anyhow::Result<()> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_tui_inner(&mut terminal, config).await;
+    let result = run_tui_inner(&mut terminal, config, resume).await;
 
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
@@ -141,6 +151,7 @@ async fn run_tui(config: Config) -> anyhow::Result<()> {
 async fn run_tui_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config: Config,
+    resume: bool,
 ) -> anyhow::Result<()> {
     let local_set = tokio::task::LocalSet::new();
 
@@ -161,6 +172,24 @@ async fn run_tui_inner(
                 config.orchestration.max_review_cycles,
             );
 
+            // ── Load saved session if resuming ──────────────────
+            let saved_session = if resume {
+                match SessionState::load(&config.cwd)? {
+                    Some(state) => {
+                        app.current_cycle = state.cycle;
+                        Some(state)
+                    }
+                    None => {
+                        anyhow::bail!(
+                            "No saved session found at {}",
+                            SessionState::path(&config.cwd).display()
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+
             // ── Spawn reviewer agent ────────────────────────────
             let (mut reviewer_conn, mut reviewer_proc, reviewer_io) =
                 spawn_agent(AgentRole::Reviewer, &config.reviewer, &config.cwd, reviewer_event_tx)?;
@@ -171,7 +200,13 @@ async fn run_tui_inner(
                 }
             });
 
-            reviewer_conn.handshake(&config.cwd).await?;
+            if let Some(ref state) = saved_session {
+                reviewer_conn
+                    .load_existing_session(state.reviewer_session_id.clone(), &config.cwd)
+                    .await?;
+            } else {
+                reviewer_conn.handshake(&config.cwd).await?;
+            }
 
             // ── Spawn worker agent ──────────────────────────────
             let (mut worker_conn, mut worker_proc, worker_io) =
@@ -183,13 +218,37 @@ async fn run_tui_inner(
                 }
             });
 
-            worker_conn.handshake(&config.cwd).await?;
+            if let Some(ref state) = saved_session {
+                worker_conn
+                    .load_existing_session(state.worker_session_id.clone(), &config.cwd)
+                    .await?;
+            } else {
+                worker_conn.handshake(&config.cwd).await?;
+            }
 
             // ── Spawn orchestrator ──────────────────────────────
             let orch_tx = orch_event_tx.clone();
             let config_clone = config.clone();
+            let resume_phase = saved_session.as_ref().map(|s| s.phase.clone());
+            let resume_agent = saved_session.as_ref().map(|s| s.last_active_agent.clone());
             tokio::task::spawn_local(async move {
                 let mut orchestrator = Orchestrator::new(config_clone, orch_tx);
+                if let Some(ref phase) = resume_phase {
+                    // Send a "continue" prompt to the last active agent.
+                    let continue_msg = format!(
+                        "Continue where you left off. The session was interrupted during the \
+                         '{phase}' phase. Pick up from where you stopped and complete the task."
+                    );
+                    match resume_agent.as_deref() {
+                        Some("worker") => {
+                            let _ = worker_conn.prompt(&continue_msg).await;
+                        }
+                        _ => {
+                            // Default to reviewer (covers "reviewer" and unknown values).
+                            let _ = reviewer_conn.prompt(&continue_msg).await;
+                        }
+                    }
+                }
                 let _ = orchestrator
                     .run(
                         &reviewer_conn,
@@ -230,7 +289,7 @@ async fn run_tui_inner(
 // Headless mode
 // ---------------------------------------------------------------------------
 
-async fn run_headless(config: Config) -> anyhow::Result<()> {
+async fn run_headless(config: Config, resume: bool) -> anyhow::Result<()> {
     let local_set = tokio::task::LocalSet::new();
 
     local_set
@@ -243,6 +302,21 @@ async fn run_headless(config: Config) -> anyhow::Result<()> {
                 mpsc::unbounded_channel::<AgentEvent>();
             let (_abort_tx, abort_rx) = mpsc::unbounded_channel::<()>();
 
+            // Load saved session if resuming.
+            let saved_session = if resume {
+                match SessionState::load(&config.cwd)? {
+                    Some(state) => Some(state),
+                    None => {
+                        anyhow::bail!(
+                            "No saved session found at {}",
+                            SessionState::path(&config.cwd).display()
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+
             // Spawn reviewer.
             let (mut reviewer_conn, mut reviewer_proc, reviewer_io) =
                 spawn_agent(AgentRole::Reviewer, &config.reviewer, &config.cwd, reviewer_event_tx)?;
@@ -253,7 +327,13 @@ async fn run_headless(config: Config) -> anyhow::Result<()> {
                 }
             });
 
-            reviewer_conn.handshake(&config.cwd).await?;
+            if let Some(ref state) = saved_session {
+                reviewer_conn
+                    .load_existing_session(state.reviewer_session_id.clone(), &config.cwd)
+                    .await?;
+            } else {
+                reviewer_conn.handshake(&config.cwd).await?;
+            }
 
             // Spawn worker.
             let (mut worker_conn, mut worker_proc, worker_io) =
@@ -265,13 +345,35 @@ async fn run_headless(config: Config) -> anyhow::Result<()> {
                 }
             });
 
-            worker_conn.handshake(&config.cwd).await?;
+            if let Some(ref state) = saved_session {
+                worker_conn
+                    .load_existing_session(state.worker_session_id.clone(), &config.cwd)
+                    .await?;
+            } else {
+                worker_conn.handshake(&config.cwd).await?;
+            }
 
             // Spawn orchestrator.
             let orch_tx = orch_event_tx.clone();
             let config_clone = config.clone();
+            let resume_phase = saved_session.as_ref().map(|s| s.phase.clone());
+            let resume_agent = saved_session.as_ref().map(|s| s.last_active_agent.clone());
             tokio::task::spawn_local(async move {
                 let mut orchestrator = Orchestrator::new(config_clone, orch_tx);
+                if let Some(ref phase) = resume_phase {
+                    let continue_msg = format!(
+                        "Continue where you left off. The session was interrupted during the \
+                         '{phase}' phase. Pick up from where you stopped and complete the task."
+                    );
+                    match resume_agent.as_deref() {
+                        Some("worker") => {
+                            let _ = worker_conn.prompt(&continue_msg).await;
+                        }
+                        _ => {
+                            let _ = reviewer_conn.prompt(&continue_msg).await;
+                        }
+                    }
+                }
                 let _ = orchestrator
                     .run(
                         &reviewer_conn,

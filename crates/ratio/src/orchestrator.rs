@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::protocol::{AgentEvent, StopReason, WorkerConnection};
+use crate::session::SessionState;
 use crate::subprocess::AgentProcess;
 
 // ---------------------------------------------------------------------------
@@ -128,6 +129,48 @@ impl Orchestrator {
     fn set_phase(&mut self, phase: Phase) {
         self.phase = phase.clone();
         let _ = self.event_tx.send(OrchestratorEvent::PhaseChanged(phase));
+    }
+
+    /// Persist session state for resume capability.
+    fn save_session(
+        &self,
+        reviewer_conn: &WorkerConnection,
+        worker_conn: &WorkerConnection,
+        last_active: &str,
+    ) {
+        let reviewer_id = reviewer_conn
+            .session_id()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let worker_id = worker_conn
+            .session_id()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let phase_str = match &self.phase {
+            Phase::Idle => "idle",
+            Phase::Initializing => "initializing",
+            Phase::Planning => "planning",
+            Phase::Working => "working",
+            Phase::Reviewing => "reviewing",
+            Phase::Revising => "revising",
+            Phase::Approved => "approved",
+            Phase::Failed(_) => "failed",
+            Phase::Aborted => "aborted",
+        };
+
+        let state = SessionState {
+            reviewer_session_id: reviewer_id,
+            worker_session_id: worker_id,
+            last_active_agent: last_active.to_string(),
+            phase: phase_str.to_string(),
+            cycle: self.cycles.len(),
+            goal: self.config.goal.clone(),
+        };
+
+        if let Err(e) = state.save(&self.config.cwd) {
+            self.log(LogLevel::Warn, format!("Failed to save session state: {e}"));
+        }
     }
 
     fn log(&self, level: LogLevel, msg: impl Into<String>) {
@@ -390,6 +433,7 @@ impl Orchestrator {
         // ── Phase 1: Planning — reviewer formulates the work instruction ──
 
         self.set_phase(Phase::Planning);
+        self.save_session(reviewer_conn, worker_conn, "reviewer");
         self.log(LogLevel::Info, "Asking reviewer to formulate work instruction...");
 
         let planning_prompt = self.build_planning_prompt();
@@ -450,6 +494,7 @@ impl Orchestrator {
             } else {
                 Phase::Revising
             });
+            self.save_session(reviewer_conn, worker_conn, "worker");
 
             let worker_result = tokio::select! {
                 result = worker_conn.prompt(&current_instruction) => result,
@@ -483,6 +528,7 @@ impl Orchestrator {
             // ── Send output to reviewer for assessment ────────────────────
 
             self.set_phase(Phase::Reviewing);
+            self.save_session(reviewer_conn, worker_conn, "reviewer");
 
             let review_prompt =
                 self.build_review_prompt(cycle, &current_instruction, &worker_output);
@@ -533,6 +579,8 @@ impl Orchestrator {
                 ReviewVerdict::Approved { ref summary } => {
                     self.log(LogLevel::Info, format!("APPROVED: {summary}"));
                     self.set_phase(Phase::Approved);
+                    // Clean up session file on successful completion.
+                    SessionState::remove(&self.config.cwd);
                     let _ = self
                         .event_tx
                         .send(OrchestratorEvent::Finished(Phase::Approved));

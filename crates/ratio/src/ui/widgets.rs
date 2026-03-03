@@ -330,13 +330,30 @@ pub fn tool_calls_paragraph<'a>(
             Span::raw(format!(" {}", tc.title)),
         ];
 
+        // Show file locations if available.
+        if !tc.locations.is_empty() {
+            header_spans.push(Span::raw("  "));
+            for (i, loc) in tc.locations.iter().enumerate() {
+                if i > 0 {
+                    header_spans.push(Span::styled(", ", Style::default().fg(Color::DarkGray)));
+                }
+                let line_suffix = loc.line.map(|l| format!(":{l}")).unwrap_or_default();
+                header_spans.push(Span::styled(
+                    format!("{}{line_suffix}", loc.path),
+                    Style::default().fg(Color::White),
+                ));
+            }
+        }
+
         // If there are raw_input parameters and it's an object, show inline
-        // for small payloads.
-        if let Some(ref input) = tc.raw_input {
-            if let serde_json::Value::Object(map) = input {
-                if map.len() <= 3 {
-                    header_spans.push(Span::styled("  ", Style::default().fg(Color::DarkGray)));
-                    header_spans.extend(json_param_spans(input, 80));
+        // for small payloads (only when no locations shown).
+        if tc.locations.is_empty() {
+            if let Some(ref input) = tc.raw_input {
+                if let serde_json::Value::Object(map) = input {
+                    if map.len() <= 3 {
+                        header_spans.push(Span::styled("  ", Style::default().fg(Color::DarkGray)));
+                        header_spans.extend(json_param_spans(input, 80));
+                    }
                 }
             }
         }
