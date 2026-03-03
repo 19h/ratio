@@ -13,6 +13,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 use agent_client_protocol as acp;
@@ -193,6 +194,11 @@ async fn run_tui_inner(
             let (mut reviewer_conn, mut reviewer_proc, reviewer_io) =
                 spawn_agent(AgentRole::Reviewer, &config.reviewer, &config.cwd, reviewer_event_tx)?;
 
+            // Drain reviewer stderr to tracing (prevents pipe buffer deadlock).
+            if let Some(stderr) = reviewer_proc.stderr.take() {
+                tokio::task::spawn_local(drain_stderr(stderr, "reviewer", false));
+            }
+
             tokio::task::spawn_local(async move {
                 if let Err(e) = reviewer_io.await {
                     tracing::error!("Reviewer ACP I/O error: {e}");
@@ -207,9 +213,19 @@ async fn run_tui_inner(
                 reviewer_conn.handshake(&config.cwd).await?;
             }
 
+            // Set the reviewer model if configured.
+            if !config.reviewer.model.is_empty() {
+                reviewer_conn.set_model(&config.reviewer.model).await?;
+            }
+
             // ── Spawn worker agent ──────────────────────────────
             let (mut worker_conn, mut worker_proc, worker_io) =
                 spawn_agent(AgentRole::Worker, &config.worker, &config.cwd, worker_event_tx)?;
+
+            // Drain worker stderr to tracing (prevents pipe buffer deadlock).
+            if let Some(stderr) = worker_proc.stderr.take() {
+                tokio::task::spawn_local(drain_stderr(stderr, "worker", false));
+            }
 
             tokio::task::spawn_local(async move {
                 if let Err(e) = worker_io.await {
@@ -223,6 +239,11 @@ async fn run_tui_inner(
                     .await?;
             } else {
                 worker_conn.handshake(&config.cwd).await?;
+            }
+
+            // Set the worker model if configured.
+            if !config.worker.model.is_empty() {
+                worker_conn.set_model(&config.worker.model).await?;
             }
 
             // ── Spawn orchestrator ──────────────────────────────
@@ -330,6 +351,11 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
             let (mut reviewer_conn, mut reviewer_proc, reviewer_io) =
                 spawn_agent(AgentRole::Reviewer, &config.reviewer, &config.cwd, reviewer_event_tx)?;
 
+            // Drain reviewer stderr (to terminal in --debug, otherwise silently).
+            if let Some(stderr) = reviewer_proc.stderr.take() {
+                tokio::task::spawn_local(drain_stderr(stderr, "reviewer", debug));
+            }
+
             tokio::task::spawn_local(async move {
                 if let Err(e) = reviewer_io.await {
                     eprintln!("[ratio] Reviewer I/O error: {e}");
@@ -344,9 +370,19 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                 reviewer_conn.handshake(&config.cwd).await?;
             }
 
+            // Set the reviewer model if configured.
+            if !config.reviewer.model.is_empty() {
+                reviewer_conn.set_model(&config.reviewer.model).await?;
+            }
+
             // Spawn worker.
             let (mut worker_conn, mut worker_proc, worker_io) =
                 spawn_agent(AgentRole::Worker, &config.worker, &config.cwd, worker_event_tx)?;
+
+            // Drain worker stderr (to terminal in --debug, otherwise silently).
+            if let Some(stderr) = worker_proc.stderr.take() {
+                tokio::task::spawn_local(drain_stderr(stderr, "worker", debug));
+            }
 
             tokio::task::spawn_local(async move {
                 if let Err(e) = worker_io.await {
@@ -360,6 +396,11 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                     .await?;
             } else {
                 worker_conn.handshake(&config.cwd).await?;
+            }
+
+            // Set the worker model if configured.
+            if !config.worker.model.is_empty() {
+                worker_conn.set_model(&config.worker.model).await?;
             }
 
             // Subscribe to raw ACP streams before moving connections
@@ -455,6 +496,24 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
 // ---------------------------------------------------------------------------
 // Debug helpers
 // ---------------------------------------------------------------------------
+
+/// Drain a subprocess stderr stream line by line.
+///
+/// When `to_stderr` is true (--debug mode), lines are printed to our stderr
+/// with a `[stderr:<role>]` prefix. Otherwise they are silently discarded.
+/// Either way, reading prevents the pipe buffer from filling up and deadlocking
+/// the subprocess.
+async fn drain_stderr(stderr: tokio::process::ChildStderr, role: &'static str, to_stderr: bool) {
+    let reader = tokio::io::BufReader::new(stderr);
+    let mut lines = reader.lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if to_stderr {
+            eprintln!("[stderr:{role}] {line}");
+        } else {
+            tracing::debug!("[{role} stderr] {line}");
+        }
+    }
+}
 
 /// Format an ACP stream message as a compact string for debug logging.
 fn format_stream_message(msg: &acp::StreamMessage) -> String {

@@ -46,6 +46,8 @@ impl fmt::Display for AgentRole {
 pub struct AgentProcess {
     child: Child,
     role: AgentRole,
+    /// Stderr handle from the subprocess (must be drained to prevent deadlock).
+    pub stderr: Option<tokio::process::ChildStderr>,
 }
 
 impl AgentProcess {
@@ -142,8 +144,10 @@ pub fn spawn_agent(
             tokio::task::spawn_local(fut);
         });
 
+    let stderr = child.stderr.take();
+
     let worker_conn = WorkerConnection::new(conn, client_for_conn);
-    let agent_proc = AgentProcess { child, role };
+    let agent_proc = AgentProcess { child, role, stderr };
 
     Ok((worker_conn, agent_proc, io_task))
 }

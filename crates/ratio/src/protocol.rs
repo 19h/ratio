@@ -612,6 +612,33 @@ impl WorkerConnection {
         Ok(())
     }
 
+    /// Set the model for the current session.
+    ///
+    /// Sends an ACP `session/setModel` request to switch the agent to
+    /// the specified model identifier (e.g. `"vertexproxy/Gemini 3.1 Pro"`).
+    /// Does nothing if no session has been established yet or if `model_id`
+    /// is empty.
+    pub async fn set_model(&self, model_id: &str) -> anyhow::Result<()> {
+        use acp::Agent as _;
+
+        if model_id.is_empty() {
+            return Ok(());
+        }
+
+        let session_id = self
+            .session_id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no active session — call handshake() first"))?
+            .clone();
+
+        self.conn
+            .set_session_model(acp::SetSessionModelRequest::new(session_id, model_id.to_string()))
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP set_session_model failed: {e}"))?;
+
+        Ok(())
+    }
+
     /// Subscribe to the raw message stream (for debug display).
     pub fn subscribe(&self) -> acp::StreamReceiver {
         self.conn.subscribe()
