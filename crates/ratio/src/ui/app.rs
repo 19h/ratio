@@ -339,10 +339,35 @@ impl App {
     fn handle_agent_event(&mut self, event: AgentEvent, source: AgentSource) {
         match event {
             AgentEvent::TextChunk(text) => {
-                self.push_stream(source, StreamEntry::Text(text));
+                // Coalesce consecutive text chunks into a single entry so the
+                // renderer doesn't treat each streamed fragment as a new line.
+                let stream = match source {
+                    AgentSource::Worker => &mut self.worker_stream,
+                    AgentSource::Reviewer => &mut self.reviewer_stream,
+                };
+                if let Some(StreamEntry::Text(existing)) = stream.back_mut() {
+                    existing.push_str(&text);
+                    // Auto-scroll if viewing this agent.
+                    if source == self.active_agent && self.auto_scroll_agent {
+                        self.agent_scroll = u16::MAX;
+                    }
+                } else {
+                    self.push_stream(source, StreamEntry::Text(text));
+                }
             }
             AgentEvent::ThoughtChunk(text) => {
-                self.push_stream(source, StreamEntry::Thought(text));
+                let stream = match source {
+                    AgentSource::Worker => &mut self.worker_stream,
+                    AgentSource::Reviewer => &mut self.reviewer_stream,
+                };
+                if let Some(StreamEntry::Thought(existing)) = stream.back_mut() {
+                    existing.push_str(&text);
+                    if source == self.active_agent && self.auto_scroll_agent {
+                        self.agent_scroll = u16::MAX;
+                    }
+                } else {
+                    self.push_stream(source, StreamEntry::Thought(text));
+                }
             }
             AgentEvent::PlanUpdated(_entries) => {
                 // Plans are shown in the stream as info, not as a separate panel.
