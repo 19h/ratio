@@ -59,7 +59,7 @@ struct Cli {
     #[arg(long, value_name = "MODEL")]
     reviewer_model: Option<String>,
 
-    /// Maximum number of review cycles before giving up.
+    /// Maximum number of review cycles (0 = unlimited, default).
     #[arg(long, value_name = "N")]
     max_cycles: Option<usize>,
 
@@ -68,9 +68,6 @@ struct Cli {
     headless: bool,
 
     /// Resume a previous session from saved state.
-    ///
-    /// Loads session IDs from .ratio-session.json in the working directory
-    /// and reconnects to both agents, continuing from where we left off.
     #[arg(long)]
     resume: bool,
 }
@@ -167,10 +164,7 @@ async fn run_tui_inner(
             let (abort_tx, abort_rx) = mpsc::unbounded_channel::<()>();
 
             // ── App state ───────────────────────────────────────
-            let mut app = App::new(
-                config.goal.clone(),
-                config.orchestration.max_review_cycles,
-            );
+            let mut app = App::new(config.goal.clone());
 
             // ── Load saved session if resuming ──────────────────
             let saved_session = if resume {
@@ -234,7 +228,6 @@ async fn run_tui_inner(
             tokio::task::spawn_local(async move {
                 let mut orchestrator = Orchestrator::new(config_clone, orch_tx);
                 if let Some(ref phase) = resume_phase {
-                    // Send a "continue" prompt to the last active agent.
                     let continue_msg = format!(
                         "Continue where you left off. The session was interrupted during the \
                          '{phase}' phase. Pick up from where you stopped and complete the task."
@@ -244,7 +237,6 @@ async fn run_tui_inner(
                             let _ = worker_conn.prompt(&continue_msg).await;
                         }
                         _ => {
-                            // Default to reviewer (covers "reviewer" and unknown values).
                             let _ = reviewer_conn.prompt(&continue_msg).await;
                         }
                     }
@@ -269,6 +261,19 @@ async fn run_tui_inner(
                 terminal.draw(|frame| {
                     render::render(frame, &mut app);
                 })?;
+
+                // Drain any queued user messages.
+                // NOTE: In this architecture the orchestrator owns the connections,
+                // so user messages are logged but not yet sent to the agent.
+                // A future iteration will add a channel from the TUI to the
+                // orchestrator for injecting user messages.
+                while let Some(msg) = app.message_queue.pop_front() {
+                    tracing::info!(
+                        "User message queued for {:?}: {}",
+                        msg.target,
+                        msg.text
+                    );
+                }
 
                 match event_loop.tick(&mut app).await {
                     Action::Redraw => {}
@@ -302,7 +307,6 @@ async fn run_headless(config: Config, resume: bool) -> anyhow::Result<()> {
                 mpsc::unbounded_channel::<AgentEvent>();
             let (_abort_tx, abort_rx) = mpsc::unbounded_channel::<()>();
 
-            // Load saved session if resuming.
             let saved_session = if resume {
                 match SessionState::load(&config.cwd)? {
                     Some(state) => Some(state),

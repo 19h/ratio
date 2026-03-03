@@ -82,10 +82,7 @@ impl Config {
             !self.goal.is_empty(),
             "A goal must be specified (--goal or config file)"
         );
-        anyhow::ensure!(
-            self.orchestration.max_review_cycles > 0,
-            "max_review_cycles must be > 0"
-        );
+        // No cycle limit validation — cycles are unlimited by default.
         Ok(())
     }
 }

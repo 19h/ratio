@@ -1,9 +1,7 @@
 //! Input event handling and the main TUI event loop.
 //!
 //! Uses crossterm's async `EventStream` so that terminal input polling
-//! does NOT block the single-threaded tokio runtime — this is critical
-//! because the orchestrator, ACP I/O, and event forwarding tasks all
-//! run on the same `LocalSet`.
+//! does NOT block the single-threaded tokio runtime.
 
 use std::time::{Duration, Instant};
 
@@ -50,37 +48,24 @@ impl EventLoop {
     }
 
     /// Run one tick of the event loop. Returns an action to take.
-    ///
-    /// Uses `tokio::select!` to race between:
-    /// 1. Orchestrator events
-    /// 2. Terminal input events (async via EventStream)
-    /// 3. A short sleep to force periodic redraws
-    ///
-    /// This is fully async and does NOT block the runtime.
     pub async fn tick(&mut self, app: &mut App) -> Action {
         // Drain all immediately-available orchestrator events first.
         while let Ok(evt) = self.orch_rx.try_recv() {
             app.handle_event(evt);
         }
 
-        // Now race: wait for either a terminal event, an orchestrator event,
-        // or a timeout (for periodic redraw).
         tokio::select! {
-            // Terminal input (async, non-blocking).
             maybe_event = self.term_events.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_event {
                     return self.handle_key(app, key);
                 }
             }
-            // Orchestrator event.
             Some(evt) = self.orch_rx.recv() => {
                 app.handle_event(evt);
-                // Drain any more that arrived.
                 while let Ok(evt) = self.orch_rx.try_recv() {
                     app.handle_event(evt);
                 }
             }
-            // Periodic redraw (50ms).
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
 
@@ -88,14 +73,14 @@ impl EventLoop {
     }
 
     fn handle_key(&mut self, app: &mut App, key: KeyEvent) -> Action {
-        // ── Emergency kill: Ctrl+K ──────────────────────────────
+        // ── Emergency kill: Ctrl+K (always active) ──────────────
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
             app.abort_requested = true;
             let _ = self.abort_tx.send(());
             return Action::Kill;
         }
 
-        // ── Ctrl+C double-tap to kill ───────────────────────────
+        // ── Ctrl+C double-tap to kill (always active) ───────────
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             let now = Instant::now();
             if let Some(last) = self.last_ctrl_c {
@@ -107,17 +92,42 @@ impl EventLoop {
             }
             self.last_ctrl_c = Some(now);
             app.ctrl_c_count += 1;
+            // If in input mode, Ctrl+C also cancels.
+            if app.input_mode {
+                app.input_mode = false;
+                app.input_buffer.clear();
+                app.input_cursor = 0;
+            }
             return Action::Redraw;
         } else {
             app.ctrl_c_count = 0;
         }
 
-        // ── Quit: q when finished ───────────────────────────────
+        // ── Input mode handling ─────────────────────────────────
+        if app.input_mode {
+            return self.handle_input_key(app, key);
+        }
+
+        // ── Normal mode ─────────────────────────────────────────
+
+        // Quit: q when finished.
         if key.code == KeyCode::Char('q') && app.finished {
             return Action::Quit;
         }
 
-        // ── Tab / Shift+Tab: cycle focused pane ─────────────────
+        // Enter input mode: 'i' or ':'.
+        if key.code == KeyCode::Char('i') || key.code == KeyCode::Char(':') {
+            app.input_mode = true;
+            return Action::Redraw;
+        }
+
+        // Switch active agent: 'r' when agent pane is focused.
+        if key.code == KeyCode::Char('r') && app.focused == FocusedPane::Agent {
+            app.toggle_agent();
+            return Action::Redraw;
+        }
+
+        // Tab / Shift+Tab: cycle focused pane.
         if key.code == KeyCode::Tab {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 app.focused = app.focused.prev();
@@ -131,7 +141,7 @@ impl EventLoop {
             return Action::Redraw;
         }
 
-        // ── Scrolling ───────────────────────────────────────────
+        // Scrolling.
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => app.scroll_up(1),
             KeyCode::Down | KeyCode::Char('j') => app.scroll_down(1),
@@ -139,17 +149,13 @@ impl EventLoop {
             KeyCode::PageDown => app.scroll_down(20),
             KeyCode::Home => {
                 match app.focused {
-                    FocusedPane::Reviewer => {
-                        app.reviewer_scroll = 0;
-                        app.auto_scroll_reviewer = false;
+                    FocusedPane::Agent => {
+                        app.agent_scroll = 0;
+                        app.auto_scroll_agent = false;
                     }
-                    FocusedPane::Worker => {
-                        app.worker_scroll = 0;
-                        app.auto_scroll_worker = false;
-                    }
-                    FocusedPane::Tools => {
-                        app.tool_scroll = 0;
-                        app.auto_scroll_tools = false;
+                    FocusedPane::Todo => {
+                        app.todo_scroll = 0;
+                        app.auto_scroll_todo = false;
                     }
                     FocusedPane::Log => {
                         app.log_scroll = 0;
@@ -161,6 +167,52 @@ impl EventLoop {
             _ => {}
         }
 
+        Action::Redraw
+    }
+
+    fn handle_input_key(&mut self, app: &mut App, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                app.input_mode = false;
+                app.input_buffer.clear();
+                app.input_cursor = 0;
+            }
+            KeyCode::Enter => {
+                app.submit_input();
+            }
+            KeyCode::Backspace => {
+                if app.input_cursor > 0 {
+                    app.input_cursor -= 1;
+                    app.input_buffer.remove(app.input_cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if app.input_cursor < app.input_buffer.len() {
+                    app.input_buffer.remove(app.input_cursor);
+                }
+            }
+            KeyCode::Left => {
+                if app.input_cursor > 0 {
+                    app.input_cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if app.input_cursor < app.input_buffer.len() {
+                    app.input_cursor += 1;
+                }
+            }
+            KeyCode::Home => {
+                app.input_cursor = 0;
+            }
+            KeyCode::End => {
+                app.input_cursor = app.input_buffer.len();
+            }
+            KeyCode::Char(c) => {
+                app.input_buffer.insert(app.input_cursor, c);
+                app.input_cursor += 1;
+            }
+            _ => {}
+        }
         Action::Redraw
     }
 }

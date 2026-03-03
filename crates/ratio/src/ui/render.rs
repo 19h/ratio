@@ -3,11 +3,13 @@
 //! Layout:
 //!
 //! ```text
-//! ┌─ Header (phase + goal) ─────────────────────────────────┐
-//! ├─ Reviewer Output (left) ──┬─ Worker Output (right) ─────┤
-//! ├─ Tool Calls (left) ───────┴─ Log (right) ───────────────┤
-//! ├─ Status Bar ────────────────────────────────────────────┤
-//! └─────────────────────────────────────────────────────────┘
+//! ┌─ Header (phase + goal) ──────────────────────────────────────┐
+//! ├─ Agent Stream (left, full height) ─┬─ Todo List (top-right) ─┤
+//! │                                    ├─ Log (bottom-right) ────┤
+//! │                                    │                         │
+//! ├─ [Input bar, when active] ─────────┴─────────────────────────┤
+//! ├─ Status Bar ─────────────────────────────────────────────────┤
+//! └──────────────────────────────────────────────────────────────┘
 //! ```
 
 use ratatui::prelude::*;
@@ -17,24 +19,27 @@ use super::app::App;
 use super::widgets;
 
 /// Render the full application frame.
-///
-/// Takes `&mut App` so we can clamp scroll positions to actual content height.
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
+
+    // Determine how many rows the input bar needs.
+    let input_height: u16 = if app.input_mode { 3 } else { 0 };
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Min(8),     // agent output panes (top half)
-            Constraint::Length(12), // tool calls + log (bottom half)
-            Constraint::Length(1),  // status bar
+            Constraint::Length(3),            // header
+            Constraint::Min(8),               // main content
+            Constraint::Length(input_height), // input bar (0 or 3)
+            Constraint::Length(1),            // status bar
         ])
         .split(area);
 
     render_header(frame, outer[0], app);
-    render_agent_panes(frame, outer[1], app);
-    render_bottom_panes(frame, outer[2], app);
+    render_main(frame, outer[1], app);
+    if app.input_mode {
+        render_input_bar(frame, outer[2], app);
+    }
     render_status_bar(frame, outer[3], app);
 }
 
@@ -74,114 +79,102 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 // ---------------------------------------------------------------------------
-// Agent output panes (reviewer | worker)
+// Main content: agent pane (left) + todo/log (right)
 // ---------------------------------------------------------------------------
 
-fn render_agent_panes(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(40), // reviewer
-            Constraint::Percentage(60), // worker
+            Constraint::Percentage(60), // agent stream
+            Constraint::Percentage(40), // todo + log
         ])
         .split(area);
 
-    // Reviewer pane
-    {
-        let pane_area = columns[0];
-        let paragraph = widgets::reviewer_paragraph(
-            &app.reviewer_thinking,
-            &app.reviewer_plan,
-            &app.reviewer_output,
-            0,
-            app.focused,
-        );
-        let inner = inner_area(pane_area);
-        let clamped = clamp_scroll(
-            paragraph.line_count(inner.width),
-            inner.height,
-            app.reviewer_scroll,
-        );
-        app.reviewer_scroll = clamped;
-        let paragraph = widgets::reviewer_paragraph(
-            &app.reviewer_thinking,
-            &app.reviewer_plan,
-            &app.reviewer_output,
-            clamped,
-            app.focused,
-        );
-        frame.render_widget(paragraph, pane_area);
-    }
+    // Left: unified agent stream.
+    render_agent_pane(frame, columns[0], app);
 
-    // Worker pane
-    {
-        let pane_area = columns[1];
-        let paragraph = widgets::worker_paragraph(
-            &app.worker_thinking,
-            &app.worker_plan,
-            &app.worker_output,
-            0,
-            app.focused,
-        );
-        let inner = inner_area(pane_area);
-        let clamped = clamp_scroll(
-            paragraph.line_count(inner.width),
-            inner.height,
-            app.worker_scroll,
-        );
-        app.worker_scroll = clamped;
-        let paragraph = widgets::worker_paragraph(
-            &app.worker_thinking,
-            &app.worker_plan,
-            &app.worker_output,
-            clamped,
-            app.focused,
-        );
-        frame.render_widget(paragraph, pane_area);
-    }
+    // Right: todo (top) + log (bottom).
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50), // todo
+            Constraint::Percentage(50), // log
+        ])
+        .split(columns[1]);
+
+    render_todo_pane(frame, right[0], app);
+    render_log_pane(frame, right[1], app);
+}
+
+fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let stream = app.active_stream();
+    let paragraph = widgets::agent_stream_paragraph(stream, app.active_agent, 0, app.focused);
+    let inner = inner_area(area);
+    let clamped = clamp_scroll(
+        paragraph.line_count(inner.width),
+        inner.height,
+        app.agent_scroll,
+    );
+    app.agent_scroll = clamped;
+
+    let paragraph = widgets::agent_stream_paragraph(
+        app.active_stream(),
+        app.active_agent,
+        clamped,
+        app.focused,
+    );
+    frame.render_widget(paragraph, area);
+}
+
+fn render_todo_pane(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let paragraph = widgets::todo_paragraph(&app.todos, 0, app.focused);
+    let inner = inner_area(area);
+    let clamped = clamp_scroll(
+        paragraph.line_count(inner.width),
+        inner.height,
+        app.todo_scroll,
+    );
+    app.todo_scroll = clamped;
+    let paragraph = widgets::todo_paragraph(&app.todos, clamped, app.focused);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_log_pane(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let paragraph = widgets::log_paragraph(&app.log_entries, 0, app.focused);
+    let inner = inner_area(area);
+    let clamped = clamp_scroll(
+        paragraph.line_count(inner.width),
+        inner.height,
+        app.log_scroll,
+    );
+    app.log_scroll = clamped;
+    let paragraph = widgets::log_paragraph(&app.log_entries, clamped, app.focused);
+    frame.render_widget(paragraph, area);
 }
 
 // ---------------------------------------------------------------------------
-// Bottom panes (tool calls | log)
+// Input bar
 // ---------------------------------------------------------------------------
 
-fn render_bottom_panes(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(40), // tools
-            Constraint::Percentage(60), // log
-        ])
-        .split(area);
+fn render_input_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let target_label = app.active_agent.label();
+    let block = Block::default()
+        .title(format!(" Message to {target_label} "))
+        .title_style(Style::default().fg(Color::Yellow).bold())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
 
-    // Tools pane
-    {
-        let pane_area = columns[0];
-        let paragraph = widgets::tool_calls_paragraph(&app.tool_calls, 0, app.focused);
-        let inner = inner_area(pane_area);
-        let clamped = clamp_scroll(
-            paragraph.line_count(inner.width),
-            inner.height,
-            app.tool_scroll,
-        );
-        app.tool_scroll = clamped;
-        let paragraph = widgets::tool_calls_paragraph(&app.tool_calls, clamped, app.focused);
-        frame.render_widget(paragraph, pane_area);
-    }
+    let input_text = Paragraph::new(app.input_buffer.as_str()).block(block);
 
-    // Log pane
-    {
-        let pane_area = columns[1];
-        let paragraph = widgets::log_paragraph(&app.log_entries, 0, app.focused);
-        let inner = inner_area(pane_area);
-        let clamped = clamp_scroll(
-            paragraph.line_count(inner.width),
-            inner.height,
-            app.log_scroll,
-        );
-        app.log_scroll = clamped;
-        let paragraph = widgets::log_paragraph(&app.log_entries, clamped, app.focused);
-        frame.render_widget(paragraph, pane_area);
+    frame.render_widget(input_text, area);
+
+    // Place cursor.
+    let inner = inner_area(area);
+    let cursor_x = inner.x + app.input_cursor as u16;
+    let cursor_y = inner.y;
+    if cursor_x < inner.x + inner.width {
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 
@@ -193,10 +186,11 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let bar = widgets::status_bar(
         &app.phase,
         app.current_cycle,
-        app.max_cycles,
+        app.active_agent,
         app.focused,
         app.abort_requested,
         app.finished,
+        app.input_mode,
     );
     let paragraph = Paragraph::new(bar);
     frame.render_widget(paragraph, area);
@@ -206,7 +200,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Compute the inner area of a block with all borders (1 cell border on each side).
+/// Compute the inner area of a block with all borders.
 fn inner_area(area: Rect) -> Rect {
     Rect {
         x: area.x.saturating_add(1),
@@ -217,12 +211,6 @@ fn inner_area(area: Rect) -> Rect {
 }
 
 /// Clamp a scroll value so the viewport always shows content at the bottom.
-///
-/// `total_lines` is the number of wrapped lines in the paragraph.
-/// `viewport_height` is the inner height of the pane (excluding borders).
-/// `requested` is the raw scroll offset (may be `u16::MAX` for "go to bottom").
-///
-/// Returns the clamped scroll value.
 fn clamp_scroll(total_lines: usize, viewport_height: u16, requested: u16) -> u16 {
     let max_scroll = total_lines.saturating_sub(viewport_height as usize);
     let max_scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);

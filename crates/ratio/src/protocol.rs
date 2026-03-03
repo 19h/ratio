@@ -46,6 +46,9 @@ pub enum AgentEvent {
     /// The agent's plan was updated (list of tasks with status).
     PlanUpdated(Vec<PlanEntry>),
 
+    /// The agent updated the shared todo list (via TodoWrite tool call).
+    TodoUpdated(Vec<TodoEntry>),
+
     /// The agent requested permission to perform an action.
     PermissionRequested {
         description: String,
@@ -72,6 +75,7 @@ pub enum ToolKind {
     Think,
     Fetch,
     SwitchMode,
+    Todo,
     Other,
 }
 
@@ -121,6 +125,14 @@ pub enum StopReason {
     EndTurn,
     Cancelled,
     Other(String),
+}
+
+/// A single todo entry as parsed from a TodoWrite tool call.
+#[derive(Debug, Clone)]
+pub struct TodoEntry {
+    pub content: String,
+    pub status: String,
+    pub priority: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +234,45 @@ impl OrchestratorClient {
             })
             .collect()
     }
+
+    /// Check if a tool call looks like a TodoWrite and try to extract todo items.
+    ///
+    /// The agent's TodoWrite calls have `raw_input` as a JSON object with a
+    /// `todos` key containing an array of `{ content, status, priority }`.
+    fn try_extract_todos(raw_input: &Option<serde_json::Value>) -> Option<Vec<TodoEntry>> {
+        let input = raw_input.as_ref()?;
+        let obj = input.as_object()?;
+        let todos_val = obj.get("todos")?;
+        let todos_arr = todos_val.as_array()?;
+
+        let mut entries = Vec::new();
+        for item in todos_arr {
+            let obj = item.as_object()?;
+            let content = obj.get("content")?.as_str()?.to_string();
+            let status = obj
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pending")
+                .to_string();
+            let priority = obj
+                .get("priority")
+                .and_then(|v| v.as_str())
+                .unwrap_or("medium")
+                .to_string();
+            entries.push(TodoEntry {
+                content,
+                status,
+                priority,
+            });
+        }
+        Some(entries)
+    }
+
+    /// Check if this is a TodoWrite tool call by its title.
+    fn is_todo_tool(title: &str) -> bool {
+        let lower = title.to_lowercase();
+        lower.contains("todowrite") || lower.contains("todo_write") || lower.contains("todo write")
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -270,7 +321,6 @@ impl acp::Client for OrchestratorClient {
             }
         } else {
             // In interactive mode we currently auto-approve.
-            // A future version could prompt the user through the TUI.
             let option = args.options.first();
             if let Some(opt) = option {
                 Ok(acp::RequestPermissionResponse::new(
@@ -300,9 +350,21 @@ impl acp::Client for OrchestratorClient {
             acp::SessionUpdate::ToolCall(tc) => {
                 let id = tc.tool_call_id.0.to_string();
                 let title = tc.title.clone();
-                let kind = Self::map_tool_kind(&tc.kind);
+                let kind = if Self::is_todo_tool(&title) {
+                    ToolKind::Todo
+                } else {
+                    Self::map_tool_kind(&tc.kind)
+                };
                 let raw_input = tc.raw_input.clone();
                 let locations = Self::map_locations(&tc.locations);
+
+                // If this is a TodoWrite call, extract the todo items.
+                if kind == ToolKind::Todo {
+                    if let Some(entries) = Self::try_extract_todos(&raw_input) {
+                        self.emit(AgentEvent::TodoUpdated(entries));
+                    }
+                }
+
                 self.emit(AgentEvent::ToolCallStarted {
                     id,
                     title,
@@ -340,6 +402,15 @@ impl acp::Client for OrchestratorClient {
                     .locations
                     .as_deref()
                     .map_or_else(Vec::new, Self::map_locations);
+
+                // Check if this update includes new todo data.
+                if let Some(ref t) = title {
+                    if Self::is_todo_tool(t) {
+                        if let Some(entries) = Self::try_extract_todos(&raw_input) {
+                            self.emit(AgentEvent::TodoUpdated(entries));
+                        }
+                    }
+                }
 
                 self.emit(AgentEvent::ToolCallUpdated {
                     id,
@@ -406,7 +477,7 @@ impl acp::Client for OrchestratorClient {
 // Connection handle
 // ---------------------------------------------------------------------------
 
-/// A live ACP connection to a worker agent subprocess.
+/// A live ACP connection to an agent subprocess.
 ///
 /// Wraps [`acp::ClientSideConnection`] and provides ergonomic methods
 /// for the orchestrator to drive the agent through the review loop.
@@ -494,7 +565,7 @@ impl WorkerConnection {
         Ok(())
     }
 
-    /// Send a prompt to the worker and wait for the turn to complete.
+    /// Send a prompt to the agent and wait for the turn to complete.
     ///
     /// Returns the stop reason and the full accumulated text from the turn.
     pub async fn prompt(&self, text: &str) -> anyhow::Result<(StopReason, String)> {

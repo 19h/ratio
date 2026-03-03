@@ -5,12 +5,12 @@ use std::collections::VecDeque;
 use chrono::Local;
 
 use crate::orchestrator::{LogLevel, OrchestratorEvent, Phase, ReviewVerdict};
-use crate::protocol::{AgentEvent, PlanEntry, ToolCallLocation, ToolCallState, ToolKind};
+use crate::protocol::{AgentEvent, ToolCallLocation, ToolCallState, ToolKind};
 
 /// Maximum number of log lines retained.
 const MAX_LOG_LINES: usize = 2000;
-/// Maximum number of tool call records retained.
-const MAX_TOOL_CALLS: usize = 500;
+/// Maximum number of stream entries retained per agent.
+const MAX_STREAM_ENTRIES: usize = 5000;
 
 // ---------------------------------------------------------------------------
 // Pane focus
@@ -19,55 +19,109 @@ const MAX_TOOL_CALLS: usize = 500;
 /// Which pane is currently focused for scrolling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusedPane {
-    Reviewer,
-    Worker,
-    Tools,
+    Agent,
+    Todo,
     Log,
 }
 
 impl FocusedPane {
     pub fn next(self) -> Self {
         match self {
-            Self::Reviewer => Self::Worker,
-            Self::Worker => Self::Tools,
-            Self::Tools => Self::Log,
-            Self::Log => Self::Reviewer,
+            Self::Agent => Self::Todo,
+            Self::Todo => Self::Log,
+            Self::Log => Self::Agent,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::Reviewer => Self::Log,
-            Self::Worker => Self::Reviewer,
-            Self::Tools => Self::Worker,
-            Self::Log => Self::Tools,
+            Self::Agent => Self::Log,
+            Self::Todo => Self::Agent,
+            Self::Log => Self::Todo,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Tool call display record
+// Which agent's output is shown in the main pane
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct ToolCallRecord {
-    pub id: String,
-    pub title: String,
-    pub kind: ToolKind,
-    pub status: ToolCallState,
-    pub source: AgentSource,
-    pub content: Option<String>,
-    pub raw_input: Option<serde_json::Value>,
-    pub raw_output: Option<serde_json::Value>,
-    pub locations: Vec<ToolCallLocation>,
-    pub timestamp: String,
-}
 
 /// Which agent produced this event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentSource {
     Worker,
     Reviewer,
+}
+
+impl AgentSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Worker => "Worker",
+            Self::Reviewer => "Reviewer",
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Worker => Self::Reviewer,
+            Self::Reviewer => Self::Worker,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified stream entry — everything the agent emits in chronological order
+// ---------------------------------------------------------------------------
+
+/// A single entry in the unified agent output stream.
+#[derive(Debug, Clone)]
+pub enum StreamEntry {
+    /// A chunk of assistant text output.
+    Text(String),
+    /// A chunk of thinking/reasoning.
+    Thought(String),
+    /// A tool call started.
+    ToolStart {
+        id: String,
+        title: String,
+        kind: ToolKind,
+        detail: String,
+    },
+    /// A tool call completed or failed.
+    ToolEnd {
+        id: String,
+        title: String,
+        status: ToolCallState,
+    },
+    /// A separator between turns / phases.
+    Separator(String),
+}
+
+// ---------------------------------------------------------------------------
+// Todo item (from agent's TodoWrite tool calls)
+// ---------------------------------------------------------------------------
+
+/// A single todo item parsed from the agent's TodoWrite tool calls.
+#[derive(Debug, Clone)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+    pub priority: TodoPriority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TodoPriority {
+    High,
+    Medium,
+    Low,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +136,17 @@ pub struct LogEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Queued user message
+// ---------------------------------------------------------------------------
+
+/// A message queued by the user to be sent to the active agent.
+#[derive(Debug, Clone)]
+pub struct QueuedMessage {
+    pub text: String,
+    pub target: AgentSource,
+}
+
+// ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
 
@@ -90,43 +155,38 @@ pub struct App {
     /// Current orchestration phase.
     pub phase: Phase,
 
-    /// Streaming text from the reviewer (current turn).
-    pub reviewer_output: String,
-    /// Streaming thinking text from the reviewer (current turn).
-    pub reviewer_thinking: String,
-    /// Scroll offset for the reviewer pane.
-    pub reviewer_scroll: u16,
+    /// Which agent is currently displayed in the main (left) pane.
+    pub active_agent: AgentSource,
 
-    /// Streaming text from the worker (current turn).
-    pub worker_output: String,
-    /// Streaming thinking text from the worker (current turn).
-    pub worker_thinking: String,
-    /// Scroll offset for the worker pane.
-    pub worker_scroll: u16,
+    /// Unified chronological stream for the worker.
+    pub worker_stream: VecDeque<StreamEntry>,
+    /// Unified chronological stream for the reviewer.
+    pub reviewer_stream: VecDeque<StreamEntry>,
 
-    /// Current plan entries from the worker agent.
-    pub worker_plan: Vec<PlanEntry>,
-    /// Current plan entries from the reviewer agent.
-    pub reviewer_plan: Vec<PlanEntry>,
+    /// Scroll offset for the agent pane.
+    pub agent_scroll: u16,
+    /// Whether to auto-scroll the agent pane.
+    pub auto_scroll_agent: bool,
 
-    /// Tool call records from both agents.
-    pub tool_calls: VecDeque<ToolCallRecord>,
-    /// Scroll offset for the tool pane.
-    pub tool_scroll: u16,
+    /// Shared todo list (updated via TodoWrite tool calls).
+    pub todos: Vec<TodoItem>,
+    /// Scroll offset for the todo pane.
+    pub todo_scroll: u16,
+    /// Whether to auto-scroll the todo pane.
+    pub auto_scroll_todo: bool,
 
     /// Log entries from orchestrator + protocol.
     pub log_entries: VecDeque<LogEntry>,
     /// Scroll offset for the log pane.
     pub log_scroll: u16,
+    /// Whether to auto-scroll the log pane.
+    pub auto_scroll_log: bool,
 
     /// Which pane is focused.
     pub focused: FocusedPane,
 
     /// Current review cycle number.
     pub current_cycle: usize,
-
-    /// Maximum configured review cycles.
-    pub max_cycles: usize,
 
     /// Whether the user has triggered an abort.
     pub abort_requested: bool,
@@ -137,78 +197,101 @@ pub struct App {
     /// Final phase (set when finished).
     pub final_phase: Option<Phase>,
 
-    /// Whether to auto-scroll the reviewer pane.
-    pub auto_scroll_reviewer: bool,
-
-    /// Whether to auto-scroll the worker pane.
-    pub auto_scroll_worker: bool,
-
-    /// Whether to auto-scroll the tools pane.
-    pub auto_scroll_tools: bool,
-
-    /// Whether to auto-scroll the log pane.
-    pub auto_scroll_log: bool,
-
     /// Number of Ctrl+C presses (double-tap to kill).
     pub ctrl_c_count: u8,
 
     /// Goal description (for header display).
     pub goal: String,
+
+    /// Whether the user is currently typing a message.
+    pub input_mode: bool,
+
+    /// Current input buffer.
+    pub input_buffer: String,
+
+    /// Cursor position within the input buffer.
+    pub input_cursor: usize,
+
+    /// Queue of messages to send to agents.
+    pub message_queue: VecDeque<QueuedMessage>,
 }
 
 impl App {
-    pub fn new(goal: String, max_cycles: usize) -> Self {
+    pub fn new(goal: String) -> Self {
         Self {
             phase: Phase::Idle,
-            reviewer_output: String::new(),
-            reviewer_thinking: String::new(),
-            reviewer_scroll: 0,
-            worker_output: String::new(),
-            worker_thinking: String::new(),
-            worker_scroll: 0,
-            worker_plan: Vec::new(),
-            reviewer_plan: Vec::new(),
-            tool_calls: VecDeque::new(),
-            tool_scroll: 0,
+            active_agent: AgentSource::Worker,
+            worker_stream: VecDeque::new(),
+            reviewer_stream: VecDeque::new(),
+            agent_scroll: 0,
+            auto_scroll_agent: true,
+            todos: Vec::new(),
+            todo_scroll: 0,
+            auto_scroll_todo: true,
             log_entries: VecDeque::new(),
             log_scroll: 0,
-            focused: FocusedPane::Worker,
+            auto_scroll_log: true,
+            focused: FocusedPane::Agent,
             current_cycle: 0,
-            max_cycles,
             abort_requested: false,
             finished: false,
             final_phase: None,
-            auto_scroll_reviewer: true,
-            auto_scroll_worker: true,
-            auto_scroll_tools: true,
-            auto_scroll_log: true,
             ctrl_c_count: 0,
             goal,
+            input_mode: false,
+            input_buffer: String::new(),
+            input_cursor: 0,
+            message_queue: VecDeque::new(),
         }
+    }
+
+    /// Get the currently active agent's stream.
+    pub fn active_stream(&self) -> &VecDeque<StreamEntry> {
+        match self.active_agent {
+            AgentSource::Worker => &self.worker_stream,
+            AgentSource::Reviewer => &self.reviewer_stream,
+        }
+    }
+
+    /// Toggle which agent is displayed in the main pane.
+    pub fn toggle_agent(&mut self) {
+        self.active_agent = self.active_agent.toggle();
+        // Reset scroll to bottom when switching.
+        self.agent_scroll = u16::MAX;
+        self.auto_scroll_agent = true;
+    }
+
+    /// Submit the current input buffer as a queued message.
+    pub fn submit_input(&mut self) {
+        let text = self.input_buffer.trim().to_string();
+        if !text.is_empty() {
+            self.message_queue.push_back(QueuedMessage {
+                text: text.clone(),
+                target: self.active_agent,
+            });
+            self.push_log(
+                LogLevel::Info,
+                format!("[User -> {:?}] {}", self.active_agent, text),
+            );
+        }
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+        self.input_mode = false;
     }
 
     /// Process an orchestrator event and update the TUI state.
     pub fn handle_event(&mut self, event: OrchestratorEvent) {
         match event {
             OrchestratorEvent::PhaseChanged(ref phase) => {
+                // Insert phase-change separator into the relevant agent stream.
+                let sep = format!("--- {} ---", phase_label(phase));
                 match phase {
                     Phase::Working | Phase::Revising => {
                         self.current_cycle += 1;
-                        // Clear worker output for new cycle.
-                        self.worker_output.clear();
-                        self.worker_thinking.clear();
-                        self.worker_scroll = 0;
+                        self.push_stream(AgentSource::Worker, StreamEntry::Separator(sep));
                     }
-                    Phase::Planning => {
-                        self.reviewer_output.clear();
-                        self.reviewer_thinking.clear();
-                        self.reviewer_scroll = 0;
-                    }
-                    Phase::Reviewing => {
-                        // Clear reviewer output for new review cycle.
-                        self.reviewer_output.clear();
-                        self.reviewer_thinking.clear();
-                        self.reviewer_scroll = 0;
+                    Phase::Planning | Phase::Reviewing => {
+                        self.push_stream(AgentSource::Reviewer, StreamEntry::Separator(sep));
                     }
                     _ => {}
                 }
@@ -227,7 +310,7 @@ impl App {
                 self.push_log(
                     LogLevel::Info,
                     format!(
-                        "Cycle {} completed — verdict: {}",
+                        "Cycle {} completed: {}",
                         record.cycle,
                         match record.verdict {
                             ReviewVerdict::Approved { .. } => "APPROVED".to_string(),
@@ -246,45 +329,15 @@ impl App {
 
     fn handle_agent_event(&mut self, event: AgentEvent, source: AgentSource) {
         match event {
-            AgentEvent::TextChunk(text) => match source {
-                AgentSource::Worker => {
-                    self.worker_output.push_str(&text);
-                    if self.auto_scroll_worker {
-                        self.worker_scroll = u16::MAX;
-                    }
-                }
-                AgentSource::Reviewer => {
-                    self.reviewer_output.push_str(&text);
-                    if self.auto_scroll_reviewer {
-                        self.reviewer_scroll = u16::MAX;
-                    }
-                }
-            },
-            AgentEvent::ThoughtChunk(text) => match source {
-                AgentSource::Worker => {
-                    self.worker_thinking.push_str(&text);
-                    if self.auto_scroll_worker {
-                        self.worker_scroll = u16::MAX;
-                    }
-                }
-                AgentSource::Reviewer => {
-                    self.reviewer_thinking.push_str(&text);
-                    if self.auto_scroll_reviewer {
-                        self.reviewer_scroll = u16::MAX;
-                    }
-                }
-            },
-            AgentEvent::PlanUpdated(entries) => {
-                match source {
-                    AgentSource::Worker => self.worker_plan = entries,
-                    AgentSource::Reviewer => self.reviewer_plan = entries,
-                }
-                if self.auto_scroll_worker && source == AgentSource::Worker {
-                    self.worker_scroll = u16::MAX;
-                }
-                if self.auto_scroll_reviewer && source == AgentSource::Reviewer {
-                    self.reviewer_scroll = u16::MAX;
-                }
+            AgentEvent::TextChunk(text) => {
+                self.push_stream(source, StreamEntry::Text(text));
+            }
+            AgentEvent::ThoughtChunk(text) => {
+                self.push_stream(source, StreamEntry::Thought(text));
+            }
+            AgentEvent::PlanUpdated(_entries) => {
+                // Plans are shown in the stream as info, not as a separate panel.
+                // We no longer use them since todo list replaces this.
             }
             AgentEvent::ToolCallStarted {
                 id,
@@ -293,82 +346,52 @@ impl App {
                 raw_input,
                 locations,
             } => {
-                // Inject a progress line into the agent's output pane.
-                let inline = Self::format_tool_inline(&kind, &title, &locations, &raw_input);
-                self.append_agent_output(source, &format!("\n{inline}"));
-
-                let record = ToolCallRecord {
-                    id,
-                    title,
-                    kind,
-                    status: ToolCallState::InProgress,
+                let detail = Self::extract_tool_detail(&kind, &title, &locations, &raw_input);
+                self.push_stream(
                     source,
-                    content: None,
-                    raw_input,
-                    raw_output: None,
-                    locations,
-                    timestamp: Local::now().format("%H:%M:%S").to_string(),
-                };
-                self.tool_calls.push_back(record);
-                if self.tool_calls.len() > MAX_TOOL_CALLS {
-                    self.tool_calls.pop_front();
-                }
-                if self.auto_scroll_tools {
-                    self.tool_scroll = u16::MAX;
-                }
+                    StreamEntry::ToolStart {
+                        id,
+                        title,
+                        kind,
+                        detail,
+                    },
+                );
             }
             AgentEvent::ToolCallUpdated {
-                id,
-                title,
-                status,
-                content,
-                raw_input,
-                raw_output,
-                locations,
+                id, title, status, ..
             } => {
-                // Extract completion marker info outside the mutable borrow of self.tool_calls.
-                let completion_marker: Option<(AgentSource, String)> = {
-                    if let Some(tc) = self.tool_calls.iter_mut().rev().find(|tc| tc.id == id) {
-                        let was_in_progress = tc.status == ToolCallState::InProgress;
-                        if let Some(t) = title {
-                            tc.title = t;
-                        }
-                        tc.status = status.clone();
-                        if content.is_some() {
-                            tc.content = content;
-                        }
-                        if raw_input.is_some() {
-                            tc.raw_input = raw_input;
-                        }
-                        if raw_output.is_some() {
-                            tc.raw_output = raw_output;
-                        }
-                        if !locations.is_empty() {
-                            tc.locations = locations.clone();
-                        }
-
-                        if was_in_progress
-                            && (status == ToolCallState::Completed
-                                || status == ToolCallState::Failed)
-                        {
-                            let marker = if status == ToolCallState::Completed {
-                                format!("  [ok] {}\n", tc.title)
-                            } else {
-                                format!("  [FAIL] {}\n", tc.title)
-                            };
-                            Some((tc.source, marker))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-                if let Some((agent_source, marker)) = completion_marker {
-                    self.append_agent_output(agent_source, &marker);
+                if status == ToolCallState::Completed || status == ToolCallState::Failed {
+                    self.push_stream(
+                        source,
+                        StreamEntry::ToolEnd {
+                            id,
+                            title: title.unwrap_or_default(),
+                            status,
+                        },
+                    );
                 }
-                if self.auto_scroll_tools {
-                    self.tool_scroll = u16::MAX;
+            }
+            AgentEvent::TodoUpdated(items) => {
+                // Replace the shared todo list.
+                self.todos = items
+                    .into_iter()
+                    .map(|item| TodoItem {
+                        content: item.content,
+                        status: match item.status.as_str() {
+                            "in_progress" => TodoStatus::InProgress,
+                            "completed" => TodoStatus::Completed,
+                            "cancelled" => TodoStatus::Cancelled,
+                            _ => TodoStatus::Pending,
+                        },
+                        priority: match item.priority.as_str() {
+                            "high" => TodoPriority::High,
+                            "low" => TodoPriority::Low,
+                            _ => TodoPriority::Medium,
+                        },
+                    })
+                    .collect();
+                if self.auto_scroll_todo {
+                    self.todo_scroll = u16::MAX;
                 }
             }
             AgentEvent::PermissionRequested { description } => {
@@ -389,6 +412,21 @@ impl App {
         }
     }
 
+    fn push_stream(&mut self, source: AgentSource, entry: StreamEntry) {
+        let stream = match source {
+            AgentSource::Worker => &mut self.worker_stream,
+            AgentSource::Reviewer => &mut self.reviewer_stream,
+        };
+        stream.push_back(entry);
+        if stream.len() > MAX_STREAM_ENTRIES {
+            stream.pop_front();
+        }
+        // Auto-scroll if viewing this agent.
+        if source == self.active_agent && self.auto_scroll_agent {
+            self.agent_scroll = u16::MAX;
+        }
+    }
+
     fn push_log(&mut self, level: LogLevel, message: String) {
         let entry = LogEntry {
             timestamp: Local::now().format("%H:%M:%S%.3f").to_string(),
@@ -404,20 +442,20 @@ impl App {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Scrolling
+    // -----------------------------------------------------------------------
+
     /// Scroll the focused pane up by `n` lines.
     pub fn scroll_up(&mut self, n: u16) {
         match self.focused {
-            FocusedPane::Reviewer => {
-                self.reviewer_scroll = self.reviewer_scroll.saturating_sub(n);
-                self.auto_scroll_reviewer = false;
+            FocusedPane::Agent => {
+                self.agent_scroll = self.agent_scroll.saturating_sub(n);
+                self.auto_scroll_agent = false;
             }
-            FocusedPane::Worker => {
-                self.worker_scroll = self.worker_scroll.saturating_sub(n);
-                self.auto_scroll_worker = false;
-            }
-            FocusedPane::Tools => {
-                self.tool_scroll = self.tool_scroll.saturating_sub(n);
-                self.auto_scroll_tools = false;
+            FocusedPane::Todo => {
+                self.todo_scroll = self.todo_scroll.saturating_sub(n);
+                self.auto_scroll_todo = false;
             }
             FocusedPane::Log => {
                 self.log_scroll = self.log_scroll.saturating_sub(n);
@@ -429,14 +467,11 @@ impl App {
     /// Scroll the focused pane down by `n` lines.
     pub fn scroll_down(&mut self, n: u16) {
         match self.focused {
-            FocusedPane::Reviewer => {
-                self.reviewer_scroll = self.reviewer_scroll.saturating_add(n);
+            FocusedPane::Agent => {
+                self.agent_scroll = self.agent_scroll.saturating_add(n);
             }
-            FocusedPane::Worker => {
-                self.worker_scroll = self.worker_scroll.saturating_add(n);
-            }
-            FocusedPane::Tools => {
-                self.tool_scroll = self.tool_scroll.saturating_add(n);
+            FocusedPane::Todo => {
+                self.todo_scroll = self.todo_scroll.saturating_add(n);
             }
             FocusedPane::Log => {
                 self.log_scroll = self.log_scroll.saturating_add(n);
@@ -447,17 +482,13 @@ impl App {
     /// Jump to the bottom of the focused pane and re-enable auto-scroll.
     pub fn scroll_to_bottom(&mut self) {
         match self.focused {
-            FocusedPane::Reviewer => {
-                self.reviewer_scroll = u16::MAX;
-                self.auto_scroll_reviewer = true;
+            FocusedPane::Agent => {
+                self.agent_scroll = u16::MAX;
+                self.auto_scroll_agent = true;
             }
-            FocusedPane::Worker => {
-                self.worker_scroll = u16::MAX;
-                self.auto_scroll_worker = true;
-            }
-            FocusedPane::Tools => {
-                self.tool_scroll = u16::MAX;
-                self.auto_scroll_tools = true;
+            FocusedPane::Todo => {
+                self.todo_scroll = u16::MAX;
+                self.auto_scroll_todo = true;
             }
             FocusedPane::Log => {
                 self.log_scroll = u16::MAX;
@@ -467,65 +498,20 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Helpers for inline tool call progress
+    // Helpers for tool call detail extraction
     // -----------------------------------------------------------------------
 
-    /// Append text to the appropriate agent's output pane and auto-scroll.
-    fn append_agent_output(&mut self, source: AgentSource, text: &str) {
-        match source {
-            AgentSource::Worker => {
-                self.worker_output.push_str(text);
-                if self.auto_scroll_worker {
-                    self.worker_scroll = u16::MAX;
-                }
-            }
-            AgentSource::Reviewer => {
-                self.reviewer_output.push_str(text);
-                if self.auto_scroll_reviewer {
-                    self.reviewer_scroll = u16::MAX;
-                }
-            }
-        }
-    }
-
-    /// Format a tool call as an inline progress line for the output pane.
-    fn format_tool_inline(
+    /// Extract the most useful one-liner from a tool call for inline display.
+    fn extract_tool_detail(
         kind: &ToolKind,
         title: &str,
         locations: &[ToolCallLocation],
         raw_input: &Option<serde_json::Value>,
     ) -> String {
-        let kind_label = match kind {
-            ToolKind::Read => "read",
-            ToolKind::Edit => "edit",
-            ToolKind::Delete => "delete",
-            ToolKind::Move => "move",
-            ToolKind::Search => "search",
-            ToolKind::Execute => "exec",
-            ToolKind::Think => "think",
-            ToolKind::Fetch => "fetch",
-            ToolKind::SwitchMode => "mode",
-            ToolKind::Other => "tool",
-        };
-
-        // Try to extract the most useful detail: file path from locations,
-        // or a command from raw_input, or fall back to title.
-        let detail = Self::extract_tool_detail(kind, locations, raw_input)
-            .unwrap_or_else(|| title.to_string());
-
-        format!("  [{kind_label}] {detail}\n")
-    }
-
-    /// Extract the most useful one-liner from a tool call.
-    fn extract_tool_detail(
-        kind: &ToolKind,
-        locations: &[ToolCallLocation],
-        raw_input: &Option<serde_json::Value>,
-    ) -> Option<String> {
         // For file-oriented operations, show the path.
         if let Some(loc) = locations.first() {
             let line_suffix = loc.line.map(|l| format!(":{l}")).unwrap_or_default();
-            return Some(format!("{}{line_suffix}", loc.path));
+            return format!("{}{line_suffix}", loc.path);
         }
 
         // For execute, try to find a "command" key in raw_input.
@@ -537,13 +523,13 @@ impl App {
                     } else {
                         cmd.clone()
                     };
-                    return Some(truncated);
+                    return truncated;
                 }
             }
             // For read/edit, try "path" or "file" keys.
             for key in &["path", "file", "filePath", "file_path"] {
                 if let Some(serde_json::Value::String(p)) = map.get(*key) {
-                    return Some(p.clone());
+                    return p.clone();
                 }
             }
             // For search, try "pattern" or "query".
@@ -554,11 +540,29 @@ impl App {
                     } else {
                         q.clone()
                     };
-                    return Some(truncated);
+                    return truncated;
                 }
             }
         }
 
-        None
+        title.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn phase_label(phase: &Phase) -> &str {
+    match phase {
+        Phase::Idle => "idle",
+        Phase::Initializing => "init",
+        Phase::Planning => "planning",
+        Phase::Working => "working",
+        Phase::Reviewing => "reviewing",
+        Phase::Revising => "revising",
+        Phase::Approved => "approved",
+        Phase::Failed(_) => "failed",
+        Phase::Aborted => "aborted",
     }
 }

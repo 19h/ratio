@@ -1,16 +1,14 @@
 //! Core orchestration engine.
 //!
 //! The orchestrator manages two LLM agents:
-//! - **Reviewer** — the primary agent that accepts the user's goal, formulates
-//!   work instructions, and performs substantive LLM-powered review of output
-//! - **Worker** — the secondary agent that executes the work instructions
+//! - **Reviewer** — accepts the user's goal, asks clarifying questions until
+//!   the task is irrefutably understood, formulates work instructions, and
+//!   reviews worker output in unlimited cycles until approved or rejected.
+//! - **Worker** — executes work instructions, maintains implementation notes
+//!   on disk, and keeps the shared todo list up to date.
 //!
-//! The flow:
-//! 1. User provides goal + constraints
-//! 2. Reviewer receives the goal and produces a work instruction for the worker
-//! 3. Worker executes the instruction and produces output
-//! 4. Reviewer receives the output and either approves, requests revision, or rejects
-//! 5. If revision needed: reviewer's feedback becomes the next instruction, loop
+//! There is **no cycle limit** — the loop runs until the reviewer approves,
+//! explicitly rejects, or the user aborts.
 
 use tokio::sync::mpsc;
 
@@ -30,7 +28,7 @@ pub enum Phase {
     Idle,
     /// Setting up agent subprocesses and ACP sessions.
     Initializing,
-    /// The reviewer is formulating the initial work instruction.
+    /// The reviewer is asking questions and formulating the work instruction.
     Planning,
     /// Worker is actively executing a task.
     Working,
@@ -40,7 +38,7 @@ pub enum Phase {
     Revising,
     /// Task is approved — orchestration complete.
     Approved,
-    /// Task failed or was aborted.
+    /// Task failed or was rejected.
     Failed(String),
     /// User requested emergency stop.
     Aborted,
@@ -74,8 +72,8 @@ pub struct CycleRecord {
 
 /// The main orchestration engine.
 ///
-/// Drives two LLM agents (reviewer + worker) through iterative work-review
-/// cycles until the reviewer approves the output, the cycle limit is reached,
+/// Drives two LLM agents (reviewer + worker) through unlimited iterative
+/// work-review cycles until the reviewer approves, explicitly rejects,
 /// or an error / abort occurs.
 pub struct Orchestrator {
     config: Config,
@@ -180,11 +178,35 @@ impl Orchestrator {
     }
 
     // -----------------------------------------------------------------------
-    // Prompt construction for the REVIEWER
+    // Prompt construction
     // -----------------------------------------------------------------------
 
-    /// Build the prompt that asks the reviewer to formulate the initial work
-    /// instruction for the worker.
+    /// Shared instructions about todo list and implementation notes that both
+    /// agents receive.
+    fn shared_instructions(&self) -> String {
+        format!(
+            "\n\n═══ SHARED WORKSPACE PROTOCOL ═══\n\n\
+             IMPLEMENTATION NOTES:\n\
+             You MUST maintain an `agents.md` file (or `claude.md` if that is the convention \
+             in the project) in the working directory. This file must contain:\n\
+             - Current understanding of the task\n\
+             - Implementation decisions and rationale\n\
+             - Open questions and blockers\n\
+             - Progress notes\n\
+             Keep this file up to date as you work. The reviewer will read it.\n\n\
+             TODO LIST:\n\
+             You MUST use the TodoWrite tool to maintain a shared todo list. \
+             This todo list is visible to BOTH the reviewer and the worker in real time \
+             via the orchestrator's TUI. It is critical that you keep it accurate and \
+             up to date as tasks are started, progressed, and completed.\n\n\
+             Working directory: {cwd}\n\
+             ═══ END SHARED WORKSPACE PROTOCOL ═══",
+            cwd = self.config.cwd.display(),
+        )
+    }
+
+    /// Build the prompt that asks the reviewer to deeply understand the task
+    /// before formulating work instructions.
     fn build_planning_prompt(&self) -> String {
         let constraints = self.config.constraints.render_prompt_section();
         let constraint_block = if constraints.is_empty() {
@@ -200,9 +222,11 @@ impl Orchestrator {
             .as_deref()
             .unwrap_or(
                 "You are a senior technical reviewer and task planner. \
-                 Your job is to decompose goals into precise, actionable \
-                 work instructions for a coding agent.",
+                 Your primary responsibility is to ensure tasks are understood \
+                 completely and unambiguously before any work begins.",
             );
+
+        let shared = self.shared_instructions();
 
         format!(
             "{system_prefix}\n\n\
@@ -210,17 +234,35 @@ impl Orchestrator {
              ═══ GOAL ═══\n\
              {goal}\n\
              ═══ END GOAL ═══\n\
-             {constraint_block}\n\
-             Your task: produce a DETAILED, PRECISE work instruction that a \
-             coding agent (the \"worker\") will execute. The worker has access \
-             to the filesystem, can run commands, and can edit files.\n\n\
-             Requirements for your instruction:\n\
-             1. Be specific about what files to examine, modify, or create\n\
-             2. Explicitly state which tools/commands the worker must run\n\
-             3. Include all constraints above — the worker must follow them\n\
-             4. Tell the worker to summarize its changes when done\n\
-             5. Tell the worker NOT to ask follow-up questions — just do the work\n\n\
-             Output ONLY the work instruction. Nothing else.",
+             {constraint_block}\
+             {shared}\n\n\
+             ═══ PLANNING PHASE INSTRUCTIONS ═══\n\n\
+             Your job right now is to DEEPLY UNDERSTAND the task before producing \
+             any work instruction. You must:\n\n\
+             1. READ the codebase thoroughly — examine the project structure, existing \
+                code, tests, configuration files, and any documentation.\n\
+             2. IDENTIFY every open question, ambiguity, or missing detail in the goal. \
+                Think about edge cases, implicit requirements, architectural decisions, \
+                and potential conflicts with existing code.\n\
+             3. Keep asking questions and investigating until you are ABSOLUTELY CERTAIN \
+                that the task is irrefutably understood. Leave NO open questions.\n\
+             4. Once you are confident, write a comprehensive `agents.md` file with your \
+                analysis and create an initial todo list with the TodoWrite tool.\n\
+             5. THEN produce a DETAILED, PRECISE work instruction for the worker agent.\n\n\
+             The worker agent has access to the filesystem, can run commands, and can \
+             edit files. Be specific about:\n\
+             - What files to examine, modify, or create\n\
+             - What tools/commands the worker must run\n\
+             - All constraints that must be followed\n\
+             - Expected outcomes and acceptance criteria\n\n\
+             Tell the worker:\n\
+             - It MUST use TodoWrite to keep the shared todo list updated\n\
+             - It MUST keep agents.md updated with implementation notes\n\
+             - It must summarize its changes when done\n\
+             - It must NOT ask follow-up questions — just do the work\n\
+             - The todo list is shared with the reviewer and must be kept current\n\n\
+             Output your work instruction at the end, after you've completed your analysis.\n\
+             ═══ END PLANNING INSTRUCTIONS ═══",
             goal = self.config.goal,
         )
     }
@@ -228,7 +270,6 @@ impl Orchestrator {
     /// Build the prompt that asks the reviewer to assess the worker's output.
     fn build_review_prompt(&self, cycle: usize, instruction: &str, output: &str) -> String {
         let constraints = self.config.constraints.render_prompt_section();
-        let max = self.config.orchestration.max_review_cycles;
 
         let system_prefix = self
             .config
@@ -241,24 +282,34 @@ impl Orchestrator {
                  and all specified constraints.",
             );
 
+        let shared = self.shared_instructions();
+
         format!(
             "{system_prefix}\n\n\
              ═══ ORIGINAL GOAL ═══\n\
              {goal}\n\
              ═══ END GOAL ═══\n\n\
              {constraints}\n\n\
+             {shared}\n\n\
              ═══ INSTRUCTION SENT TO WORKER ═══\n\
              {instruction}\n\
              ═══ END INSTRUCTION ═══\n\n\
-             ═══ WORKER OUTPUT (cycle {cycle}/{max}) ═══\n\
+             ═══ WORKER OUTPUT (cycle {cycle}) ═══\n\
              {output}\n\
              ═══ END WORKER OUTPUT ═══\n\n\
+             IMPORTANT: Read the agents.md file and the current todo list to understand \
+             the full context. Check the actual files on disk — don't just trust the \
+             worker's summary.\n\n\
              Review the worker's output thoroughly. Check:\n\
              1. Did the worker accomplish the goal?\n\
              2. Were all required tools used?\n\
              3. Were all constraints respected?\n\
              4. Is the code correct, idiomatic, and complete?\n\
-             5. Are there any issues, omissions, or violations?\n\n\
+             5. Are there any issues, omissions, or violations?\n\
+             6. Is the todo list accurately reflecting the current state?\n\
+             7. Is agents.md up to date with implementation notes?\n\n\
+             Update the todo list with your findings using TodoWrite.\n\
+             Update agents.md with your review notes.\n\n\
              You MUST respond in EXACTLY this format:\n\n\
              VERDICT: APPROVED|NEEDS_REVISION|REJECTED\n\n\
              ASSESSMENT:\n\
@@ -276,7 +327,6 @@ impl Orchestrator {
     /// Build the prompt that sends the reviewer's feedback back to the worker
     /// as a revision instruction.
     fn build_revision_prompt(&self, feedback: &str, cycle: usize) -> String {
-        let max = self.config.orchestration.max_review_cycles;
         let constraints = self.config.constraints.render_prompt_section();
         let constraint_reminder = if constraints.is_empty() {
             String::new()
@@ -284,13 +334,21 @@ impl Orchestrator {
             format!("\n\nReminder of constraints you must follow:\n{constraints}")
         };
 
+        let shared = self.shared_instructions();
+
         format!(
-            "REVISION REQUEST (cycle {cycle}/{max}):\n\n\
+            "REVISION REQUEST (cycle {cycle}):\n\n\
              The reviewer found issues with your previous output. \
              You must address ALL of the following:\n\n\
              {feedback}\n\n\
-             Fix every issue listed above. When done, clearly summarize \
-             what you changed. Do NOT ask follow-up questions.{constraint_reminder}",
+             {shared}\n\n\
+             IMPORTANT:\n\
+             - Update the todo list (TodoWrite) to reflect what needs to be fixed\n\
+             - Update agents.md with notes about the revision\n\
+             - Fix every issue listed above\n\
+             - When done, clearly summarize what you changed\n\
+             - Do NOT ask follow-up questions\n\
+             {constraint_reminder}",
         )
     }
 
@@ -299,20 +357,6 @@ impl Orchestrator {
     // -----------------------------------------------------------------------
 
     /// Parse the reviewer LLM's response into a structured verdict.
-    ///
-    /// Expected format:
-    /// ```text
-    /// VERDICT: APPROVED|NEEDS_REVISION|REJECTED
-    ///
-    /// ASSESSMENT:
-    /// <reasoning>
-    ///
-    /// FEEDBACK: (optional, for NEEDS_REVISION)
-    /// <actionable feedback>
-    ///
-    /// REASON: (optional, for REJECTED)
-    /// <why>
-    /// ```
     fn parse_reviewer_response(&self, response: &str) -> ReviewVerdict {
         let upper = response.to_uppercase();
 
@@ -331,14 +375,12 @@ impl Orchestrator {
         {
             "REJECTED"
         } else {
-            // Fallback heuristic: if the reviewer didn't follow the format,
-            // look for keywords.
+            // Fallback heuristic.
             if upper.contains("APPROVED") && !upper.contains("NOT APPROVED") {
                 "APPROVED"
             } else if upper.contains("REJECT") {
                 "REJECTED"
             } else {
-                // Default to needing revision if unclear.
                 "NEEDS_REVISION"
             }
         };
@@ -356,7 +398,6 @@ impl Orchestrator {
                 ReviewVerdict::Rejected { reason }
             }
             _ => {
-                // NEEDS_REVISION
                 let feedback = Self::extract_section(response, "FEEDBACK:")
                     .or_else(|| Self::extract_section(response, "ASSESSMENT:"))
                     .unwrap_or_else(|| response.to_string());
@@ -372,7 +413,6 @@ impl Orchestrator {
         let idx = upper.find(&header_upper)?;
         let after = &text[idx + header.len()..];
 
-        // Take everything until the next section header or end of text.
         let section_headers = ["VERDICT:", "ASSESSMENT:", "FEEDBACK:", "REASON:"];
         let end = section_headers
             .iter()
@@ -393,18 +433,13 @@ impl Orchestrator {
     }
 
     // -----------------------------------------------------------------------
-    // Main orchestration loop
+    // Main orchestration loop — NO CYCLE LIMIT
     // -----------------------------------------------------------------------
 
     /// Run the full orchestration loop with two LLM agents.
     ///
-    /// # Arguments
-    /// - `reviewer_conn` — ACP connection to the reviewer opencode instance
-    /// - `worker_conn` — ACP connection to the worker opencode instance
-    /// - `reviewer_proc` / `worker_proc` — process handles for killing
-    /// - `worker_event_rx` — events from the worker's ACP session
-    /// - `reviewer_event_rx` — events from the reviewer's ACP session
-    /// - `abort_rx` — emergency stop signal
+    /// The loop runs indefinitely until the reviewer approves, explicitly
+    /// rejects, or an abort signal is received.
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &mut self,
@@ -430,11 +465,17 @@ impl Orchestrator {
             }
         });
 
-        // ── Phase 1: Planning — reviewer formulates the work instruction ──
+        // ── Phase 1: Planning ────────────────────────────────────────────
+        // Reviewer deeply investigates the codebase and formulates the work
+        // instruction. It must ask questions and investigate until the task
+        // is irrefutably understood.
 
         self.set_phase(Phase::Planning);
         self.save_session(reviewer_conn, worker_conn, "reviewer");
-        self.log(LogLevel::Info, "Asking reviewer to formulate work instruction...");
+        self.log(
+            LogLevel::Info,
+            "Reviewer is analyzing the codebase and formulating work instruction...",
+        );
 
         let planning_prompt = self.build_planning_prompt();
 
@@ -472,22 +513,24 @@ impl Orchestrator {
             ),
         );
 
-        // ── Phase 2: Work-review loop ─────────────────────────────────────
+        // ── Phase 2: Unlimited work-review loop ──────────────────────────
 
-        let max_cycles = self.config.orchestration.max_review_cycles;
         let mut current_instruction = work_instruction;
+        let mut cycle: usize = 0;
 
-        for cycle in 1..=max_cycles {
+        loop {
+            cycle += 1;
+
             // Check for abort.
             if abort_rx.try_recv().is_ok() {
                 return self.abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc).await;
             }
 
-            // ── Send instruction to worker ────────────────────────────────
+            // ── Send instruction to worker ───────────────────────────────
 
             self.log(
                 LogLevel::Info,
-                format!("Cycle {cycle}/{max_cycles}: dispatching to worker..."),
+                format!("Cycle {cycle}: dispatching to worker..."),
             );
             self.set_phase(if cycle == 1 {
                 Phase::Working
@@ -525,7 +568,7 @@ impl Orchestrator {
                 ),
             );
 
-            // ── Send output to reviewer for assessment ────────────────────
+            // ── Send output to reviewer for assessment ───────────────────
 
             self.set_phase(Phase::Reviewing);
             self.save_session(reviewer_conn, worker_conn, "reviewer");
@@ -555,10 +598,13 @@ impl Orchestrator {
 
             self.log(
                 LogLevel::Info,
-                format!("Reviewer assessment received ({} chars).", reviewer_response.len()),
+                format!(
+                    "Reviewer assessment received ({} chars).",
+                    reviewer_response.len()
+                ),
             );
 
-            // ── Parse verdict ─────────────────────────────────────────────
+            // ── Parse verdict ────────────────────────────────────────────
 
             let verdict = self.parse_reviewer_response(&reviewer_response);
 
@@ -579,7 +625,6 @@ impl Orchestrator {
                 ReviewVerdict::Approved { ref summary } => {
                     self.log(LogLevel::Info, format!("APPROVED: {summary}"));
                     self.set_phase(Phase::Approved);
-                    // Clean up session file on successful completion.
                     SessionState::remove(&self.config.cwd);
                     let _ = self
                         .event_tx
@@ -587,17 +632,6 @@ impl Orchestrator {
                     return Ok(Phase::Approved);
                 }
                 ReviewVerdict::NeedsRevision { ref feedback } => {
-                    if cycle == max_cycles {
-                        let msg = format!(
-                            "Reached maximum review cycles ({max_cycles}) without approval."
-                        );
-                        self.log(LogLevel::Warn, &msg);
-                        self.set_phase(Phase::Failed(msg.clone()));
-                        let _ = self
-                            .event_tx
-                            .send(OrchestratorEvent::Finished(Phase::Failed(msg)));
-                        return Ok(self.phase.clone());
-                    }
                     self.log(
                         LogLevel::Warn,
                         format!("Cycle {cycle}: revision needed."),
@@ -616,8 +650,6 @@ impl Orchestrator {
                 }
             }
         }
-
-        Ok(self.phase.clone())
     }
 
     /// Emergency-stop both agents.
