@@ -1,0 +1,3 @@
+# This file is intentionally left minimal.
+# The ACP crate is included as a member of the parent workspace at ../../Cargo.toml.
+# See the root workspace for all dependency definitions.

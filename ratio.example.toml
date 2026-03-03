@@ -1,0 +1,97 @@
+# Ratio — example configuration
+#
+# Copy this to `ratio.toml` and customize for your project.
+# All fields have sensible defaults; only `goal` is required.
+#
+# Ratio orchestrates TWO LLM agents:
+#   - Reviewer: formulates tasks, reviews output, enforces constraints
+#   - Worker: executes the coding work
+#
+# Both agents are opencode instances communicating over ACP.
+
+# The goal to accomplish — a detailed natural-language description.
+goal = """
+Review and improve the decompiler output in src/decompiler/: ensure all \
+generated code compiles, follows idiomatic Rust patterns, has proper error \
+handling, and passes `cargo test`.
+"""
+
+# Working directory both agents operate in.
+# Defaults to the current directory.
+# cwd = "/path/to/project"
+
+# ── Worker agent configuration ──────────────────────────────
+# The agent that does the actual coding / implementation work.
+
+[worker]
+binary = "opencode"
+# model = "anthropic/claude-sonnet-4-5"
+# agent = "my-custom-worker-agent"
+# env = [
+#   { key = "ANTHROPIC_API_KEY", value = "sk-ant-..." },
+# ]
+# extra_args = []
+
+# ── Reviewer agent configuration ────────────────────────────
+# The agent that formulates tasks, reviews output, and makes
+# approval/revision/rejection decisions via LLM reasoning.
+
+[reviewer]
+binary = "opencode"
+# model = "anthropic/claude-sonnet-4-5"
+# agent = "my-custom-reviewer-agent"
+# env = [
+#   { key = "ANTHROPIC_API_KEY", value = "sk-ant-..." },
+# ]
+# extra_args = []
+
+# ── Orchestration behavior ──────────────────────────────────
+
+[orchestration]
+# Maximum number of review-revise cycles before giving up.
+max_review_cycles = 5
+
+# Custom system prompt for the reviewer agent.
+# reviewer_system_prompt = "You are a senior Rust engineer reviewing generated code."
+
+# Custom system prompt for the worker agent.
+# worker_system_prompt = "You are a precise, thorough coding agent."
+
+# ── Enforced constraints ────────────────────────────────────
+# These are provided to BOTH agents: the worker must follow them,
+# and the reviewer verifies compliance.
+
+[constraints]
+# Tools the worker MUST use during its work.
+required_tools = [
+    "cargo clippy",
+    "cargo test",
+]
+
+# Tools the worker must NOT use.
+# forbidden_tools = ["rm -rf"]
+
+# Coding approaches the worker must follow.
+required_approaches = [
+    "Use Result<T, E> for all error handling — no unwrap() or expect()",
+    "All public types must derive Debug",
+]
+
+# Approaches the worker must avoid.
+forbidden_approaches = [
+    "unsafe code blocks",
+]
+
+# File paths the worker is allowed to modify (empty = unrestricted).
+# allowed_paths = ["src/decompiler/"]
+
+# File paths the worker must NOT touch.
+forbidden_paths = [
+    "Cargo.lock",
+]
+
+# Custom rules expressed as free-form sentences.
+custom_rules = [
+    "Do not add new dependencies without explicit approval",
+    "Preserve existing public API signatures",
+]
