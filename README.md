@@ -4,24 +4,26 @@ RA orchestrates LLM agents through iterative review cycles. A **reviewer** agent
 
 The orchestrator enforces user-specified constraints (required tools, forbidden patterns, path restrictions, custom quality rules) and runs a structured approve/revise/reject loop until the reviewer approves, rejects, or the user aborts.
 
-```
-                    ┌─────────────┐
-                    │    User     │
-                    │  (goal +    │
-                    │ constraints)│
-                    └──────┬──────┘
-                           │
-                    ┌──────▼─────────┐
-                    │      ra        │
-                    │  Orchestrator  │
-                    └─┬────┬───────┬─┘
-              ┌───────▼┐ ┌─▼────┐ ┌▼─────────────┐
-              │reviewer│ │worker│ │ stakeholders │
-              │  (LLM) │ │(LLM) │ │   (LLM x N)  │
-              └────────┘ └──────┘ └──────────────┘
-```
+<img width="3830" height="1832" src="./558205054-4acc4ddd-41d9-4ede-849a-d44ceb54916d.png" />
 
 ## How it works
+
+```
+             Planning                    Work-Review Loop (cycles)
+           ┌─────────┐                 ┌─────────────────────────┐
+           │         ▼                 │                         ▼
+  goal ──► reviewer ──► stakeholders ──► reviewer synthesis ──► worker
+                        (planning)      (final instruction)       │
+                                                                  │
+           ┌──────────────────────────────────────────────────────┘
+           │
+           ▼
+       reviewer ──► stakeholders ──► reviewer synthesis ──► verdict
+       (draft)      (review)         (final verdict)          │
+           ▲                                                  │
+           │         NEEDS_REVISION                           │
+           └──────────────────────────────────────────────────┘
+```
 
 ### Core loop
 
@@ -434,25 +436,6 @@ Communication is over **stdin/stdout** using newline-delimited JSON-RPC (the ACP
 
 Subprocess stderr is drained asynchronously to prevent pipe buffer deadlocks. In `--debug` mode, stderr lines are printed with `[stderr:<role>]` prefixes.
 
-### Orchestration flow
-
-```
-             Planning                    Work-Review Loop (cycles)
-           ┌─────────┐                 ┌─────────────────────────┐
-           │         ▼                 │                         ▼
-  goal ──► reviewer ──► stakeholders ──► reviewer synthesis ──► worker
-                        (planning)      (final instruction)       │
-                                                                  │
-           ┌──────────────────────────────────────────────────────┘
-           │
-           ▼
-       reviewer ──► stakeholders ──► reviewer synthesis ──► verdict
-       (draft)      (review)         (final verdict)          │
-           ▲                                                  │
-           │         NEEDS_REVISION                           │
-           └──────────────────────────────────────────────────┘
-```
-
 ### Event flow
 
 ```
@@ -484,25 +467,6 @@ ratatui render (clamped scroll, styled paragraphs)
 | `Plan` | `PlanUpdated` — plan entries (currently not rendered as a dedicated panel) |
 | `ToolCall`/`ToolCallUpdate` for TodoWrite | `TodoUpdated` — shared todo list (parsed from tool input) |
 | Other variants | `ProtocolMessage` — forwarded as debug info |
-
-### Source layout
-
-```
-crates/ratio/src/
-├── main.rs          — CLI args, agent spawning, TUI/headless modes
-├── config.rs        — Config, AgentConfig, StakeholderConfig, Constraints
-├── orchestrator.rs  — Orchestrator state machine, prompt construction,
-│                      verdict parsing, stakeholder consultation
-├── protocol.rs      — ACP client implementation, AgentEvent types,
-│                      WorkerConnection (prompt, cancel, set_model)
-├── session.rs       — SessionState, UIState persistence for resume
-├── subprocess.rs    — Agent process spawning (opencode acp subprocess)
-└── ui/
-    ├── app.rs       — App state, event handling, stream management
-    ├── events.rs    — TUI event loop (crossterm + orchestrator events)
-    ├── render.rs    — ratatui rendering dispatch
-    └── widgets.rs   — Pane rendering (agent stream, todo, log, status)
-```
 
 ## Logging
 

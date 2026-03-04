@@ -5,23 +5,18 @@ version = 4
 [[package]]
 name = "agent-client-protocol"
 version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "499b7ff5c6c842e43fb188f6da7c99a258ae89a9df8c896d6e9784da9b4b23e7"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
  "async-broadcast",
  "async-trait",
  "derive_more",
- "env_logger",
  "futures",
- "futures-util",
  "log",
- "piper",
- "pretty_assertions",
- "rustyline",
  "serde",
  "serde_json",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -142,12 +137,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atomic-waker"
-version = "1.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
-
-[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -203,12 +192,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "cfg_aliases"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
-
-[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -260,15 +243,6 @@ name = "clap_lex"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
-
-[[package]]
-name = "clipboard-win"
-version = "5.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
-dependencies = [
- "error-code",
-]
 
 [[package]]
 name = "colorchoice"
@@ -331,7 +305,7 @@ dependencies = [
  "futures-core",
  "mio",
  "parking_lot",
- "rustix 0.38.44",
+ "rustix",
  "signal-hook",
  "signal-hook-mio",
  "winapi",
@@ -405,12 +379,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "diff"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
-
-[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -421,35 +389,6 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
-
-[[package]]
-name = "endian-type"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
-
-[[package]]
-name = "env_filter"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a1c3cc8e57274ec99de65301228b537f1e4eedc1b8e0f9411c6caac8ae7308f"
-dependencies = [
- "log",
- "regex",
-]
-
-[[package]]
-name = "env_logger"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2daee4ea451f429a58296525ddf28b45a3b64f1acf6587e2067437bb11e218d"
-dependencies = [
- "anstream",
- "anstyle",
- "env_filter",
- "jiff",
- "log",
-]
 
 [[package]]
 name = "equivalent"
@@ -466,12 +405,6 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "error-code"
-version = "3.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
 name = "event-listener"
@@ -492,23 +425,6 @@ checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener",
  "pin-project-lite",
-]
-
-[[package]]
-name = "fastrand"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
-
-[[package]]
-name = "fd-lock"
-version = "4.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
-dependencies = [
- "cfg-if",
- "rustix 1.1.4",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -654,15 +570,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "home"
-version = "0.5.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "589533453244b0995c858700322199b2becb13b627df2851f64a2775d024abcf"
-dependencies = [
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -754,30 +661,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
-name = "jiff"
-version = "0.2.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819b44bc7c87d9117eb522f14d46e918add69ff12713c475946b0a29363ed1c2"
-dependencies = [
- "jiff-static",
- "log",
- "portable-atomic",
- "portable-atomic-util",
- "serde_core",
-]
-
-[[package]]
-name = "jiff-static"
-version = "0.2.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "470252db18ecc35fd766c0891b1e3ec6cbbcd62507e85276c01bf75d8e94d4a1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "js-sys"
 version = "0.3.91"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -810,12 +693,6 @@ name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
-
-[[package]]
-name = "linux-raw-sys"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lock_api"
@@ -866,27 +743,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "nibble_vec"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77a5d83df9f36fe23f0c3648c6bbb8b0298bb5f1939c8f2704431371f4b84d43"
-dependencies = [
- "smallvec",
-]
-
-[[package]]
-name = "nix"
-version = "0.30.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
-dependencies = [
- "bitflags",
- "cfg-if",
- "cfg_aliases",
- "libc",
 ]
 
 [[package]]
@@ -961,42 +817,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "piper"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c835479a4443ded371d6c535cbfd8d31ad92c5d23ae9770a61bc155e4992a3c1"
-dependencies = [
- "atomic-waker",
- "fastrand",
- "futures-io",
-]
-
-[[package]]
-name = "portable-atomic"
-version = "1.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
-
-[[package]]
-name = "portable-atomic-util"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a9db96d7fa8782dd8c15ce32ffe8680bbd1e978a43bf51a34d39483540495f5"
-dependencies = [
- "portable-atomic",
-]
-
-[[package]]
-name = "pretty_assertions"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
-dependencies = [
- "diff",
- "yansi",
-]
-
-[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1054,16 +874,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "radix_trie"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c069c179fcdc6a2fe24d8d18305cf085fdbd4f922c041943e203685d6a1c58fd"
-dependencies = [
- "endian-type",
- "nibble_vec",
-]
-
-[[package]]
 name = "ratatui"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1114,18 +924,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "regex"
-version = "1.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
-dependencies = [
- "aho-corasick",
- "memchr",
- "regex-automata",
- "regex-syntax",
-]
-
-[[package]]
 name = "regex-automata"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1160,21 +958,8 @@ dependencies = [
  "bitflags",
  "errno",
  "libc",
- "linux-raw-sys 0.4.15",
+ "linux-raw-sys",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "rustix"
-version = "1.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
-dependencies = [
- "bitflags",
- "errno",
- "libc",
- "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1182,28 +967,6 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
-
-[[package]]
-name = "rustyline"
-version = "17.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e902948a25149d50edc1a8e0141aad50f54e22ba83ff988cf8f7c9ef07f50564"
-dependencies = [
- "bitflags",
- "cfg-if",
- "clipboard-win",
- "fd-lock",
- "home",
- "libc",
- "log",
- "memchr",
- "nix",
- "radix_trie",
- "unicode-segmentation",
- "unicode-width 0.2.0",
- "utf8parse",
- "windows-sys 0.60.2",
-]
 
 [[package]]
 name = "ryu"
@@ -2124,12 +1887,6 @@ dependencies = [
  "unicode-xid",
  "wasmparser",
 ]
-
-[[package]]
-name = "yansi"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "zmij"

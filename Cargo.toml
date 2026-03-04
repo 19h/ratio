@@ -1,7 +1,6 @@
 [workspace]
 members = [
-    "crates/ratio",
-    "vendor/acp-rust-sdk/src/agent-client-protocol",
+    "crates/ratio"
 ]
 resolver = "3"
 
@@ -12,7 +11,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # ── ACP protocol (vendored) ─────────────────────────────────
-agent-client-protocol = { path = "vendor/acp-rust-sdk/src/agent-client-protocol", features = ["unstable"] }
+agent-client-protocol = { version = "0.9.5", features = ["unstable"] }
 
 # These are required by the vendored ACP crate (it uses workspace = true)
 agent-client-protocol-schema = { version = "=0.10.8" }
