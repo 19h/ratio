@@ -1,7 +1,9 @@
 //! Application state for the TUI.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use chrono::Local;
 
@@ -213,12 +215,19 @@ pub struct App {
     /// Queue of messages to send to agents.
     pub message_queue: VecDeque<QueuedMessage>,
 
+    /// Whether the help overlay is shown (toggled with 'h').
+    pub show_help: bool,
+
+    /// Whether stakeholder consultations run in parallel.
+    /// Shared with the orchestrator via `Rc<Cell<bool>>`.
+    pub parallel_stakeholders: Rc<Cell<bool>>,
+
     /// Working directory (for persisting UI state).
     cwd: PathBuf,
 }
 
 impl App {
-    pub fn new(goal: String, cwd: PathBuf) -> Self {
+    pub fn new(goal: String, cwd: PathBuf, parallel_stakeholders: Rc<Cell<bool>>) -> Self {
         Self {
             phase: Phase::Idle,
             active_agent: AgentSource::Reviewer,
@@ -244,8 +253,18 @@ impl App {
             input_buffer: String::new(),
             input_cursor: 0,
             message_queue: VecDeque::new(),
+            show_help: false,
+            parallel_stakeholders,
             cwd,
         }
+    }
+
+    /// Toggle the parallel_stakeholders setting.
+    pub fn toggle_parallel_stakeholders(&mut self) {
+        let current = self.parallel_stakeholders.get();
+        self.parallel_stakeholders.set(!current);
+        let state = if !current { "ON" } else { "OFF" };
+        self.push_log(LogLevel::Info, format!("Parallel stakeholders: {state}"));
     }
 
     /// Register stakeholder names so the TUI can create their streams.

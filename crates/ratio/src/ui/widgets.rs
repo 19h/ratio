@@ -289,6 +289,7 @@ pub fn status_bar<'a>(
     finished: bool,
     input_mode: bool,
     num_stakeholders: usize,
+    parallel_stakeholders: bool,
 ) -> Line<'a> {
     let mut spans = vec![
         Span::styled(
@@ -337,6 +338,19 @@ pub fn status_bar<'a>(
             format!(" {current_idx}/{total_agents}"),
             Style::default().fg(Color::DarkGray),
         ));
+
+        // Show parallel stakeholders indicator.
+        if parallel_stakeholders {
+            spans.push(Span::styled(
+                " [parallel]",
+                Style::default().fg(Color::Green),
+            ));
+        } else {
+            spans.push(Span::styled(
+                " [sequential]",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
 
     spans.push(Span::raw("  "));
@@ -358,12 +372,156 @@ pub fn status_bar<'a>(
         ));
     } else {
         spans.push(Span::styled(
-            "i:input r/R:agent Tab:pane j/k:scroll Ctrl+K:kill",
+            "i:input r/R:agent Tab:pane j/k:scroll p:parallel h:help Ctrl+K:kill",
             Style::default().fg(Color::DarkGray),
         ));
     }
 
     Line::from(spans)
+}
+
+// ---------------------------------------------------------------------------
+// Help overlay
+// ---------------------------------------------------------------------------
+
+/// Build the help overlay widget that displays all keyboard shortcuts.
+pub fn help_overlay(parallel_stakeholders: bool) -> Paragraph<'static> {
+    let parallel_label = if parallel_stakeholders { "ON" } else { "OFF" };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            " Keyboard Shortcuts ",
+            Style::default().fg(Color::Cyan).bold(),
+        )),
+        Line::from(""),
+        // -- Navigation --
+        Line::from(Span::styled(
+            "Navigation",
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from(vec![
+            Span::styled(
+                "  Tab / Shift+Tab  ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw("Cycle focused pane (Agent/Todo/Log)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  r / R            ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw("Cycle agent view (Reviewer/Worker/Stakeholders)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  j/k  Up/Down     ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw("Scroll focused pane"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  PgUp / PgDn      ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw("Scroll by page (20 lines)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  Home / End       ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw("Jump to top/bottom, toggle auto-scroll"),
+        ]),
+        Line::from(""),
+        // -- Input --
+        Line::from(Span::styled(
+            "Input & Messaging",
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from(vec![
+            Span::styled(
+                "  i / :            ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw("Enter input mode (type message to active agent)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  Enter            ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw("Queue message (delivered on next turn)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  Alt/Ctrl+Enter   ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw("Interrupt agent & send message immediately"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  Esc              ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw("Cancel input / dismiss help"),
+        ]),
+        Line::from(""),
+        // -- Settings --
+        Line::from(Span::styled(
+            "Settings",
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from(vec![
+            Span::styled(
+                "  p                ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw(format!("Toggle parallel stakeholders [{parallel_label}]")),
+        ]),
+        Line::from(""),
+        // -- Control --
+        Line::from(Span::styled(
+            "Control",
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from(vec![
+            Span::styled(
+                "  Ctrl+K           ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw("Emergency kill all agents"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  Ctrl+C Ctrl+C    ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw("Double-tap to kill (within 800ms)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  q                ",
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::raw("Quit (only when orchestration is finished)"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Press any key to dismiss ",
+            Style::default().fg(Color::DarkGray).italic(),
+        )),
+    ];
+
+    let block = Block::default()
+        .title(" Help (h) ")
+        .title_style(Style::default().fg(Color::Cyan).bold())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    Paragraph::new(lines).block(block)
 }
 
 // ---------------------------------------------------------------------------

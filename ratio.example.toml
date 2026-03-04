@@ -65,6 +65,13 @@ max_review_cycles = 5
 # Maximum nudge attempts before treating the turn as failed. Default: 3.
 # max_nudges = 3
 
+# Run stakeholder consultations in parallel instead of sequentially.
+# When enabled, all stakeholders for a given phase (planning or review)
+# are prompted concurrently, which can significantly reduce wait time
+# when there are multiple stakeholders. Toggle in the TUI with 'p'.
+# Default: true.
+# parallel_stakeholders = true
+
 # ── Enforced constraints ────────────────────────────────────
 # These are provided to BOTH agents: the worker must follow them,
 # and the reviewer verifies compliance.
@@ -112,13 +119,19 @@ custom_rules = [
 # and/or review phases. Each gets its own opencode subprocess with a
 # clean, unpolluted context and a unique persona.
 #
-# During planning: stakeholders review the reviewer's draft work
-# instruction and provide input. The reviewer then synthesizes their
-# feedback into the final instruction sent to the worker.
+# During planning: stakeholders review the reviewer's DRAFT WORK
+# INSTRUCTION before it reaches the worker. They are explicitly told
+# they are reviewing an instruction for the worker agent, and their
+# feedback is incorporated by the reviewer into the final instruction.
+# This ensures all perspectives are captured BEFORE work begins.
 #
 # During review: stakeholders review the worker's output and the
 # reviewer's draft assessment. The reviewer synthesizes their input
 # into the final verdict.
+#
+# When parallel_stakeholders = true (the default), all stakeholders
+# for a given phase are consulted concurrently. Toggle this at
+# runtime with the 'p' key in the TUI.
 #
 # Uncomment below to add stakeholders:
 

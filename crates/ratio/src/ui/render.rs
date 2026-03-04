@@ -13,7 +13,7 @@
 //! ```
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::app::App;
 use super::widgets;
@@ -41,6 +41,11 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_input_bar(frame, outer[2], app);
     }
     render_status_bar(frame, outer[3], app);
+
+    // Help overlay (rendered on top of everything).
+    if app.show_help {
+        render_help_overlay(frame, area, app);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -193,9 +198,29 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.finished,
         app.input_mode,
         app.stakeholder_streams.len(),
+        app.parallel_stakeholders.get(),
     );
     let paragraph = Paragraph::new(bar);
     frame.render_widget(paragraph, area);
+}
+
+// ---------------------------------------------------------------------------
+// Help overlay
+// ---------------------------------------------------------------------------
+
+fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // Center the help popup in the terminal area.
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    let popup_height = 30u16.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    // Clear the area behind the popup.
+    frame.render_widget(Clear, popup_area);
+
+    let help = widgets::help_overlay(app.parallel_stakeholders.get());
+    frame.render_widget(help, popup_area);
 }
 
 // ---------------------------------------------------------------------------

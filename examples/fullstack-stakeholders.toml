@@ -71,6 +71,9 @@ model = "anthropic/claude-sonnet-4-5"
 [orchestration]
 max_review_cycles = 6
 
+# All three stakeholders will be consulted in parallel to save time.
+parallel_stakeholders = true
+
 reviewer_system_prompt = """
 You are a senior backend engineer reviewing API implementations. You verify
 correctness by reading code, running tests, and checking that all requirements

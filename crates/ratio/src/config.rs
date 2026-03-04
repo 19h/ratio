@@ -224,6 +224,16 @@ pub struct OrchestrationConfig {
     ///
     /// Default: 3.
     pub max_nudges: usize,
+
+    /// Run stakeholder consultations in parallel instead of sequentially.
+    ///
+    /// When enabled, all stakeholders for a given phase (planning or review)
+    /// are prompted concurrently using `tokio::task::spawn_local`. This can
+    /// significantly reduce the time spent in stakeholder consultation when
+    /// there are multiple stakeholders.
+    ///
+    /// Default: true.
+    pub parallel_stakeholders: bool,
 }
 
 impl Default for OrchestrationConfig {
@@ -234,6 +244,7 @@ impl Default for OrchestrationConfig {
             worker_system_prompt: None,
             stall_timeout_secs: 120,
             max_nudges: 3,
+            parallel_stakeholders: true,
         }
     }
 }

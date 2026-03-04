@@ -10,7 +10,9 @@
 //! There is **no cycle limit** — the loop runs until the reviewer approves,
 //! explicitly rejects, or the user aborts.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use tokio::sync::mpsc;
 
@@ -94,6 +96,8 @@ pub struct Orchestrator {
     phase: Phase,
     cycles: Vec<CycleRecord>,
     event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
+    /// Shared toggle for parallel stakeholder execution (togglable from the TUI).
+    parallel_stakeholders: Rc<Cell<bool>>,
 }
 
 /// Events emitted by the orchestrator to the UI layer.
@@ -145,12 +149,17 @@ pub enum LogLevel {
 }
 
 impl Orchestrator {
-    pub fn new(config: Config, event_tx: mpsc::UnboundedSender<OrchestratorEvent>) -> Self {
+    pub fn new(
+        config: Config,
+        event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
+        parallel_stakeholders: Rc<Cell<bool>>,
+    ) -> Self {
         Self {
             config,
             phase: Phase::Idle,
             cycles: Vec::new(),
             event_tx,
+            parallel_stakeholders,
         }
     }
 
@@ -1061,8 +1070,15 @@ impl Orchestrator {
                 stakeholders,
                 StakeholderPhase::Planning,
                 &format!(
-                    "GOAL: {}\n\nDRAFT WORK INSTRUCTION:\n{}",
-                    self.config.goal, work_instruction
+                    "GOAL: {goal}\n\n\
+                     ═══ DRAFT WORK INSTRUCTION FOR WORKER AGENT ═══\n\
+                     The following instruction will be sent to the worker coding agent. \
+                     The worker will implement exactly what this instruction says. \
+                     Your job is to review this instruction BEFORE it reaches the worker \
+                     and flag anything that is missing, wrong, or inadequately specified.\n\n\
+                     {work_instruction}\n\
+                     ═══ END DRAFT WORK INSTRUCTION ═══",
+                    goal = self.config.goal,
                 ),
                 &mut pending_stakeholder_msgs,
             )
@@ -1464,12 +1480,95 @@ impl Orchestrator {
         }
     }
 
+    /// Build the prompt text for a single stakeholder.
+    fn build_stakeholder_prompt(
+        persona: &str,
+        name: &str,
+        context: &str,
+        phase: &StakeholderPhase,
+        pending_notes: Option<Vec<String>>,
+    ) -> String {
+        let stakeholder_file = name.to_lowercase().replace(' ', "-");
+
+        let (phase_framing, task_section) = match phase {
+            StakeholderPhase::Planning => (
+                "You are reviewing a WORK INSTRUCTION that will be sent to a \
+                 coding agent (the \"worker\"). The reviewer has drafted this \
+                 instruction based on the user's goal. Your feedback will be \
+                 incorporated by the reviewer before the final instruction is \
+                 dispatched to the worker. The worker has NOT started yet — \
+                 this is your chance to influence what gets built and how.",
+                "Based on your expertise and perspective as {name}:\n\
+                 1. Does this work instruction adequately address your concerns?\n\
+                 2. What requirements, constraints, or considerations are MISSING \
+                    from the instruction that the worker needs to know?\n\
+                 3. What risks or pitfalls should the worker be warned about?\n\
+                 4. Are there better approaches the worker should consider?\n\n\
+                 IMPORTANT: Your feedback will be used to REFINE the work instruction \
+                 before it reaches the worker. Be specific about what should be added, \
+                 changed, or emphasized in the instruction."
+                    .replace("{name}", name),
+            ),
+            StakeholderPhase::Review => (
+                "You are reviewing the output of a coding agent (the \"worker\") \
+                 and the reviewer's draft assessment. Your perspective will be \
+                 incorporated into the final verdict.",
+                "Based on your expertise and perspective as {name}:\n\
+                 1. What are your requirements, concerns, or suggestions?\n\
+                 2. What would you want to see prioritized or changed?\n\
+                 3. Are there risks or opportunities the team might be missing?"
+                    .replace("{name}", name),
+            ),
+        };
+
+        let mut prompt = format!(
+            "{persona}\n\n\
+             You are participating as a stakeholder named \"{name}\" in a \
+             software development process. Your role is to provide input from \
+             your unique perspective — you are NOT the implementer.\n\n\
+             {phase_framing}\n\n\
+             ═══ CURRENT CONTEXT ═══\n\
+             {context}\n\
+             ═══ END CONTEXT ═══\n\n\
+             ═══ YOUR TASK ═══\n\
+             {task_section}\n\n\
+             Be concise and direct. Focus on what matters from YOUR perspective. \
+             Write your findings to `.ratio/research/{stakeholder_file}.md` so \
+             the team can reference them.\n\
+             ═══ END TASK ═══",
+        );
+
+        if let Some(notes) = pending_notes {
+            if !notes.is_empty() {
+                let rendered = notes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| format!("{}. {}", i + 1, m))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                prompt.push_str(&format!(
+                    "\n\n\
+                     ═══ USER MESSAGE(S) FOR {name} ═══\n\
+                     The user added the following guidance. You MUST account for it in your response:\n\
+                     {rendered}\n\
+                     ═══ END USER MESSAGE(S) ═══"
+                ));
+            }
+        }
+
+        prompt
+    }
+
     /// Consult all stakeholders that participate in the given phase.
     ///
     /// Each stakeholder receives a prompt with their persona, the current
     /// context, and an ask for their perspective. Returns a consolidated
     /// block of all stakeholder input, or an empty string if there are
     /// no stakeholders for this phase.
+    ///
+    /// When `parallel_stakeholders` is enabled in the config, all relevant
+    /// stakeholders are prompted concurrently. Otherwise they run sequentially.
     async fn consult_stakeholders(
         &self,
         stakeholders: &[LiveStakeholder],
@@ -1491,58 +1590,42 @@ impl Orchestrator {
             StakeholderPhase::Review => "review",
         };
 
+        let parallel = self.parallel_stakeholders.get();
+        let mode = if parallel { "parallel" } else { "sequential" };
+
         self.log(
             LogLevel::Info,
             format!(
-                "Consulting {} stakeholder(s) for {phase_label} phase...",
+                "Consulting {} stakeholder(s) for {phase_label} phase ({mode})...",
                 relevant.len()
             ),
         );
 
+        if parallel {
+            self.consult_stakeholders_parallel(&relevant, &phase, context, pending_stakeholder_msgs)
+                .await
+        } else {
+            self.consult_stakeholders_sequential(&relevant, &phase, context, pending_stakeholder_msgs)
+                .await
+        }
+    }
+
+    /// Run stakeholder consultations sequentially (one at a time).
+    async fn consult_stakeholders_sequential(
+        &self,
+        relevant: &[&LiveStakeholder],
+        phase: &StakeholderPhase,
+        context: &str,
+        pending_stakeholder_msgs: &mut BTreeMap<usize, Vec<String>>,
+    ) -> String {
         let mut all_input = String::new();
 
         for stakeholder in relevant {
             let persona = &self.config.stakeholders[stakeholder.index].persona;
             let name = &stakeholder.name;
+            let pending_notes = pending_stakeholder_msgs.remove(&stakeholder.index);
 
-            let mut prompt = format!(
-                "{persona}\n\n\
-                 You are participating as a stakeholder named \"{name}\" in a \
-                 software development process. Your role is to provide input from \
-                 your unique perspective — you are NOT the implementer.\n\n\
-                 ═══ CURRENT CONTEXT ═══\n\
-                 {context}\n\
-                 ═══ END CONTEXT ═══\n\n\
-                 ═══ YOUR TASK ═══\n\
-                 Based on your expertise and perspective as {name}:\n\
-                 1. What are your requirements, concerns, or suggestions?\n\
-                 2. What would you want to see prioritized or changed?\n\
-                 3. Are there risks or opportunities the team might be missing?\n\n\
-                 Be concise and direct. Focus on what matters from YOUR perspective. \
-                 Write your findings to `.ratio/research/{stakeholder_file}.md` so \
-                 the team can reference them.\n\
-                 ═══ END TASK ═══",
-                stakeholder_file = name.to_lowercase().replace(' ', "-"),
-            );
-
-            if let Some(mut notes) = pending_stakeholder_msgs.remove(&stakeholder.index) {
-                if !notes.is_empty() {
-                    let rendered = notes
-                        .drain(..)
-                        .enumerate()
-                        .map(|(i, m)| format!("{}. {}", i + 1, m))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    prompt.push_str(&format!(
-                        "\n\n\
-                         ═══ USER MESSAGE(S) FOR {name} ═══\n\
-                         The user added the following guidance. You MUST account for it in your response:\n\
-                         {rendered}\n\
-                         ═══ END USER MESSAGE(S) ═══"
-                    ));
-                }
-            }
+            let prompt = Self::build_stakeholder_prompt(persona, name, context, phase, pending_notes);
 
             self.log(
                 LogLevel::Info,
@@ -1550,6 +1633,81 @@ impl Orchestrator {
             );
 
             match self.prompt_agent(&stakeholder.conn, &prompt, name).await {
+                Ok((_, response)) => {
+                    if !response.trim().is_empty() {
+                        all_input.push_str(&format!(
+                            "\n═══ STAKEHOLDER INPUT: {name} ═══\n\
+                             {response}\n\
+                             ═══ END {name} ═══\n"
+                        ));
+                        self.log(
+                            LogLevel::Info,
+                            format!(
+                                "Stakeholder \"{name}\" provided {} chars of input.",
+                                response.len()
+                            ),
+                        );
+                    }
+                }
+                Err(e) => {
+                    self.log(
+                        LogLevel::Warn,
+                        format!("Stakeholder \"{name}\" failed: {e}"),
+                    );
+                }
+            }
+        }
+
+        all_input
+    }
+
+    /// Run stakeholder consultations in parallel (all at once).
+    ///
+    /// Uses `futures::future::join_all` to poll all stakeholder prompt
+    /// futures concurrently on the single-threaded runtime. Each future
+    /// borrows its own `WorkerConnection` — no cloning needed.
+    async fn consult_stakeholders_parallel(
+        &self,
+        relevant: &[&LiveStakeholder],
+        phase: &StakeholderPhase,
+        context: &str,
+        pending_stakeholder_msgs: &mut BTreeMap<usize, Vec<String>>,
+    ) -> String {
+        // Pre-build all prompts and collect info needed for each future.
+        let mut prompt_infos: Vec<(String, String)> = Vec::new(); // (name, prompt_text)
+
+        for stakeholder in relevant.iter() {
+            let persona = self.config.stakeholders[stakeholder.index].persona.clone();
+            let name = stakeholder.name.clone();
+            let pending_notes = pending_stakeholder_msgs.remove(&stakeholder.index);
+
+            let prompt = Self::build_stakeholder_prompt(&persona, &name, context, phase, pending_notes);
+
+            self.log(
+                LogLevel::Info,
+                format!("Stakeholder \"{name}\" is providing input (parallel)..."),
+            );
+
+            prompt_infos.push((name, prompt));
+        }
+
+        // Create futures that each borrow their respective connection.
+        let futures: Vec<_> = relevant
+            .iter()
+            .zip(prompt_infos.iter())
+            .map(|(stakeholder, (name, prompt))| {
+                self.prompt_agent(&stakeholder.conn, prompt, name)
+            })
+            .collect();
+
+        // Poll all futures concurrently.
+        let results = futures::future::join_all(futures).await;
+
+        // Collect results.
+        let mut all_input = String::new();
+        for ((_name, _prompt), result) in prompt_infos.iter().zip(results.into_iter()) {
+            let name = &_name;
+            match result {
                 Ok((_, response)) => {
                     if !response.trim().is_empty() {
                         all_input.push_str(&format!(
@@ -1614,7 +1772,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.goal = "test goal".to_string();
         let (tx, _rx) = mpsc::unbounded_channel();
-        Orchestrator::new(cfg, tx)
+        let parallel = Rc::new(Cell::new(cfg.orchestration.parallel_stakeholders));
+        Orchestrator::new(cfg, tx, parallel)
     }
 
     #[test]

@@ -4,8 +4,10 @@
 //! worker agent subprocesses, and runs the TUI event loop alongside the
 //! orchestration engine.
 
+use std::cell::Cell;
 use std::io;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use clap::Parser;
 use crossterm::ExecutableCommand;
@@ -170,8 +172,17 @@ async fn run_tui_inner(
             let (user_msg_tx, user_msg_rx) = mpsc::unbounded_channel::<UserMessage>();
             let (abort_tx, abort_rx) = mpsc::unbounded_channel::<()>();
 
+            // ── Shared settings ──────────────────────────────────
+            let parallel_stakeholders = Rc::new(Cell::new(
+                config.orchestration.parallel_stakeholders,
+            ));
+
             // ── App state ───────────────────────────────────────
-            let mut app = App::new(config.goal.clone(), config.cwd.clone());
+            let mut app = App::new(
+                config.goal.clone(),
+                config.cwd.clone(),
+                parallel_stakeholders.clone(),
+            );
 
             // ── Load saved session if resuming ──────────────────
             let saved_session = if resume {
@@ -309,10 +320,11 @@ async fn run_tui_inner(
             // ── Spawn orchestrator ──────────────────────────────
             let orch_tx = orch_event_tx.clone();
             let config_clone = config.clone();
+            let parallel_sh = parallel_stakeholders.clone();
             let resume_phase = saved_session.as_ref().map(|s| s.phase.clone());
             let resume_agent = saved_session.as_ref().map(|s| s.last_active_agent.clone());
             tokio::task::spawn_local(async move {
-                let mut orchestrator = Orchestrator::new(config_clone, orch_tx);
+                let mut orchestrator = Orchestrator::new(config_clone, orch_tx, parallel_sh);
                 if let Some(ref phase) = resume_phase {
                     let continue_msg = format!(
                         "Continue where you left off. The session was interrupted during the \
@@ -545,10 +557,11 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
             // Spawn orchestrator.
             let orch_tx = orch_event_tx.clone();
             let config_clone = config.clone();
+            let parallel_sh = Rc::new(Cell::new(config.orchestration.parallel_stakeholders));
             let resume_phase = saved_session.as_ref().map(|s| s.phase.clone());
             let resume_agent = saved_session.as_ref().map(|s| s.last_active_agent.clone());
             tokio::task::spawn_local(async move {
-                let mut orchestrator = Orchestrator::new(config_clone, orch_tx);
+                let mut orchestrator = Orchestrator::new(config_clone, orch_tx, parallel_sh);
                 if let Some(ref phase) = resume_phase {
                     let continue_msg = format!(
                         "Continue where you left off. The session was interrupted during the \

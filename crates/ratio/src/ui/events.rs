@@ -108,6 +108,17 @@ impl EventLoop {
             return self.handle_input_key(app, key);
         }
 
+        // ── Help overlay: dismiss on any key except 'h' toggle ──
+        if app.show_help {
+            // 'h' toggles help off; any other key also dismisses it.
+            app.show_help = false;
+            if key.code != KeyCode::Char('h') {
+                // Don't process the key further — just dismiss.
+                return Action::Redraw;
+            }
+            return Action::Redraw;
+        }
+
         // ── Normal mode ─────────────────────────────────────────
 
         // Quit: q when finished.
@@ -118,6 +129,18 @@ impl EventLoop {
         // Enter input mode: 'i' or ':'.
         if key.code == KeyCode::Char('i') || key.code == KeyCode::Char(':') {
             app.input_mode = true;
+            return Action::Redraw;
+        }
+
+        // Toggle help overlay: 'h'.
+        if key.code == KeyCode::Char('h') {
+            app.show_help = true;
+            return Action::Redraw;
+        }
+
+        // Toggle parallel stakeholders: 'p'.
+        if key.code == KeyCode::Char('p') {
+            app.toggle_parallel_stakeholders();
             return Action::Redraw;
         }
 
@@ -182,13 +205,25 @@ impl EventLoop {
                 app.input_cursor = 0;
             }
             KeyCode::Enter => {
-                if key.modifiers.contains(KeyModifiers::ALT)
-                    || key.modifiers.contains(KeyModifiers::CONTROL)
-                {
+                if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) {
                     app.submit_input_immediate();
                 } else {
                     app.submit_input();
                 }
+            }
+            // Many terminals send Ctrl+Enter as Ctrl+J (since Enter = LF = ^J).
+            // Treat Ctrl+J in input mode as an immediate-interrupt submit.
+            KeyCode::Char('j') | KeyCode::Char('J')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                app.submit_input_immediate();
+            }
+            // Some terminals send Alt+Enter as a raw escape sequence that
+            // crossterm decodes as Char('\r') or Char('\n') with ALT.
+            KeyCode::Char('\n') | KeyCode::Char('\r')
+                if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                app.submit_input_immediate();
             }
             KeyCode::Backspace => {
                 if app.input_cursor > 0 {
