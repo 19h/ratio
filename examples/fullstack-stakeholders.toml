@@ -1,0 +1,224 @@
+# Ratio — Stakeholder Example: Fullstack Feature with Multi-Perspective Review
+#
+# This example shows how to use stakeholders to bring diverse perspectives
+# into the planning and review phases. Three stakeholders participate:
+#
+#   - Security Auditor: reviews for auth flaws, injection, data exposure
+#   - UX Engineer: reviews for API ergonomics, error messages, consistency
+#   - SRE / Ops: reviews for observability, failure modes, deployment risk
+#
+# The reviewer still makes the final APPROVED/NEEDS_REVISION/REJECTED decision,
+# but stakeholders' concerns are incorporated into the verdict. Each stakeholder
+# runs as its own opencode subprocess with a clean context and its own persona.
+#
+# Flow:
+#   1. Reviewer reads the codebase and drafts a work instruction
+#   2. Stakeholders review the draft plan and provide input from their perspectives
+#   3. Reviewer synthesizes stakeholder input into the final work instruction
+#   4. Worker implements the feature
+#   5. Reviewer drafts an assessment of the worker's output
+#   6. Stakeholders review the output and assessment from their perspectives
+#   7. Reviewer synthesizes stakeholder input into the final verdict
+#   8. If NEEDS_REVISION, the worker gets feedback and tries again
+#
+# Stakeholders do NOT edit code. They provide analysis, concerns, and
+# suggestions that the reviewer must address before approving.
+
+goal = """
+Add a user invitation system to the existing REST API:
+
+1. POST /api/invitations — create an invitation (requires admin role)
+   - Accepts: { email, role, expires_in_hours }
+   - Sends invitation email with a unique token
+   - Stores invitation in the database with expiry timestamp
+   - Returns: { id, email, role, token, expires_at, created_at }
+
+2. GET /api/invitations/:token — look up an invitation by token
+   - Public endpoint (no auth required — the token IS the auth)
+   - Returns invitation details if valid and not expired
+   - Returns 404 if expired or already accepted
+
+3. POST /api/invitations/:token/accept — accept an invitation
+   - Accepts: { name, password }
+   - Creates the user account with the role from the invitation
+   - Marks the invitation as accepted
+   - Returns the new user object with a session token
+
+4. DELETE /api/invitations/:id — revoke an invitation (requires admin role)
+
+Requirements:
+- Tokens must be cryptographically random (32 bytes, base64url encoded)
+- Expired invitations must be cleaned up by a background job
+- All endpoints must have OpenAPI documentation
+- Integration tests for the full invitation lifecycle
+- Rate limiting on the accept endpoint (max 5 attempts per token)
+"""
+
+cwd = "/Users/you/dev/myapp"
+
+# ── Agent configuration ─────────────────────────────────────
+
+[worker]
+binary = "opencode"
+model = "anthropic/claude-sonnet-4-5"
+
+[reviewer]
+binary = "opencode"
+model = "anthropic/claude-sonnet-4-5"
+
+# ── Orchestration ───────────────────────────────────────────
+
+[orchestration]
+max_review_cycles = 6
+
+reviewer_system_prompt = """
+You are a senior backend engineer reviewing API implementations. You verify
+correctness by reading code, running tests, and checking that all requirements
+are met. You do not write code — you provide precise, actionable feedback.
+
+Your review must cover: endpoint behavior, database migrations, auth/authz,
+input validation, error handling, test coverage, and API documentation.
+"""
+
+worker_system_prompt = """
+You are a senior backend engineer implementing API features. You write clean,
+well-tested code. You follow the project's existing patterns and conventions.
+
+Before implementing, read the existing codebase to understand:
+- The routing framework and middleware stack
+- Database access patterns (ORM, raw SQL, migrations)
+- Authentication and authorization middleware
+- Testing patterns and fixtures
+- Error handling conventions
+"""
+
+# ── Constraints ─────────────────────────────────────────────
+
+[constraints]
+required_tools = [
+    "cargo test",
+    "cargo clippy -- -D warnings",
+]
+
+required_approaches = [
+    "Database changes must use migrations (not manual SQL)",
+    "All new endpoints must have integration tests",
+    "Use the existing error handling patterns — do not invent new ones",
+]
+
+forbidden_approaches = [
+    "Storing passwords in plaintext",
+    "Using MD5 or SHA1 for password hashing",
+    "Hardcoded secrets or tokens",
+]
+
+forbidden_paths = [
+    "Cargo.lock",
+    ".env",
+    "migrations/20230101_initial/",
+]
+
+custom_rules = [
+    "All new endpoints must return proper HTTP status codes (201 for creation, 404 for not found, 409 for conflict, 429 for rate limit)",
+    "Invitation tokens must be cryptographically random — use rand::rngs::OsRng, not rand::thread_rng()",
+    "The accept endpoint must be idempotent — accepting an already-accepted invitation returns the existing user",
+    "All database queries must use parameterized statements — no string interpolation in SQL",
+    "Integration tests must cover: happy path, expired token, already-accepted token, invalid token, rate limiting, unauthorized access",
+]
+
+# ── Stakeholders ────────────────────────────────────────────
+#
+# Each [[stakeholders]] entry defines a persona that participates in
+# planning, review, or both. Stakeholders get their own opencode process
+# with a clean context — they see the current state of the codebase and
+# the reviewer's draft, then provide input from their perspective.
+
+[[stakeholders]]
+name = "Security Auditor"
+persona = """
+You are a senior application security engineer. You review code for
+security vulnerabilities, authentication/authorization flaws, and data
+exposure risks. You think like an attacker.
+
+Your concerns include:
+- Token generation: is it cryptographically secure? Sufficient entropy?
+- Token storage: are tokens hashed in the database? (They should be —
+  a database leak should not expose valid invitation tokens.)
+- Input validation: can an attacker craft malicious email addresses,
+  inject SQL, or cause XSS via the name field?
+- Authorization: can a non-admin create invitations? Can someone
+  enumerate valid tokens via timing attacks on the lookup endpoint?
+- Rate limiting: is it per-token, per-IP, or per-session? Can it be
+  bypassed by rotating IPs?
+- Password handling: is bcrypt/argon2 used? Is the cost factor sufficient?
+- Information leakage: do error messages reveal whether a token exists
+  vs. is expired vs. is already accepted?
+
+Be specific. Cite exact code locations. Suggest concrete fixes.
+"""
+phases = ["planning", "review"]
+
+# Security auditor uses a different model for cost efficiency.
+# If omitted, the reviewer's agent config is used.
+[stakeholders.agent]
+binary = "opencode"
+model = "anthropic/claude-sonnet-4-5"
+
+[[stakeholders]]
+name = "UX Engineer"
+persona = """
+You are a frontend/UX engineer who consumes this API. You care about
+developer experience, API ergonomics, and end-user-facing behavior.
+
+Your concerns include:
+- Are error responses consistent and helpful? Do they include error
+  codes that the frontend can programmatically handle?
+- Is the invitation email content configurable or hardcoded?
+- What happens from the user's perspective if they click an expired link?
+  Do they get a helpful message or a cryptic 404?
+- Is the token URL-safe? (base64url, not base64 — no + / = characters)
+- Are response shapes consistent with existing API conventions?
+- Is pagination needed for GET /api/invitations (list endpoint)?
+  What about filtering by status (pending/accepted/expired)?
+- Are timestamps in ISO 8601 format with timezone?
+
+You don't review implementation details — you review the API contract
+and user-facing behavior.
+"""
+phases = ["review"]
+
+# UX engineer only participates in review — they don't need to see
+# the planning phase since they care about the actual output, not
+# the implementation plan.
+
+[[stakeholders]]
+name = "SRE"
+persona = """
+You are a site reliability engineer responsible for operating this service
+in production. You care about observability, failure modes, and operational
+risk.
+
+Your concerns include:
+- Logging: are invitation creation, acceptance, and revocation logged
+  with structured fields (invitation_id, email, admin_user_id)?
+- Metrics: are counters/histograms emitted for invitation operations?
+  (invitation_created, invitation_accepted, invitation_expired, etc.)
+- Background job: how does the expiry cleanup job run? Is it idempotent?
+  What happens if it crashes mid-run? Is there a dead letter queue for
+  failed email sends?
+- Database: are there proper indexes on the invitations table?
+  (token lookup, expiry scan, email uniqueness)
+- Failure modes: what happens if the email service is down? Does
+  invitation creation fail or succeed-with-pending-email?
+- Migration safety: can the migration be applied without downtime?
+  Does it lock the users table?
+- Rate limiting storage: is it in-memory (lost on restart) or in
+  Redis/database (persistent across deploys)?
+
+Be concrete about what observability instrumentation is missing.
+"""
+phases = ["planning", "review"]
+
+[stakeholders.agent]
+binary = "opencode"
+model = "anthropic/claude-sonnet-4-5"

@@ -3,11 +3,13 @@
 # Copy this to `ratio.toml` and customize for your project.
 # All fields have sensible defaults; only `goal` is required.
 #
-# Ratio orchestrates TWO LLM agents:
+# Ratio orchestrates LLM agents through iterative review cycles:
 #   - Reviewer: formulates tasks, reviews output, enforces constraints
 #   - Worker: executes the coding work
+#   - Stakeholders (optional): provide additional perspectives during
+#     planning and/or review phases
 #
-# Both agents are opencode instances communicating over ACP.
+# All agents are opencode instances communicating over ACP.
 
 # The goal to accomplish — a detailed natural-language description.
 goal = """
@@ -16,7 +18,7 @@ generated code compiles, follows idiomatic Rust patterns, has proper error \
 handling, and passes `cargo test`.
 """
 
-# Working directory both agents operate in.
+# Working directory all agents operate in.
 # Defaults to the current directory.
 # cwd = "/path/to/project"
 
@@ -40,10 +42,6 @@ binary = "opencode"
 binary = "opencode"
 # model = "anthropic/claude-sonnet-4-5"
 # agent = "my-custom-reviewer-agent"
-# env = [
-#   { key = "ANTHROPIC_API_KEY", value = "sk-ant-..." },
-# ]
-# extra_args = []
 
 # ── Orchestration behavior ──────────────────────────────────
 
@@ -91,7 +89,52 @@ forbidden_paths = [
 ]
 
 # Custom rules expressed as free-form sentences.
+# These are injected as MANDATORY QUALITY RULES — the reviewer cannot
+# approve unless every rule is satisfied.
 custom_rules = [
     "Do not add new dependencies without explicit approval",
     "Preserve existing public API signatures",
 ]
+
+# ── Stakeholders (optional) ─────────────────────────────────
+#
+# Stakeholders are additional LLM agents that participate in planning
+# and/or review phases. Each gets its own opencode subprocess with a
+# clean, unpolluted context and a unique persona.
+#
+# During planning: stakeholders review the reviewer's draft work
+# instruction and provide input. The reviewer then synthesizes their
+# feedback into the final instruction sent to the worker.
+#
+# During review: stakeholders review the worker's output and the
+# reviewer's draft assessment. The reviewer synthesizes their input
+# into the final verdict.
+#
+# Uncomment below to add stakeholders:
+
+# [[stakeholders]]
+# name = "Security Reviewer"
+# persona = """
+# You are a security engineer. Review for auth flaws, injection
+# vulnerabilities, data exposure, and insecure defaults.
+# """
+# # Which phases to participate in. Options: "planning", "review".
+# # Defaults to both.
+# phases = ["planning", "review"]
+#
+# # Optional: override the agent config (binary, model, env, etc.).
+# # If omitted, the reviewer's agent config is used.
+# # [stakeholders.agent]
+# # binary = "opencode"
+# # model = "anthropic/claude-sonnet-4-5"
+#
+# [[stakeholders]]
+# name = "Performance Engineer"
+# persona = """
+# You review for algorithmic efficiency, memory allocation patterns,
+# and scalability concerns. Flag any O(n^2) or worse algorithms.
+# """
+# phases = ["review"]  # Only review, not planning
+
+# See examples/fullstack-stakeholders.toml for a comprehensive example
+# with three stakeholders (Security Auditor, UX Engineer, SRE).

@@ -1,8 +1,8 @@
 # ratio
 
-Ratio orchestrates two LLM agents through iterative review cycles. A **reviewer** agent formulates precise work instructions and evaluates output. A **worker** agent executes the coding tasks. Both are [opencode](https://opencode.ai) instances communicating over the [Agent Client Protocol (ACP)](https://agentclientprotocol.com) — the same protocol used by Zed's AI features.
+Ratio orchestrates LLM agents through iterative review cycles. A **reviewer** agent formulates precise work instructions and evaluates output quality. A **worker** agent executes the coding tasks. Optional **stakeholder** agents bring additional perspectives (security, UX, ops, domain expertise) into planning and review phases. All agents are [opencode](https://opencode.ai) instances communicating over the [Agent Client Protocol (ACP)](https://agentclientprotocol.com).
 
-The orchestrator enforces user-specified constraints (required tools, forbidden patterns, path restrictions) and runs a structured approve/revise/reject loop until the reviewer is satisfied or the cycle limit is reached.
+The orchestrator enforces user-specified constraints (required tools, forbidden patterns, path restrictions, custom quality rules) and runs a structured approve/revise/reject loop until the reviewer is satisfied or the cycle limit is reached.
 
 ```
                     ┌─────────────┐
@@ -11,33 +11,82 @@ The orchestrator enforces user-specified constraints (required tools, forbidden 
                     │ constraints)│
                     └──────┬──────┘
                            │
-                    ┌──────▼──────┐
-                    │   ratio     │
-                    │ Orchestrator│
-                    └───┬─────┬───┘
-               ┌────────▼─┐ ┌─▼────────┐
-               │ reviewer │ │ worker   │
-               │(opencode)│ │(opencode)│
-               └──────────┘ └──────────┘
-                  LLM #1       LLM #2
+                    ┌──────▼─────────┐
+                    │      ratio     │
+                    │  Orchestrator  │
+                    └─┬────┬───────┬─┘
+              ┌───────▼┐ ┌─▼────┐ ┌▼─────────────┐
+              │reviewer│ │worker│ │ stakeholders │
+              │  (LLM) │ │(LLM) │ │   (LLM x N)  │
+              └────────┘ └──────┘ └──────────────┘
 ```
 
 ## How it works
 
-1. You provide a **goal** (natural-language description of what to build or fix) and optional **constraints** (required tools, forbidden patterns, path restrictions, custom rules).
+### Core loop
 
-2. The **reviewer** receives the goal and produces a detailed, actionable **work instruction** for the worker.
+1. You provide a **goal** (natural-language description of what to build or fix) and optional **constraints** (required tools, forbidden patterns, path restrictions, quality rules).
 
-3. The **worker** executes the instruction — reading files, editing code, running commands — and produces output.
+2. **Planning** — The reviewer receives the goal, reads the codebase, and produces a detailed, actionable work instruction. If stakeholders participate in the planning phase, they review the draft instruction and provide input from their perspectives. The reviewer synthesizes their feedback into the final instruction.
 
-4. The **reviewer** inspects the worker's output against the original goal and all constraints. It returns a structured verdict:
-   - **APPROVED** — work meets all requirements, orchestration ends successfully
-   - **NEEDS_REVISION** — specific feedback is sent back to the worker for another cycle
-   - **REJECTED** — the approach is fatally flawed and cannot be fixed iteratively
+3. **Working** — The worker executes the instruction: reading files, editing code, running commands.
 
-5. Steps 3–4 repeat up to the configured maximum cycles.
+4. **Reviewing** — The reviewer inspects the worker's output against the original goal, all constraints, and all mandatory quality rules. If stakeholders participate in the review phase, they review the output and draft assessment. The reviewer synthesizes their input into the final verdict:
+   - **APPROVED** — work meets all requirements, orchestration ends
+   - **NEEDS_REVISION** — specific feedback is sent back to the worker
+   - **REJECTED** — the approach is fatally flawed
 
-Both agents are real LLM instances. The reviewer is not a rule-based checker — it uses LLM reasoning to evaluate quality, correctness, and constraint compliance.
+5. Steps 3-4 repeat until approved, rejected, or the cycle limit is reached.
+
+All agents are real LLM instances. The reviewer is not a rule-based checker — it uses LLM reasoning to evaluate quality, correctness, and constraint compliance.
+
+### Verdict parsing
+
+The orchestrator parses the reviewer's response for a structured `VERDICT:` line. The parser is intentionally conservative:
+
+- Only a standalone `VERDICT: APPROVED` line triggers approval — the word "APPROVED" appearing in prose does not
+- Format template echoes (`APPROVED|NEEDS_REVISION|REJECTED`) are ignored
+- If no valid verdict line is found, the default is NEEDS_REVISION
+- The fallback never produces APPROVED — the reviewer must be unambiguous
+
+### Shared workspace
+
+Both agents (and all stakeholders) share a workspace protocol:
+
+- **`agents.md`** — implementation notes, decisions, progress. Both agents read and update it
+- **`.ratio/research/*.md`** — research and analysis files. Agents write findings to named markdown files and reference them in handoffs, preventing duplicate work across cycles
+- **Todo list** — shared via the `TodoWrite` tool, visible in the TUI in real time
+
+### Stakeholders
+
+Stakeholders are additional LLM agents that bring specialized perspectives into the orchestration loop without doing implementation work. Each stakeholder:
+
+- Gets its own opencode subprocess with a **clean, unpolluted context**
+- Has a unique **persona** that defines what they care about and how they evaluate things
+- Participates in **planning**, **review**, or both
+- Can use its own **model** (e.g., a cheaper model for simple reviews)
+- Writes analysis to `.ratio/research/` files that the team can reference
+
+During planning, stakeholders see the reviewer's draft work instruction and provide input. During review, they see the worker's output and the reviewer's draft assessment. The reviewer always makes the final verdict, but must address stakeholder concerns — unresolved stakeholder concerns block approval.
+
+Stakeholders are defined in the config file as `[[stakeholders]]` entries:
+
+```toml
+[[stakeholders]]
+name = "Security Auditor"
+persona = """
+You are a security engineer. Review for auth flaws, injection
+vulnerabilities, data exposure, and insecure crypto.
+"""
+phases = ["planning", "review"]  # or just ["review"]
+
+# Optional: use a different model than the reviewer
+[stakeholders.agent]
+binary = "opencode"
+model = "anthropic/claude-sonnet-4-5"
+```
+
+See [`examples/fullstack-stakeholders.toml`](examples/fullstack-stakeholders.toml) for a comprehensive example with three stakeholders (Security Auditor, UX Engineer, SRE).
 
 ## Installation
 
@@ -77,7 +126,23 @@ ratio --config ratio.toml
 ratio --config ratio.toml --headless > worker_output.txt
 ```
 
-In headless mode, worker text streams to stdout. Orchestrator status, reviewer text, and logs go to stderr.
+In headless mode, worker text streams to stdout. Reviewer text, stakeholder text, orchestrator status, and logs go to stderr.
+
+### Debug mode
+
+```sh
+ratio --config ratio.toml --headless --debug 2>debug.log
+```
+
+Logs all ACP protocol messages (`[acp:worker]`, `[acp:reviewer]`) and subprocess stderr (`[stderr:worker]`, `[stderr:reviewer]`, `[stderr:stakeholder]`) to stderr.
+
+### Resume a previous session
+
+```sh
+ratio --config ratio.toml --resume
+```
+
+Restores session state (cycle count, agent sessions, UI state) from the saved `.ratio-session.json` in the working directory.
 
 ## Configuration
 
@@ -98,7 +163,7 @@ Build a REST API server with user authentication, input validation,
 and comprehensive test coverage.
 """
 
-# Working directory for both agents. Defaults to current directory.
+# Working directory for all agents. Defaults to current directory.
 # cwd = "/path/to/project"
 
 # ── Agent configuration ────────────────────────────────────────
@@ -120,9 +185,11 @@ binary = "opencode"
 # ── Orchestration behavior ─────────────────────────────────────
 
 [orchestration]
-max_review_cycles = 5            # Maximum review-revise cycles before giving up
+max_review_cycles = 5            # Maximum review-revise cycles (default: 5)
 
-# Custom system prompts override the defaults.
+# Custom system prompts override the defaults. These shape agent behavior
+# across all cycles — use them for project-specific review criteria,
+# domain expertise, and quality standards.
 # reviewer_system_prompt = "You are a senior Rust engineer..."
 # worker_system_prompt = "You are a precise, thorough coding agent..."
 
@@ -159,12 +226,37 @@ forbidden_paths = [
     "Cargo.lock",
 ]
 
-# Free-form rules expressed as sentences.
+# Free-form rules expressed as sentences. These are injected as
+# MANDATORY QUALITY RULES — the reviewer cannot approve unless
+# every single rule is satisfied.
 custom_rules = [
     "Do not add new dependencies without explicit approval",
     "Preserve existing public API signatures",
 ]
+
+# ── Stakeholders (optional) ───────────────────────────────────
+# Each [[stakeholders]] entry adds a persona that participates in
+# planning and/or review phases.
+
+# [[stakeholders]]
+# name = "Security Reviewer"
+# persona = "You are a security engineer. Review for auth flaws..."
+# phases = ["planning", "review"]    # Default: both
+#
+# # Override the agent config (binary, model, env). Default: reviewer's config.
+# [stakeholders.agent]
+# binary = "opencode"
+# model = "anthropic/claude-sonnet-4-5"
 ```
+
+### Stakeholder configuration fields
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | yes | — | Display name (e.g. "Security Auditor") |
+| `persona` | string | yes | — | Who this stakeholder is, what they care about, how they evaluate |
+| `phases` | list | no | `["planning", "review"]` | Which phases to participate in |
+| `agent` | table | no | reviewer's config | Agent subprocess config (binary, model, env, etc.) |
 
 ## CLI reference
 
@@ -176,11 +268,13 @@ Usage: ratio [OPTIONS]
 Options:
   -g, --goal <GOAL>                The goal to accomplish
   -c, --config <FILE>              Path to TOML configuration file
-  -C, --cwd <DIR>                  Working directory for both agents
+  -C, --cwd <DIR>                  Working directory for all agents
       --worker-model <MODEL>       LLM model for the worker agent
       --reviewer-model <MODEL>     LLM model for the reviewer agent
       --max-cycles <N>             Maximum review cycles
       --headless                   Run without TUI (output to stdout/stderr)
+      --debug                      Log ACP protocol messages to stderr
+      --resume                     Resume a previous session from saved state
   -V, --version                    Print version
   -h, --help                       Print help
 ```
@@ -198,13 +292,15 @@ Ratio includes a terminal interface built with [ratatui](https://ratatui.rs).
 | **Reviewer** | Thinking tokens (dimmed italic), plan entries with status, reviewer output text |
 | **Worker** | Thinking tokens (dimmed italic), plan entries with status, worker output text |
 | **Tool Calls** | Tool invocations from both agents with kind badges, parameters, and status |
-| **Log** | Orchestrator messages with timestamps and severity |
+| **Log** | Orchestrator messages, stakeholder output (`[Name] ...`), timestamps, severity |
+
+Stakeholder output is routed to the Log pane with a `[Name]` prefix (e.g. `[Security Auditor] Found SQL injection risk in...`).
 
 ### Keyboard shortcuts
 
 | Key | Action |
 |---|---|
-| `Ctrl+K` | Emergency kill — immediately terminates both agents |
+| `Ctrl+K` | Emergency kill — immediately terminates all agents |
 | `Ctrl+C` x2 | Double-tap abort (within 800ms) |
 | `q` | Quit (when orchestration is finished) |
 | `Tab` | Focus next pane |
@@ -232,6 +328,10 @@ Each tool call entry shows:
 
 For tools with 3 or fewer parameters, values are shown inline. Larger parameter sets expand onto indented lines below.
 
+### Session persistence
+
+When the session is interrupted (Ctrl+C, Ctrl+K), the TUI state (todos, logs) and session identifiers are saved to `.ratio-session.json` in the working directory. Use `--resume` to restore.
+
 ## Architecture
 
 ### Runtime model
@@ -245,14 +345,17 @@ tokio::main (current_thread)
    ├─ spawn_local: worker ACP I/O loop
    ├─ spawn_local: reviewer event forwarder
    ├─ spawn_local: worker event forwarder
-   └─ orchestrator.run() — drives the review loop
+   ├─ spawn_local: stakeholder ACP I/O loops (one per stakeholder)
+   ├─ spawn_local: stakeholder event forwarders (one per stakeholder)
+   ├─ spawn_local: stderr drain tasks (one per subprocess)
+   └─ orchestrator.run() — drives the planning/review loop
        ↕ mpsc channels ↕
    TUI event loop (select! on terminal input + orchestrator events + timer)
 ```
 
 ### Agent lifecycle
 
-Each agent is spawned as:
+Each agent (reviewer, worker, stakeholder) is spawned as:
 
 ```sh
 opencode acp --cwd <working_dir> [--model <model>] [--agent <agent>] [extra_args...]
@@ -261,9 +364,31 @@ opencode acp --cwd <working_dir> [--model <model>] [--agent <agent>] [extra_args
 Communication is over **stdin/stdout** using newline-delimited JSON-RPC (the ACP wire format). The handshake sequence is:
 
 1. `initialize` — exchange protocol version and client info
-2. `new_session` — create a session scoped to the working directory
-3. `prompt` — send instructions, receive streaming updates via `session_notification`
-4. `cancel` — abort the current turn (on emergency stop)
+2. `set_session_model` — forward the configured model to opencode
+3. `new_session` — create a session scoped to the working directory
+4. `prompt` — send instructions, receive streaming updates via `session_notification`
+5. `cancel` — abort the current turn (on emergency stop)
+
+Subprocess stderr is drained asynchronously to prevent pipe buffer deadlocks. In `--debug` mode, stderr lines are printed with `[stderr:<role>]` prefixes.
+
+### Orchestration flow
+
+```
+             Planning                    Work-Review Loop (cycles)
+           ┌─────────┐                 ┌─────────────────────────┐
+           │         ▼                 │                         ▼
+  goal ──► reviewer ──► stakeholders ──► reviewer synthesis ──► worker
+                        (planning)      (final instruction)       │
+                                                                  │
+           ┌──────────────────────────────────────────────────────┘
+           │
+           ▼
+       reviewer ──► stakeholders ──► reviewer synthesis ──► verdict
+       (draft)      (review)         (final verdict)          │
+           ▲                                                  │
+           │         NEEDS_REVISION                           │
+           └──────────────────────────────────────────────────┘
+```
 
 ### Event flow
 
@@ -275,9 +400,10 @@ OrchestratorClient (implements acp::Client)
     │ AgentEvent (TextChunk, ThoughtChunk, ToolCallStarted, PlanUpdated, ...)
     ▼
 mpsc channel → Orchestrator
-    │ OrchestratorEvent (PhaseChanged, WorkerEvent, ReviewerEvent, Log, ...)
+    │ OrchestratorEvent (PhaseChanged, WorkerEvent, ReviewerEvent,
+    │                    StakeholderEvent, Log, CycleCompleted, Finished)
     ▼
-mpsc channel → TUI App
+mpsc channel → TUI App / headless printer
     │ Updates app state (output text, thinking, plan, tool calls, logs)
     ▼
 ratatui render (clamped scroll, styled paragraphs)
@@ -292,7 +418,27 @@ ratatui render (clamped scroll, styled paragraphs)
 | `ToolCall` | `ToolCallStarted` — with kind + raw_input |
 | `ToolCallUpdate` | `ToolCallUpdated` — with status + content + raw_output |
 | `Plan` | `PlanUpdated` — task list with priorities and status |
+| `TodoWrite` | `TodoUpdated` — shared todo list |
 | Other variants | `ProtocolMessage` — forwarded as debug info |
+
+### Source layout
+
+```
+crates/ratio/src/
+├── main.rs          — CLI args, agent spawning, TUI/headless modes
+├── config.rs        — Config, AgentConfig, StakeholderConfig, Constraints
+├── orchestrator.rs  — Orchestrator state machine, prompt construction,
+│                      verdict parsing, stakeholder consultation
+├── protocol.rs      — ACP client implementation, AgentEvent types,
+│                      WorkerConnection (prompt, cancel, set_model)
+├── session.rs       — SessionState, UIState persistence for resume
+├── subprocess.rs    — Agent process spawning (opencode acp subprocess)
+└── ui/
+    ├── app.rs       — App state, event handling, stream management
+    ├── events.rs    — TUI event loop (crossterm + orchestrator events)
+    ├── render.rs    — ratatui rendering dispatch
+    └── widgets.rs   — Pane rendering (reviewer, worker, tools, log)
+```
 
 ## Logging
 
@@ -305,6 +451,8 @@ tail -f "$TMPDIR/ratio.log"
 # Enable debug-level logging
 RUST_LOG=ratio=debug ratio --config ratio.toml
 ```
+
+In headless mode with `--debug`, ACP protocol messages and subprocess stderr are printed to stderr in addition to the log file.
 
 ## Examples
 
@@ -354,6 +502,46 @@ custom_rules = [
 ]
 ```
 
+### Multi-stakeholder review
+
+```toml
+goal = "Add a user invitation system with email tokens and role assignment."
+
+[worker]
+model = "anthropic/claude-sonnet-4-5"
+
+[reviewer]
+model = "anthropic/claude-sonnet-4-5"
+
+[orchestration]
+max_review_cycles = 6
+
+[[stakeholders]]
+name = "Security Auditor"
+persona = """
+Review for auth flaws, injection vulnerabilities, insecure token
+generation, and data exposure risks. Think like an attacker.
+"""
+phases = ["planning", "review"]
+
+[[stakeholders]]
+name = "SRE"
+persona = """
+Review for observability (logging, metrics), failure modes, migration
+safety, and operational risk. What breaks at 3am?
+"""
+phases = ["review"]
+
+[constraints]
+required_tools = ["cargo test"]
+custom_rules = [
+    "Invitation tokens must use OsRng, not thread_rng",
+    "All database queries must use parameterized statements",
+]
+```
+
+See [`examples/fullstack-stakeholders.toml`](examples/fullstack-stakeholders.toml) for a fully annotated example with three stakeholders and detailed personas.
+
 ### Headless CI pipeline
 
 ```sh
@@ -368,6 +556,20 @@ ratio \
   2>ratio-stderr.log
 
 echo "Orchestration complete"
+```
+
+### Debug a failing session
+
+```sh
+# Full protocol trace
+ratio --config ratio.toml --headless --debug 2>debug.log
+
+# In debug.log you'll see:
+# [acp:worker] send request id=1 method=initialize params={...}
+# [acp:worker] recv response id=1 result={...}
+# [acp:reviewer] send request id=1 method=prompt params={...}
+# [stderr:worker] Loading model anthropic/claude-sonnet-4-5...
+# [ratio] [Info] Parsed verdict: NEEDS_REVISION (feedback: 2847 chars)
 ```
 
 ## License
