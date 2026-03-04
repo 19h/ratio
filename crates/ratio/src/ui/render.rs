@@ -169,9 +169,10 @@ fn render_input_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(input_text, area);
 
-    // Place cursor.
+    // Place cursor — count display columns up to the byte cursor position.
     let inner = inner_area(area);
-    let cursor_x = inner.x + app.input_cursor as u16;
+    let display_cols = app.input_buffer[..app.input_cursor].chars().count() as u16;
+    let cursor_x = inner.x + display_cols;
     let cursor_y = inner.y;
     if cursor_x < inner.x + inner.width {
         frame.set_cursor_position((cursor_x, cursor_y));

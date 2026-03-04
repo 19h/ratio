@@ -295,10 +295,12 @@ impl App {
             AgentSource::Worker => &self.worker_stream,
             AgentSource::Reviewer => &self.reviewer_stream,
             AgentSource::Stakeholder(idx, _) => {
-                self.stakeholder_streams
-                    .get(*idx)
-                    .map(|(_, s)| s)
-                    .unwrap_or(&self.worker_stream) // fallback — shouldn't happen
+                if let Some((_, s)) = self.stakeholder_streams.get(*idx) {
+                    s
+                } else {
+                    // Stale index — reset to reviewer view.
+                    &self.reviewer_stream
+                }
             }
         }
     }
@@ -468,8 +470,13 @@ impl App {
         match source {
             AgentSource::Worker => &mut self.worker_stream,
             AgentSource::Reviewer => &mut self.reviewer_stream,
-            AgentSource::Stakeholder(idx, _) => {
-                // The stream should already exist (registered or late-created).
+            AgentSource::Stakeholder(idx, name) => {
+                // Ensure the stream exists (defensive — should already be
+                // created by register_stakeholders or late-registration).
+                while self.stakeholder_streams.len() <= *idx {
+                    self.stakeholder_streams
+                        .push((name.clone(), VecDeque::new()));
+                }
                 &mut self.stakeholder_streams[*idx].1
             }
         }
@@ -872,10 +879,18 @@ impl App {
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        return s.to_string();
     }
+    // Find a char boundary at or before `max - 3` to avoid panicking
+    // on multibyte UTF-8 sequences.
+    let target = max.saturating_sub(3);
+    let boundary = s
+        .char_indices()
+        .take_while(|(i, _)| *i <= target)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    format!("{}...", &s[..boundary])
 }
 
 fn phase_label(phase: &Phase) -> &str {

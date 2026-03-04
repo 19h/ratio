@@ -2,7 +2,7 @@
 
 Ratio orchestrates LLM agents through iterative review cycles. A **reviewer** agent formulates precise work instructions and evaluates output quality. A **worker** agent executes the coding tasks. Optional **stakeholder** agents bring additional perspectives (security, UX, ops, domain expertise) into planning and review phases. All agents are [opencode](https://opencode.ai) instances communicating over the [Agent Client Protocol (ACP)](https://agentclientprotocol.com).
 
-The orchestrator enforces user-specified constraints (required tools, forbidden patterns, path restrictions, custom quality rules) and runs a structured approve/revise/reject loop until the reviewer is satisfied or the cycle limit is reached.
+The orchestrator enforces user-specified constraints (required tools, forbidden patterns, path restrictions, custom quality rules) and runs a structured approve/revise/reject loop until the reviewer approves, rejects, or the user aborts.
 
 ```
                     ┌─────────────┐
@@ -36,7 +36,7 @@ The orchestrator enforces user-specified constraints (required tools, forbidden 
    - **NEEDS_REVISION** — specific feedback is sent back to the worker
    - **REJECTED** — the approach is fatally flawed
 
-5. Steps 3-4 repeat until approved, rejected, or the cycle limit is reached.
+5. Steps 3-4 repeat until approved, rejected, or aborted.
 
 All agents are real LLM instances. The reviewer is not a rule-based checker — it uses LLM reasoning to evaluate quality, correctness, and constraint compliance.
 
@@ -68,6 +68,8 @@ Stakeholders are additional LLM agents that bring specialized perspectives into 
 - Writes analysis to `.ratio/research/` files that the team can reference
 
 During planning, stakeholders see the reviewer's draft work instruction and provide input. During review, they see the worker's output and the reviewer's draft assessment. The reviewer always makes the final verdict, but must address stakeholder concerns — unresolved stakeholder concerns block approval.
+
+In the TUI, stakeholders are first-class streams in the Agent pane (same as Reviewer/Worker). You can cycle through them with `r`/`R`.
 
 Stakeholders are defined in the config file as `[[stakeholders]]` entries:
 
@@ -199,7 +201,9 @@ binary = "opencode"
 # ── Orchestration behavior ─────────────────────────────────────
 
 [orchestration]
-max_review_cycles = 5            # Maximum review-revise cycles (default: 5)
+# NOTE: currently not enforced by the runtime loop; retained for forward
+# compatibility with planned bounded-cycle orchestration.
+max_review_cycles = 5
 
 # Custom system prompts override the defaults. These shape agent behavior
 # across all cycles — use them for project-specific review criteria,
@@ -293,7 +297,7 @@ Options:
   -C, --cwd <DIR>                  Working directory for all agents
       --worker-model <MODEL>       LLM model for the worker agent
       --reviewer-model <MODEL>     LLM model for the reviewer agent
-      --max-cycles <N>             Maximum review cycles
+      --max-cycles <N>             Cycle cap override (currently not enforced)
       --headless                   Run without TUI (output to stdout/stderr)
       --debug                      Log ACP protocol messages to stderr
       --resume                     Resume a previous session from saved state
@@ -311,12 +315,25 @@ Ratio includes a terminal interface built with [ratatui](https://ratatui.rs).
 
 | Pane | Content |
 |---|---|
-| **Reviewer** | Thinking tokens (dimmed italic), plan entries with status, reviewer output text |
-| **Worker** | Thinking tokens (dimmed italic), plan entries with status, worker output text |
-| **Tool Calls** | Tool invocations from both agents with kind badges, parameters, and status |
-| **Log** | Orchestrator messages, stakeholder output (`[Name] ...`), timestamps, severity |
+| **Agent** | Unified stream for the currently selected agent (Reviewer, Worker, or Stakeholder): text output, thought chunks, tool calls, phase separators |
+| **Todo** | Shared todo list from `TodoWrite` tool calls |
+| **Log** | Orchestrator/system messages with timestamps and severity |
 
-Stakeholder output is routed to the Log pane with a `[Name]` prefix (e.g. `[Security Auditor] Found SQL injection risk in...`).
+The Agent pane is first-class for all agents. Stakeholders are not collapsed into logs — each stakeholder has its own stream and title color.
+
+### Agent stream behavior
+
+- `r` cycles forward through agents: Reviewer -> Worker -> Stakeholder 1 -> ...
+- `R` cycles backward
+- Phase changes auto-follow activity (`Working/Revising` -> Worker, `Planning/Reviewing` -> Reviewer)
+- During stakeholder consultation, the first stakeholder text chunk auto-switches from Reviewer to that stakeholder stream
+- Thought chunks are dim italic; tool calls are updated in place as status changes
+
+### Agent colors
+
+- Reviewer: magenta
+- Worker: cyan
+- Stakeholders: rotating palette (light green, yellow, red, blue, magenta, cyan, orange, lavender)
 
 ### Keyboard shortcuts
 
@@ -325,6 +342,10 @@ Stakeholder output is routed to the Log pane with a `[Name]` prefix (e.g. `[Secu
 | `Ctrl+K` | Emergency kill — immediately terminates all agents |
 | `Ctrl+C` x2 | Double-tap abort (within 800ms) |
 | `q` | Quit (when orchestration is finished) |
+| `i` or `:` | Enter message input mode |
+| `Esc` | Exit input mode |
+| `Enter` | Queue message to current agent (input mode) |
+| `r` / `R` | Cycle next / previous agent stream (Agent pane focused) |
 | `Tab` | Focus next pane |
 | `Shift+Tab` | Focus previous pane |
 | `j` / `Down` | Scroll down |
@@ -339,20 +360,34 @@ Each pane auto-scrolls independently. Scrolling up manually disables auto-scroll
 
 ### Tool call display
 
-Each tool call entry shows:
+Tool calls are rendered inline inside the active agent stream:
 
-- **Timestamp** — when the call was initiated
-- **Source** — `W` (worker, cyan) or `R` (reviewer, magenta)
-- **Status** — `[...]` in progress, `[ ok]` completed, `[ERR]` failed
-- **Kind** — two-character badge: `RD` read, `ED` edit, `DL` delete, `MV` move, `SR` search, `EX` execute, `TH` think, `FT` fetch
-- **Title** — human-readable description from the agent
-- **Parameters** — color-coded JSON key-value pairs from the tool's `raw_input`
+- In progress: `[read]`, `[edit]`, `[exec]`, etc. plus best-effort detail and trailing `...`
+- Completed: `[ok]` and dimmed detail
+- Failed: `[FAIL]` and red detail
 
-For tools with 3 or fewer parameters, values are shown inline. Larger parameter sets expand onto indented lines below.
+`detail` is extracted from the most useful available data in this order:
+
+1. File location (`path[:line]`) if ACP provides locations
+2. Command for execute tools
+3. Query/pattern plus scope for search tools
+4. Path-like fields from tool input (`path`, `filePath`, etc.)
+5. Compact fallback `key=value` summary
+
+Tool call updates are applied in-place by `tool_call_id`, so entries don't duplicate as streaming updates arrive.
+
+### Input mode note
+
+User-entered messages are currently queued and logged in the TUI but not injected into running agent turns yet. Wiring TUI input into orchestrator prompts is planned.
 
 ### Session persistence
 
-When the session is interrupted (Ctrl+C, Ctrl+K), the TUI state (todos, logs) and session identifiers are saved to `.ratio-session.json` in the working directory. Use `--resume` to restore.
+On interrupt/exit, ratio persists:
+
+- `.ratio-session.json` — reviewer/worker session IDs, last phase, cycle count, goal
+- `.ratio-ui-state.json` — todos and log entries
+
+`--resume` restores reviewer/worker sessions and UI state. Stakeholder sessions are recreated fresh on resume.
 
 ## Architecture
 
@@ -419,14 +454,15 @@ opencode subprocess
     │ ACP session_notification (JSON-RPC)
     ▼
 OrchestratorClient (implements acp::Client)
-    │ AgentEvent (TextChunk, ThoughtChunk, ToolCallStarted, PlanUpdated, ...)
+    │ AgentEvent (TextChunk, ThoughtChunk, ToolCallStarted, ToolCallUpdated,
+    │            TodoUpdated, PlanUpdated, ...)
     ▼
 mpsc channel → Orchestrator
     │ OrchestratorEvent (PhaseChanged, WorkerEvent, ReviewerEvent,
     │                    StakeholderEvent, Log, CycleCompleted, Finished)
     ▼
 mpsc channel → TUI App / headless printer
-    │ Updates app state (output text, thinking, plan, tool calls, logs)
+    │ Updates app state (agent streams, thoughts, tool calls, todos, logs)
     ▼
 ratatui render (clamped scroll, styled paragraphs)
 ```
@@ -439,8 +475,8 @@ ratatui render (clamped scroll, styled paragraphs)
 | `AgentThoughtChunk` | `ThoughtChunk` — streaming reasoning/thinking |
 | `ToolCall` | `ToolCallStarted` — with kind + raw_input |
 | `ToolCallUpdate` | `ToolCallUpdated` — with status + content + raw_output |
-| `Plan` | `PlanUpdated` — task list with priorities and status |
-| `TodoWrite` | `TodoUpdated` — shared todo list |
+| `Plan` | `PlanUpdated` — plan entries (currently not rendered as a dedicated panel) |
+| `ToolCall`/`ToolCallUpdate` for TodoWrite | `TodoUpdated` — shared todo list (parsed from tool input) |
 | Other variants | `ProtocolMessage` — forwarded as debug info |
 
 ### Source layout
@@ -459,7 +495,7 @@ crates/ratio/src/
     ├── app.rs       — App state, event handling, stream management
     ├── events.rs    — TUI event loop (crossterm + orchestrator events)
     ├── render.rs    — ratatui rendering dispatch
-    └── widgets.rs   — Pane rendering (reviewer, worker, tools, log)
+    └── widgets.rs   — Pane rendering (agent stream, todo, log, status)
 ```
 
 ## Logging
@@ -477,6 +513,8 @@ RUST_LOG=ratio=debug ratio --config ratio.toml
 In headless mode with `--debug`, ACP protocol messages and subprocess stderr are printed to stderr in addition to the log file.
 
 ## Examples
+
+`max_review_cycles` appears in several snippets below for forward compatibility, but the current orchestration loop is unbounded in runtime behavior.
 
 ### Code review and cleanup
 

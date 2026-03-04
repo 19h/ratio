@@ -188,23 +188,26 @@ impl EventLoop {
             }
             KeyCode::Backspace => {
                 if app.input_cursor > 0 {
-                    app.input_cursor -= 1;
-                    app.input_buffer.remove(app.input_cursor);
+                    // Move cursor back by one char (which may be multiple bytes).
+                    let prev = prev_char_boundary(&app.input_buffer, app.input_cursor);
+                    app.input_buffer.drain(prev..app.input_cursor);
+                    app.input_cursor = prev;
                 }
             }
             KeyCode::Delete => {
                 if app.input_cursor < app.input_buffer.len() {
-                    app.input_buffer.remove(app.input_cursor);
+                    let next = next_char_boundary(&app.input_buffer, app.input_cursor);
+                    app.input_buffer.drain(app.input_cursor..next);
                 }
             }
             KeyCode::Left => {
                 if app.input_cursor > 0 {
-                    app.input_cursor -= 1;
+                    app.input_cursor = prev_char_boundary(&app.input_buffer, app.input_cursor);
                 }
             }
             KeyCode::Right => {
                 if app.input_cursor < app.input_buffer.len() {
-                    app.input_cursor += 1;
+                    app.input_cursor = next_char_boundary(&app.input_buffer, app.input_cursor);
                 }
             }
             KeyCode::Home => {
@@ -215,10 +218,32 @@ impl EventLoop {
             }
             KeyCode::Char(c) => {
                 app.input_buffer.insert(app.input_cursor, c);
-                app.input_cursor += 1;
+                app.input_cursor += c.len_utf8();
             }
             _ => {}
         }
         Action::Redraw
     }
+}
+
+// ---------------------------------------------------------------------------
+// UTF-8 char boundary helpers
+// ---------------------------------------------------------------------------
+
+/// Find the byte offset of the previous char boundary before `pos`.
+fn prev_char_boundary(s: &str, pos: usize) -> usize {
+    let mut i = pos.saturating_sub(1);
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Find the byte offset of the next char boundary after `pos`.
+fn next_char_boundary(s: &str, pos: usize) -> usize {
+    let mut i = pos + 1;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i.min(s.len())
 }
