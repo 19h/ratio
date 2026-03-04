@@ -121,9 +121,15 @@ impl EventLoop {
             return Action::Redraw;
         }
 
-        // Switch active agent: 'r' when agent pane is focused.
+        // Cycle active agent: 'r' / 'R' when agent pane is focused.
+        // 'r' = forward (Reviewer → Worker → Stakeholder0 → ...)
+        // 'R' = backward
         if key.code == KeyCode::Char('r') && app.focused == FocusedPane::Agent {
-            app.toggle_agent();
+            app.cycle_agent();
+            return Action::Redraw;
+        }
+        if key.code == KeyCode::Char('R') && app.focused == FocusedPane::Agent {
+            app.cycle_agent_prev();
             return Action::Redraw;
         }
 

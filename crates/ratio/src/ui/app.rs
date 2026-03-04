@@ -48,25 +48,21 @@ impl FocusedPane {
 // Which agent's output is shown in the main pane
 // ---------------------------------------------------------------------------
 
-/// Which agent produced this event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which agent produced this event / whose stream is shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentSource {
     Worker,
     Reviewer,
+    /// A stakeholder agent identified by its index and display name.
+    Stakeholder(usize, String),
 }
 
 impl AgentSource {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> String {
         match self {
-            Self::Worker => "Worker",
-            Self::Reviewer => "Reviewer",
-        }
-    }
-
-    pub fn toggle(self) -> Self {
-        match self {
-            Self::Worker => Self::Reviewer,
-            Self::Reviewer => Self::Worker,
+            Self::Worker => "Worker".to_string(),
+            Self::Reviewer => "Reviewer".to_string(),
+            Self::Stakeholder(_, name) => name.clone(),
         }
     }
 }
@@ -159,6 +155,9 @@ pub struct App {
     pub worker_stream: VecDeque<StreamEntry>,
     /// Unified chronological stream for the reviewer.
     pub reviewer_stream: VecDeque<StreamEntry>,
+    /// Per-stakeholder streams, indexed by stakeholder index.
+    /// Each entry is (name, stream).
+    pub stakeholder_streams: Vec<(String, VecDeque<StreamEntry>)>,
 
     /// Scroll offset for the agent pane.
     pub agent_scroll: u16,
@@ -223,6 +222,7 @@ impl App {
             active_agent: AgentSource::Reviewer,
             worker_stream: VecDeque::new(),
             reviewer_stream: VecDeque::new(),
+            stakeholder_streams: Vec::new(),
             agent_scroll: 0,
             auto_scroll_agent: true,
             todos: Vec::new(),
@@ -244,6 +244,12 @@ impl App {
             message_queue: VecDeque::new(),
             cwd,
         }
+    }
+
+    /// Register stakeholder names so the TUI can create their streams.
+    /// Call this once after spawning stakeholders but before the run loop.
+    pub fn register_stakeholders(&mut self, names: &[String]) {
+        self.stakeholder_streams = names.iter().map(|n| (n.clone(), VecDeque::new())).collect();
     }
 
     /// Restore todos and log entries from a previous session's UI state.
@@ -285,19 +291,70 @@ impl App {
 
     /// Get the currently active agent's stream.
     pub fn active_stream(&self) -> &VecDeque<StreamEntry> {
-        match self.active_agent {
+        match &self.active_agent {
             AgentSource::Worker => &self.worker_stream,
             AgentSource::Reviewer => &self.reviewer_stream,
+            AgentSource::Stakeholder(idx, _) => {
+                self.stakeholder_streams
+                    .get(*idx)
+                    .map(|(_, s)| s)
+                    .unwrap_or(&self.worker_stream) // fallback — shouldn't happen
+            }
         }
     }
 
-    /// Toggle which agent is displayed in the main pane.
-    pub fn toggle_agent(&mut self) {
-        self.switch_to_agent(self.active_agent.toggle());
+    /// Cycle to the next agent in the ring: Reviewer → Worker → Stakeholder0 → ... → Reviewer.
+    pub fn cycle_agent(&mut self) {
+        let next = match &self.active_agent {
+            AgentSource::Reviewer => AgentSource::Worker,
+            AgentSource::Worker => {
+                if let Some((name, _)) = self.stakeholder_streams.first() {
+                    AgentSource::Stakeholder(0, name.clone())
+                } else {
+                    AgentSource::Reviewer
+                }
+            }
+            AgentSource::Stakeholder(idx, _) => {
+                let next_idx = idx + 1;
+                if let Some((name, _)) = self.stakeholder_streams.get(next_idx) {
+                    AgentSource::Stakeholder(next_idx, name.clone())
+                } else {
+                    AgentSource::Reviewer
+                }
+            }
+        };
+        self.switch_to_agent(next);
+    }
+
+    /// Cycle to the previous agent in the ring.
+    pub fn cycle_agent_prev(&mut self) {
+        let prev = match &self.active_agent {
+            AgentSource::Reviewer => {
+                if let Some((idx, (name, _))) = self.stakeholder_streams.iter().enumerate().last() {
+                    AgentSource::Stakeholder(idx, name.clone())
+                } else {
+                    AgentSource::Worker
+                }
+            }
+            AgentSource::Worker => AgentSource::Reviewer,
+            AgentSource::Stakeholder(idx, _) => {
+                if *idx == 0 {
+                    AgentSource::Worker
+                } else {
+                    let prev_idx = idx - 1;
+                    if let Some((name, _)) = self.stakeholder_streams.get(prev_idx) {
+                        AgentSource::Stakeholder(prev_idx, name.clone())
+                    } else {
+                        AgentSource::Worker
+                    }
+                }
+            }
+        };
+        self.switch_to_agent(prev);
     }
 
     /// Switch the active agent view (only if actually changing).
-    fn switch_to_agent(&mut self, agent: AgentSource) {
+    pub fn switch_to_agent(&mut self, agent: AgentSource) {
         if self.active_agent != agent {
             self.active_agent = agent;
             self.agent_scroll = u16::MAX;
@@ -309,14 +366,15 @@ impl App {
     pub fn submit_input(&mut self) {
         let text = self.input_buffer.trim().to_string();
         if !text.is_empty() {
-            self.message_queue.push_back(QueuedMessage {
-                text: text.clone(),
-                target: self.active_agent,
-            });
+            let target = self.active_agent.clone();
             self.push_log(
                 LogLevel::Info,
-                format!("[User -> {:?}] {}", self.active_agent, text),
+                format!("[User -> {}] {}", target.label(), text),
             );
+            self.message_queue.push_back(QueuedMessage {
+                text: text.clone(),
+                target,
+            });
         }
         self.input_buffer.clear();
         self.input_cursor = 0;
@@ -337,7 +395,19 @@ impl App {
                         self.switch_to_agent(AgentSource::Worker);
                     }
                     Phase::Planning | Phase::Reviewing => {
-                        self.push_stream(AgentSource::Reviewer, StreamEntry::Separator(sep));
+                        self.push_stream(
+                            AgentSource::Reviewer,
+                            StreamEntry::Separator(sep.clone()),
+                        );
+                        // Also push separator to all stakeholder streams so
+                        // they have phase context when viewed.
+                        for i in 0..self.stakeholder_streams.len() {
+                            let name = self.stakeholder_streams[i].0.clone();
+                            self.push_stream(
+                                AgentSource::Stakeholder(i, name),
+                                StreamEntry::Separator(sep.clone()),
+                            );
+                        }
                         self.switch_to_agent(AgentSource::Reviewer);
                     }
                     _ => {}
@@ -367,27 +437,40 @@ impl App {
                     ),
                 );
             }
-            OrchestratorEvent::StakeholderEvent(_idx, ref name, agent_evt) => {
-                // Route stakeholder output into the log pane with a [Name] prefix.
-                match agent_evt {
-                    AgentEvent::TextChunk(text) => {
-                        self.push_log(LogLevel::Info, format!("[{name}] {text}"));
-                    }
-                    AgentEvent::ThoughtChunk(text) => {
-                        self.push_log(LogLevel::Info, format!("[{name} thought] {text}"));
-                    }
-                    AgentEvent::ToolCallStarted { title, .. } => {
-                        self.push_log(LogLevel::Info, format!("[{name}] tool: {title}"));
-                    }
-                    AgentEvent::TurnComplete { .. } => {
-                        self.push_log(LogLevel::Info, format!("[{name}] done"));
-                    }
-                    _ => {} // ToolCallUpdated, PlanUpdated, TodoUpdated, PermissionRequested
+            OrchestratorEvent::StakeholderEvent(idx, ref name, agent_evt) => {
+                // Ensure the stakeholder stream exists (late registration).
+                while self.stakeholder_streams.len() <= idx {
+                    self.stakeholder_streams
+                        .push((name.clone(), VecDeque::new()));
                 }
+                let source = AgentSource::Stakeholder(idx, name.clone());
+
+                // Auto-switch to this stakeholder when their first text
+                // arrives, but only if we're still on the Reviewer view
+                // (stakeholder consultation happens during Planning/Reviewing).
+                if matches!(agent_evt, AgentEvent::TextChunk(_))
+                    && self.active_agent == AgentSource::Reviewer
+                    && self.auto_scroll_agent
+                {
+                    self.switch_to_agent(source.clone());
+                }
+
+                self.handle_agent_event(agent_evt, source);
             }
             OrchestratorEvent::Finished(phase) => {
                 self.finished = true;
                 self.final_phase = Some(phase);
+            }
+        }
+    }
+
+    fn get_stream_mut(&mut self, source: &AgentSource) -> &mut VecDeque<StreamEntry> {
+        match source {
+            AgentSource::Worker => &mut self.worker_stream,
+            AgentSource::Reviewer => &mut self.reviewer_stream,
+            AgentSource::Stakeholder(idx, _) => {
+                // The stream should already exist (registered or late-created).
+                &mut self.stakeholder_streams[*idx].1
             }
         }
     }
@@ -397,10 +480,7 @@ impl App {
             AgentEvent::TextChunk(text) => {
                 // Coalesce consecutive text chunks into a single entry so the
                 // renderer doesn't treat each streamed fragment as a new line.
-                let stream = match source {
-                    AgentSource::Worker => &mut self.worker_stream,
-                    AgentSource::Reviewer => &mut self.reviewer_stream,
-                };
+                let stream = self.get_stream_mut(&source);
                 if let Some(StreamEntry::Text(existing)) = stream.back_mut() {
                     existing.push_str(&text);
                     // Auto-scroll if viewing this agent.
@@ -412,10 +492,7 @@ impl App {
                 }
             }
             AgentEvent::ThoughtChunk(text) => {
-                let stream = match source {
-                    AgentSource::Worker => &mut self.worker_stream,
-                    AgentSource::Reviewer => &mut self.reviewer_stream,
-                };
+                let stream = self.get_stream_mut(&source);
                 if let Some(StreamEntry::Thought(existing)) = stream.back_mut() {
                     existing.push_str(&text);
                     if source == self.active_agent && self.auto_scroll_agent {
@@ -455,10 +532,7 @@ impl App {
                 locations,
                 ..
             } => {
-                let stream = match source {
-                    AgentSource::Worker => &mut self.worker_stream,
-                    AgentSource::Reviewer => &mut self.reviewer_stream,
-                };
+                let stream = self.get_stream_mut(&source);
                 // Find the existing ToolCall entry and update it in-place.
                 if let Some(StreamEntry::ToolCall {
                     status: s,
@@ -515,26 +589,26 @@ impl App {
             AgentEvent::PermissionRequested { description } => {
                 self.push_log(
                     LogLevel::Info,
-                    format!("[{source:?}] Permission auto-approved: {description}"),
+                    format!(
+                        "[{}] Permission auto-approved: {description}",
+                        source.label()
+                    ),
                 );
             }
             AgentEvent::TurnComplete { stop_reason } => {
                 self.push_log(
                     LogLevel::Info,
-                    format!("[{source:?}] Turn complete: {stop_reason:?}"),
+                    format!("[{}] Turn complete: {stop_reason:?}", source.label()),
                 );
             }
             AgentEvent::ProtocolMessage(msg) => {
-                self.push_log(LogLevel::Info, format!("[{source:?}] {msg}"));
+                self.push_log(LogLevel::Info, format!("[{}] {msg}", source.label()));
             }
         }
     }
 
     fn push_stream(&mut self, source: AgentSource, entry: StreamEntry) {
-        let stream = match source {
-            AgentSource::Worker => &mut self.worker_stream,
-            AgentSource::Reviewer => &mut self.reviewer_stream,
-        };
+        let stream = self.get_stream_mut(&source);
         stream.push_back(entry);
         if stream.len() > MAX_STREAM_ENTRIES {
             stream.pop_front();

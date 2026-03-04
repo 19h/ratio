@@ -291,6 +291,12 @@ async fn run_tui_inner(
                 }
             }
 
+            // Register stakeholder names with the TUI so it can create streams.
+            {
+                let names: Vec<String> = live_stakeholders.iter().map(|s| s.name.clone()).collect();
+                app.register_stakeholders(&names);
+            }
+
             // ── Spawn orchestrator ──────────────────────────────
             let orch_tx = orch_event_tx.clone();
             let config_clone = config.clone();

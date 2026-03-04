@@ -43,18 +43,37 @@ pub fn focused_border_style(focused: FocusedPane, this_pane: FocusedPane) -> Sty
 // Unified agent stream pane
 // ---------------------------------------------------------------------------
 
+/// Color palette for stakeholders — cycles through distinctive colors.
+const STAKEHOLDER_COLORS: &[Color] = &[
+    Color::LightGreen,
+    Color::LightYellow,
+    Color::LightRed,
+    Color::LightBlue,
+    Color::LightMagenta,
+    Color::LightCyan,
+    Color::Rgb(255, 165, 0),   // orange
+    Color::Rgb(180, 130, 255), // lavender
+];
+
+/// Get the color for a given agent source.
+pub fn agent_color(agent: &AgentSource) -> Color {
+    match agent {
+        AgentSource::Worker => Color::Cyan,
+        AgentSource::Reviewer => Color::Magenta,
+        AgentSource::Stakeholder(idx, _) => STAKEHOLDER_COLORS[idx % STAKEHOLDER_COLORS.len()],
+    }
+}
+
 /// Build the main agent output pane — a unified chronological stream of
 /// text, thoughts, and tool calls as they arrive.
 pub fn agent_stream_paragraph<'a>(
     stream: &'a std::collections::VecDeque<StreamEntry>,
-    agent: AgentSource,
+    agent: &AgentSource,
     scroll: u16,
     focused: FocusedPane,
 ) -> Paragraph<'a> {
-    let (title, title_color) = match agent {
-        AgentSource::Worker => ("Worker", Color::Cyan),
-        AgentSource::Reviewer => ("Reviewer", Color::Magenta),
-    };
+    let title = agent.label();
+    let title_color = agent_color(agent);
 
     let block = Block::default()
         .title(format!(" {title} "))
@@ -264,11 +283,12 @@ pub fn log_paragraph<'a>(
 pub fn status_bar<'a>(
     phase: &Phase,
     cycle: usize,
-    active_agent: AgentSource,
+    active_agent: &AgentSource,
     focused: FocusedPane,
     abort_requested: bool,
     finished: bool,
     input_mode: bool,
+    num_stakeholders: usize,
 ) -> Line<'a> {
     let mut spans = vec![
         Span::styled(
@@ -289,13 +309,10 @@ pub fn status_bar<'a>(
     }
 
     // Show active agent.
-    let agent_color = match active_agent {
-        AgentSource::Worker => Color::Cyan,
-        AgentSource::Reviewer => Color::Magenta,
-    };
+    let color = agent_color(active_agent);
     spans.push(Span::styled(
         format!("[{}]", active_agent.label()),
-        Style::default().fg(agent_color),
+        Style::default().fg(color),
     ));
 
     let pane_label = match focused {
@@ -307,6 +324,20 @@ pub fn status_bar<'a>(
         format!(" {pane_label}"),
         Style::default().fg(Color::DarkGray),
     ));
+
+    // Show agent index if there are stakeholders (e.g. "1/4").
+    let total_agents = 2 + num_stakeholders; // Worker + Reviewer + stakeholders
+    if num_stakeholders > 0 {
+        let current_idx = match active_agent {
+            AgentSource::Reviewer => 1,
+            AgentSource::Worker => 2,
+            AgentSource::Stakeholder(idx, _) => 3 + idx,
+        };
+        spans.push(Span::styled(
+            format!(" {current_idx}/{total_agents}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
 
     spans.push(Span::raw("  "));
 
@@ -327,7 +358,7 @@ pub fn status_bar<'a>(
         ));
     } else {
         spans.push(Span::styled(
-            "i:input r:switch Tab:pane j/k:scroll Ctrl+K:kill",
+            "i:input r/R:agent Tab:pane j/k:scroll Ctrl+K:kill",
             Style::default().fg(Color::DarkGray),
         ));
     }

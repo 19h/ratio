@@ -109,7 +109,7 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
 fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let stream = app.active_stream();
-    let paragraph = widgets::agent_stream_paragraph(stream, app.active_agent, 0, app.focused);
+    let paragraph = widgets::agent_stream_paragraph(stream, &app.active_agent, 0, app.focused);
     let inner = inner_area(area);
     let clamped = clamp_scroll(
         paragraph.line_count(inner.width),
@@ -120,7 +120,7 @@ fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     let paragraph = widgets::agent_stream_paragraph(
         app.active_stream(),
-        app.active_agent,
+        &app.active_agent,
         clamped,
         app.focused,
     );
@@ -186,11 +186,12 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let bar = widgets::status_bar(
         &app.phase,
         app.current_cycle,
-        app.active_agent,
+        &app.active_agent,
         app.focused,
         app.abort_requested,
         app.finished,
         app.input_mode,
+        app.stakeholder_streams.len(),
     );
     let paragraph = Paragraph::new(bar);
     frame.render_widget(paragraph, area);
