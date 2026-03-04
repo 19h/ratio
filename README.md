@@ -69,9 +69,24 @@ Stakeholders are additional LLM agents that bring specialized perspectives into 
 - Can use its own **model** (e.g., a cheaper model for simple reviews)
 - Writes analysis to `.ratio/research/` files that the team can reference
 
-During planning, stakeholders see the reviewer's draft work instruction and provide input. During review, they see the worker's output and the reviewer's draft assessment. The reviewer always makes the final verdict, but must address stakeholder concerns — unresolved stakeholder concerns block approval.
+During planning, stakeholders review the reviewer's **draft work instruction** before it reaches the worker. They are explicitly told they are reviewing an instruction that will be sent to the worker agent, and their feedback is incorporated by the reviewer into the final instruction. This ensures all perspectives are captured before work begins.
+
+During review, stakeholders see the worker's output and the reviewer's draft assessment. The reviewer always makes the final verdict, but must address stakeholder concerns — unresolved stakeholder concerns block approval.
+
+#### Parallel execution
+
+By default, all stakeholders for a given phase are consulted **in parallel** (`parallel_stakeholders = true`). This can significantly reduce total wall-clock time when multiple stakeholders are configured — instead of waiting for each stakeholder sequentially, all of them run concurrently and the orchestrator collects their results.
+
+Toggle parallel/sequential execution:
+- In the config file: `parallel_stakeholders = true` (default) or `false`
+- At runtime in the TUI: press `p` to toggle
+- The status bar shows `[parallel]` or `[sequential]` when stakeholders are present
+
+#### TUI integration
 
 In the TUI, stakeholders are first-class streams in the Agent pane (same as Reviewer/Worker). You can cycle through them with `r`/`R`.
+
+#### Configuration
 
 Stakeholders are defined in the config file as `[[stakeholders]]` entries:
 
@@ -221,6 +236,11 @@ max_review_cycles = 5
 # Maximum nudge attempts before treating the turn as failed. Default: 3.
 # max_nudges = 3
 
+# Run stakeholder consultations in parallel. When enabled, all stakeholders
+# for a given phase are prompted concurrently. Toggle at runtime with 'p'.
+# Default: true.
+# parallel_stakeholders = true
+
 # ── Enforced constraints ───────────────────────────────────────
 # Injected into prompts for both agents. The worker must follow them;
 # the reviewer verifies compliance.
@@ -339,13 +359,15 @@ The Agent pane is first-class for all agents. Stakeholders are not collapsed int
 
 ### Keyboard shortcuts
 
+Press `h` at any time to show the full help overlay in the TUI.
+
 | Key | Action |
 |---|---|
 | `Ctrl+K` | Emergency kill — immediately terminates all agents |
 | `Ctrl+C` x2 | Double-tap abort (within 800ms) |
 | `q` | Quit (when orchestration is finished) |
 | `i` or `:` | Enter message input mode |
-| `Esc` | Exit input mode |
+| `Esc` | Exit input mode / dismiss help |
 | `Enter` | Queue message to current agent (input mode) |
 | `Alt+Enter` or `Ctrl+Enter` | Queue message and interrupt current Reviewer/Worker turn |
 | `r` / `R` | Cycle next / previous agent stream (Agent pane focused) |
@@ -356,6 +378,8 @@ The Agent pane is first-class for all agents. Stakeholders are not collapsed int
 | `PageDown` / `PageUp` | Scroll by 20 lines |
 | `End` | Jump to bottom (re-enables auto-scroll) |
 | `Home` | Jump to top (disables auto-scroll) |
+| `h` | Toggle help overlay |
+| `p` | Toggle parallel stakeholder execution |
 
 ### Auto-scroll
 
@@ -392,10 +416,10 @@ If the target agent is currently idle, the message is applied on its next turn.
 
 On interrupt/exit, ra persists:
 
-- `.ratio-session.json` — reviewer/worker session IDs, last phase, cycle count, goal
+- `.ratio-session.json` — session IDs for reviewer, worker, and all stakeholders, plus last phase, cycle count, and goal
 - `.ratio-ui-state.json` — todos and log entries
 
-`--resume` restores reviewer/worker sessions and UI state. Stakeholder sessions are recreated fresh on resume.
+`--resume` restores all agent sessions (reviewer, worker, and stakeholders) and UI state. Each stakeholder is matched by index and name — if a saved session is found, the ACP session is restored so the stakeholder retains its full conversation history and any research files it previously wrote. If a stakeholder's session cannot be restored (e.g., the config changed), it falls back to a fresh handshake.
 
 ## Architecture
 
@@ -545,6 +569,7 @@ model = "anthropic/claude-sonnet-4-5"
 
 [orchestration]
 max_review_cycles = 6
+parallel_stakeholders = true  # both stakeholders run concurrently (default)
 
 [[stakeholders]]
 name = "Security Auditor"
