@@ -28,6 +28,10 @@ pub struct Config {
     /// Reviewer agent configuration (the agent reviewing the worker's output).
     pub reviewer: AgentConfig,
 
+    /// Additional stakeholder personas that participate in planning and/or review.
+    #[serde(default)]
+    pub stakeholders: Vec<StakeholderConfig>,
+
     /// Orchestration behavior.
     pub orchestration: OrchestrationConfig,
 
@@ -42,6 +46,7 @@ impl Default for Config {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             worker: AgentConfig::default_worker(),
             reviewer: AgentConfig::default_reviewer(),
+            stakeholders: Vec::new(),
             orchestration: OrchestrationConfig::default(),
             constraints: Constraints::default(),
         }
@@ -143,6 +148,47 @@ impl AgentConfig {
 pub struct EnvVar {
     pub key: String,
     pub value: String,
+}
+
+// ---------------------------------------------------------------------------
+// Stakeholder configuration
+// ---------------------------------------------------------------------------
+
+/// Which orchestration phases a stakeholder participates in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StakeholderPhase {
+    Planning,
+    Review,
+}
+
+/// Configuration for a stakeholder persona.
+///
+/// Each stakeholder gets its own opencode subprocess with a clean context.
+/// During the phases they participate in, they are prompted with the current
+/// context and asked for input from their unique perspective.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StakeholderConfig {
+    /// Human-readable name (e.g. "Reverse Engineer", "CEO").
+    pub name: String,
+
+    /// The persona prompt — describes who this stakeholder is, what they
+    /// care about, and how they evaluate things.
+    pub persona: String,
+
+    /// Which phases this stakeholder participates in.
+    /// Defaults to both planning and review.
+    #[serde(default = "default_stakeholder_phases")]
+    pub phases: Vec<StakeholderPhase>,
+
+    /// Agent subprocess configuration (binary, model, env, etc.).
+    /// Falls back to the reviewer's config if not specified.
+    #[serde(default)]
+    pub agent: Option<AgentConfig>,
+}
+
+fn default_stakeholder_phases() -> Vec<StakeholderPhase> {
+    vec![StakeholderPhase::Planning, StakeholderPhase::Review]
 }
 
 // ---------------------------------------------------------------------------

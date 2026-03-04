@@ -367,6 +367,24 @@ impl App {
                     ),
                 );
             }
+            OrchestratorEvent::StakeholderEvent(_idx, ref name, agent_evt) => {
+                // Route stakeholder output into the log pane with a [Name] prefix.
+                match agent_evt {
+                    AgentEvent::TextChunk(text) => {
+                        self.push_log(LogLevel::Info, format!("[{name}] {text}"));
+                    }
+                    AgentEvent::ThoughtChunk(text) => {
+                        self.push_log(LogLevel::Info, format!("[{name} thought] {text}"));
+                    }
+                    AgentEvent::ToolCallStarted { title, .. } => {
+                        self.push_log(LogLevel::Info, format!("[{name}] tool: {title}"));
+                    }
+                    AgentEvent::TurnComplete { .. } => {
+                        self.push_log(LogLevel::Info, format!("[{name}] done"));
+                    }
+                    _ => {} // ToolCallUpdated, PlanUpdated, TodoUpdated, PermissionRequested
+                }
+            }
             OrchestratorEvent::Finished(phase) => {
                 self.finished = true;
                 self.final_phase = Some(phase);
@@ -442,32 +460,29 @@ impl App {
                     AgentSource::Reviewer => &mut self.reviewer_stream,
                 };
                 // Find the existing ToolCall entry and update it in-place.
-                if let Some(entry) = stream
+                if let Some(StreamEntry::ToolCall {
+                    status: s,
+                    detail: d,
+                    kind: k,
+                    ..
+                }) = stream
                     .iter_mut()
                     .rev()
                     .find(|e| matches!(e, StreamEntry::ToolCall { id: eid, .. } if *eid == id))
                 {
-                    if let StreamEntry::ToolCall {
-                        status: s,
-                        detail: d,
-                        kind: k,
-                        ..
-                    } = entry
-                    {
-                        *s = status;
-                        // Re-extract detail from the update which often has
-                        // better data (locations filled in, title updated).
-                        let updated_title = title.as_deref().unwrap_or("");
-                        let better =
-                            Self::extract_tool_detail(k, updated_title, &locations, &raw_input);
-                        if !better.is_empty() && better != updated_title {
-                            *d = better;
-                        } else if d.is_empty() || d == updated_title {
-                            // Try the title from the update as last resort.
-                            if let Some(ref t) = title {
-                                if !t.is_empty() {
-                                    *d = t.clone();
-                                }
+                    *s = status;
+                    // Re-extract detail from the update which often has
+                    // better data (locations filled in, title updated).
+                    let updated_title = title.as_deref().unwrap_or("");
+                    let better =
+                        Self::extract_tool_detail(k, updated_title, &locations, &raw_input);
+                    if !better.is_empty() && better != updated_title {
+                        *d = better;
+                    } else if d.is_empty() || d == updated_title {
+                        // Try the title from the update as last resort.
+                        if let Some(ref t) = title {
+                            if !t.is_empty() {
+                                *d = t.clone();
                             }
                         }
                     }

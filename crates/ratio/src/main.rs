@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use agent_client_protocol as acp;
 use ratio::config::{CliOverrides, Config};
-use ratio::orchestrator::{Orchestrator, OrchestratorEvent};
+use ratio::orchestrator::{LiveStakeholder, Orchestrator, OrchestratorEvent};
 use ratio::protocol::AgentEvent;
 use ratio::session::SessionState;
 use ratio::subprocess::{AgentRole, spawn_agent};
@@ -247,6 +247,50 @@ async fn run_tui_inner(
                 worker_conn.set_model(&config.worker.model).await?;
             }
 
+            // ── Spawn stakeholder agents ─────────────────────────
+            let mut live_stakeholders = Vec::new();
+            let mut stakeholder_event_rxs = Vec::new();
+            for (i, sh_cfg) in config.stakeholders.iter().enumerate() {
+                let agent_cfg = sh_cfg.agent.as_ref().unwrap_or(&config.reviewer);
+                let (sh_event_tx, sh_event_rx) = mpsc::unbounded_channel();
+                match spawn_agent(
+                    AgentRole::Reviewer, // stakeholders use reviewer role (read-only)
+                    agent_cfg,
+                    &config.cwd,
+                    sh_event_tx,
+                ) {
+                    Ok((mut sh_conn, mut sh_proc, sh_io)) => {
+                        if let Some(stderr) = sh_proc.stderr.take() {
+                            tokio::task::spawn_local(drain_stderr(stderr, "stakeholder", false));
+                        }
+                        tokio::task::spawn_local(async move {
+                            if let Err(e) = sh_io.await {
+                                tracing::error!("Stakeholder I/O error: {e}");
+                            }
+                        });
+                        if let Err(e) = sh_conn.handshake(&config.cwd).await {
+                            tracing::warn!("Stakeholder '{}' handshake failed: {e}", sh_cfg.name);
+                            continue;
+                        }
+                        if let Some(ref ac) = sh_cfg.agent {
+                            if !ac.model.is_empty() {
+                                let _ = sh_conn.set_model(&ac.model).await;
+                            }
+                        }
+                        live_stakeholders.push(LiveStakeholder {
+                            index: i,
+                            name: sh_cfg.name.clone(),
+                            conn: sh_conn,
+                            proc: sh_proc,
+                        });
+                        stakeholder_event_rxs.push(sh_event_rx);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to spawn stakeholder '{}': {e}", sh_cfg.name);
+                    }
+                }
+            }
+
             // ── Spawn orchestrator ──────────────────────────────
             let orch_tx = orch_event_tx.clone();
             let config_clone = config.clone();
@@ -274,6 +318,8 @@ async fn run_tui_inner(
                         &worker_conn,
                         &mut reviewer_proc,
                         &mut worker_proc,
+                        &mut live_stakeholders,
+                        stakeholder_event_rxs,
                         worker_event_rx,
                         reviewer_event_rx,
                         abort_rx,
@@ -404,6 +450,50 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                 worker_conn.set_model(&config.worker.model).await?;
             }
 
+            // ── Spawn stakeholder agents ─────────────────────────
+            let mut live_stakeholders = Vec::new();
+            let mut stakeholder_event_rxs = Vec::new();
+            for (i, sh_cfg) in config.stakeholders.iter().enumerate() {
+                let agent_cfg = sh_cfg.agent.as_ref().unwrap_or(&config.reviewer);
+                let (sh_event_tx, sh_event_rx) = mpsc::unbounded_channel();
+                match spawn_agent(
+                    AgentRole::Reviewer, // stakeholders use reviewer role (read-only)
+                    agent_cfg,
+                    &config.cwd,
+                    sh_event_tx,
+                ) {
+                    Ok((mut sh_conn, mut sh_proc, sh_io)) => {
+                        if let Some(stderr) = sh_proc.stderr.take() {
+                            tokio::task::spawn_local(drain_stderr(stderr, "stakeholder", debug));
+                        }
+                        tokio::task::spawn_local(async move {
+                            if let Err(e) = sh_io.await {
+                                eprintln!("[ratio] Stakeholder I/O error: {e}");
+                            }
+                        });
+                        if let Err(e) = sh_conn.handshake(&config.cwd).await {
+                            eprintln!("[ratio] Stakeholder '{}' handshake failed: {e}", sh_cfg.name);
+                            continue;
+                        }
+                        if let Some(ref ac) = sh_cfg.agent {
+                            if !ac.model.is_empty() {
+                                let _ = sh_conn.set_model(&ac.model).await;
+                            }
+                        }
+                        live_stakeholders.push(LiveStakeholder {
+                            index: i,
+                            name: sh_cfg.name.clone(),
+                            conn: sh_conn,
+                            proc: sh_proc,
+                        });
+                        stakeholder_event_rxs.push(sh_event_rx);
+                    }
+                    Err(e) => {
+                        eprintln!("[ratio] Failed to spawn stakeholder '{}': {e}", sh_cfg.name);
+                    }
+                }
+            }
+
             // Subscribe to raw ACP streams before moving connections
             // into the orchestrator (--debug mode).
             if debug {
@@ -453,6 +543,8 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                         &worker_conn,
                         &mut reviewer_proc,
                         &mut worker_proc,
+                        &mut live_stakeholders,
+                        stakeholder_event_rxs,
                         worker_event_rx,
                         reviewer_event_rx,
                         abort_rx,
@@ -480,6 +572,9 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                             "[ratio] cycle {} completed: {:?}",
                             record.cycle, record.verdict
                         );
+                    }
+                    OrchestratorEvent::StakeholderEvent(_idx, name, AgentEvent::TextChunk(text)) => {
+                        eprint!("[{name}] {text}");
                     }
                     OrchestratorEvent::Finished(phase) => {
                         eprintln!("[ratio] finished: {phase:?}");
