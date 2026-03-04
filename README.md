@@ -88,6 +88,20 @@ model = "anthropic/claude-sonnet-4-5"
 
 See [`examples/fullstack-stakeholders.toml`](examples/fullstack-stakeholders.toml) for a comprehensive example with three stakeholders (Security Auditor, UX Engineer, SRE).
 
+### Stall watchdog
+
+Agents can silently hang — typically when a subagent tool call (e.g., opencode's Task tool spawning a sub-agent) stalls or the subprocess crashes without closing its stdout. The stall watchdog monitors each agent's event stream and intervenes if no ACP events (text chunks, tool calls, thinking tokens) arrive within `stall_timeout_secs` (default: 120 seconds).
+
+When a stall is detected:
+
+1. The current turn is cancelled via ACP `session/cancel`
+2. A nudge prompt is sent: *"Continue where you left off. You appear to have stalled — keep working on the task."*
+3. The agent resumes with its conversation history intact (the cancel + re-prompt happens within the same session)
+4. If the agent stalls again after the nudge, the process repeats up to `max_nudges` times (default: 3)
+5. After exhausting all nudge attempts, the turn is treated as failed
+
+The watchdog is active for all agents (reviewer, worker, stakeholders). Set `stall_timeout_secs = 0` to disable it.
+
 ## Installation
 
 ### Prerequisites
@@ -192,6 +206,14 @@ max_review_cycles = 5            # Maximum review-revise cycles (default: 5)
 # domain expertise, and quality standards.
 # reviewer_system_prompt = "You are a senior Rust engineer..."
 # worker_system_prompt = "You are a precise, thorough coding agent..."
+
+# Stall watchdog: if an agent produces no ACP events for this many seconds,
+# cancel the turn and send a "continue" nudge. Default: 120 (2 minutes).
+# Set to 0 to disable.
+# stall_timeout_secs = 120
+
+# Maximum nudge attempts before treating the turn as failed. Default: 3.
+# max_nudges = 3
 
 # ── Enforced constraints ───────────────────────────────────────
 # Injected into prompts for both agents. The worker must follow them;

@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol as acp;
 use tokio::sync::mpsc;
@@ -150,6 +151,10 @@ pub struct OrchestratorClient {
     /// Accumulated full text from the agent's current turn.
     accumulated_text: RefCell<String>,
 
+    /// Timestamp of the last event received from the agent. Updated on every
+    /// `session_notification`. Used by the stall watchdog to detect silent hangs.
+    last_activity: RefCell<Instant>,
+
     /// Auto-approve permissions (when running in unattended mode).
     auto_approve: bool,
 }
@@ -167,6 +172,7 @@ impl OrchestratorClient {
         Self {
             event_tx,
             accumulated_text: RefCell::new(String::new()),
+            last_activity: RefCell::new(Instant::now()),
             auto_approve,
         }
     }
@@ -176,7 +182,19 @@ impl OrchestratorClient {
         self.accumulated_text.borrow_mut().split_off(0)
     }
 
+    /// Return the elapsed time since the last event was received.
+    pub fn elapsed_since_last_activity(&self) -> Duration {
+        self.last_activity.borrow().elapsed()
+    }
+
+    /// Reset the last-activity timestamp to now.
+    pub fn touch_activity(&self) {
+        *self.last_activity.borrow_mut() = Instant::now();
+    }
+
     fn emit(&self, event: AgentEvent) {
+        // Update activity timestamp on every event.
+        *self.last_activity.borrow_mut() = Instant::now();
         // Best-effort: if the receiver is gone we just drop the event.
         let _ = self.event_tx.send(event);
     }
@@ -597,6 +615,154 @@ impl WorkerConnection {
 
         let full_text = self.client.take_accumulated_text();
         Ok((stop, full_text))
+    }
+
+    /// Send a prompt with a stall watchdog.
+    ///
+    /// Behaves like [`prompt()`], but monitors the agent's event stream for
+    /// activity. If `stall_timeout` elapses with no events (no text chunks,
+    /// tool calls, thoughts, or any other session notification), the current
+    /// turn is cancelled and a nudge prompt ("Continue where you left off")
+    /// is sent to restart the agent.
+    ///
+    /// This handles the case where an agent silently hangs after spawning a
+    /// subagent tool call — the subprocess may have crashed or stalled, and
+    /// the ACP prompt future will never resolve without intervention.
+    ///
+    /// The `on_nudge` callback is called each time a nudge is sent, so the
+    /// caller can log it. Returns the combined accumulated text across all
+    /// nudge attempts.
+    pub async fn prompt_with_nudge(
+        &self,
+        text: &str,
+        stall_timeout: Duration,
+        max_nudges: usize,
+        mut on_nudge: impl FnMut(usize),
+    ) -> anyhow::Result<(StopReason, String)> {
+        use acp::Agent as _;
+
+        let session_id = self
+            .session_id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no active session — call handshake() first"))?
+            .clone();
+
+        // Clear leftover text and reset activity clock.
+        let _ = self.client.take_accumulated_text();
+        self.client.touch_activity();
+
+        let mut combined_text = String::new();
+        let mut nudge_count: usize = 0;
+        let mut current_prompt = text.to_string();
+
+        // Inner loop result: either the turn completed (with a stop reason)
+        // or we need to send a nudge.
+        enum TurnOutcome {
+            Completed(StopReason),
+            Nudge,
+        }
+
+        loop {
+            // Send the prompt (initial or nudge follow-up).
+            let prompt_fut = self.conn.prompt(acp::PromptRequest::new(
+                session_id.clone(),
+                vec![current_prompt.as_str().into()],
+            ));
+            tokio::pin!(prompt_fut);
+
+            let outcome: TurnOutcome = loop {
+                // Poll with a 5-second granularity: check activity timestamp,
+                // and if stall_timeout has elapsed, cancel + nudge.
+                let check_interval = Duration::from_secs(5);
+                tokio::select! {
+                    result = &mut prompt_fut => {
+                        let resp = result.map_err(|e| anyhow::anyhow!("ACP prompt failed: {e}"))?;
+                        let stop = match resp.stop_reason {
+                            acp::StopReason::EndTurn => StopReason::EndTurn,
+                            acp::StopReason::Cancelled => StopReason::Cancelled,
+                            other => StopReason::Other(format!("{other:?}")),
+                        };
+                        break TurnOutcome::Completed(stop);
+                    }
+                    () = tokio::time::sleep(check_interval) => {
+                        let elapsed = self.client.elapsed_since_last_activity();
+                        if elapsed >= stall_timeout {
+                            // Agent is stalled. Cancel and nudge.
+                            nudge_count += 1;
+
+                            if nudge_count > max_nudges {
+                                // Too many nudges — give up and return what we have.
+                                let partial = self.client.take_accumulated_text();
+                                combined_text.push_str(&partial);
+                                self.cancel().await.ok();
+                                return Ok((StopReason::Other("stall_timeout_exceeded".to_string()), combined_text));
+                            }
+
+                            on_nudge(nudge_count);
+
+                            // Cancel the current turn.
+                            self.cancel().await.ok();
+
+                            // Wait for the prompt future to resolve with Cancelled.
+                            // Give it a reasonable deadline — if it doesn't respond
+                            // to cancel within 30s, something is deeply broken.
+                            match tokio::time::timeout(Duration::from_secs(30), &mut prompt_fut).await {
+                                Ok(Ok(resp)) => {
+                                    let partial = self.client.take_accumulated_text();
+                                    combined_text.push_str(&partial);
+
+                                    match resp.stop_reason {
+                                        acp::StopReason::Cancelled => {
+                                            // Cancelled successfully — break to send nudge.
+                                            break TurnOutcome::Nudge;
+                                        }
+                                        acp::StopReason::EndTurn => {
+                                            // It actually finished just as we cancelled.
+                                            break TurnOutcome::Completed(StopReason::EndTurn);
+                                        }
+                                        other => {
+                                            break TurnOutcome::Completed(
+                                                StopReason::Other(format!("{other:?}")),
+                                            );
+                                        }
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    let partial = self.client.take_accumulated_text();
+                                    combined_text.push_str(&partial);
+                                    return Err(anyhow::anyhow!("ACP prompt failed after cancel: {e}"));
+                                }
+                                Err(_timeout) => {
+                                    // Cancel didn't cause the prompt to resolve.
+                                    // The subprocess may be truly dead.
+                                    let partial = self.client.take_accumulated_text();
+                                    combined_text.push_str(&partial);
+                                    return Ok((StopReason::Other("cancel_timeout".to_string()), combined_text));
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Collect accumulated text from this turn.
+            let turn_text = self.client.take_accumulated_text();
+            combined_text.push_str(&turn_text);
+
+            match outcome {
+                TurnOutcome::Completed(stop) => {
+                    return Ok((stop, combined_text));
+                }
+                TurnOutcome::Nudge => {
+                    // Send the nudge prompt and loop.
+                    self.client.touch_activity();
+                    current_prompt = "Continue where you left off. You appear to have stalled — \
+                        keep working on the task. Do not repeat completed work. \
+                        Pick up from where you stopped.".to_string();
+                    continue;
+                }
+            }
+        }
     }
 
     /// Send a cancel notification to abort the current turn.

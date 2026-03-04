@@ -55,6 +55,16 @@ max_review_cycles = 5
 # Custom system prompt for the worker agent.
 # worker_system_prompt = "You are a precise, thorough coding agent."
 
+# Seconds of inactivity before nudging a stalled agent.
+# If an agent produces no ACP events (text, tool calls, thinking) for this
+# long, the orchestrator cancels the current turn and sends "continue where
+# you left off" to restart it. This catches agents that silently hang after
+# a subagent tool call. Set to 0 to disable. Default: 120 (2 minutes).
+# stall_timeout_secs = 120
+
+# Maximum nudge attempts before treating the turn as failed. Default: 3.
+# max_nudges = 3
+
 # ── Enforced constraints ────────────────────────────────────
 # These are provided to BOTH agents: the worker must follow them,
 # and the reviewer verifies compliance.

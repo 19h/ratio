@@ -207,6 +207,23 @@ pub struct OrchestrationConfig {
 
     /// Custom system-level instructions prepended to the worker's prompts.
     pub worker_system_prompt: Option<String>,
+
+    /// Seconds of inactivity (no ACP events) before nudging a stalled agent.
+    ///
+    /// When an agent goes silent for this long (e.g. after a subagent tool call
+    /// that hangs), the orchestrator cancels the current turn and sends a
+    /// "continue where you left off" nudge to restart it.
+    ///
+    /// Set to 0 to disable the stall watchdog. Default: 120 (2 minutes).
+    pub stall_timeout_secs: u64,
+
+    /// Maximum number of nudge attempts before giving up on a stalled agent.
+    ///
+    /// After this many consecutive nudges without the agent completing its turn
+    /// normally, the orchestrator treats the turn as failed.
+    ///
+    /// Default: 3.
+    pub max_nudges: usize,
 }
 
 impl Default for OrchestrationConfig {
@@ -215,6 +232,8 @@ impl Default for OrchestrationConfig {
             max_review_cycles: 5,
             reviewer_system_prompt: None,
             worker_system_prompt: None,
+            stall_timeout_secs: 120,
+            max_nudges: 3,
         }
     }
 }

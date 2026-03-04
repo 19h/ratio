@@ -191,6 +191,39 @@ impl Orchestrator {
             .send(OrchestratorEvent::Log(level, msg.into()));
     }
 
+    /// Send a prompt to an agent with the stall watchdog enabled.
+    ///
+    /// If `stall_timeout_secs` is 0, falls through to a plain `prompt()`.
+    /// Otherwise uses `prompt_with_nudge()` which will cancel + re-prompt
+    /// if the agent goes silent for too long.
+    async fn prompt_agent(
+        &self,
+        conn: &WorkerConnection,
+        text: &str,
+        role: &str,
+    ) -> anyhow::Result<(StopReason, String)> {
+        let timeout_secs = self.config.orchestration.stall_timeout_secs;
+        if timeout_secs == 0 {
+            return conn.prompt(text).await;
+        }
+
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let max_nudges = self.config.orchestration.max_nudges;
+        let event_tx = self.event_tx.clone();
+        let role_owned = role.to_string();
+
+        conn.prompt_with_nudge(text, timeout, max_nudges, move |attempt| {
+            let _ = event_tx.send(OrchestratorEvent::Log(
+                LogLevel::Warn,
+                format!(
+                    "{role_owned} stalled ({timeout_secs}s no activity) — \
+                     sending nudge ({attempt}/{max_nudges})",
+                ),
+            ));
+        })
+        .await
+    }
+
     // -----------------------------------------------------------------------
     // Prompt construction
     // -----------------------------------------------------------------------
@@ -598,6 +631,21 @@ impl Orchestrator {
         mut reviewer_event_rx: mpsc::UnboundedReceiver<AgentEvent>,
         mut abort_rx: mpsc::UnboundedReceiver<()>,
     ) -> anyhow::Result<Phase> {
+        // Report stakeholder count to the UI.
+        if stakeholders.is_empty() {
+            self.log(LogLevel::Info, "No stakeholders configured.");
+        } else {
+            let names: Vec<&str> = stakeholders.iter().map(|s| s.name.as_str()).collect();
+            self.log(
+                LogLevel::Info,
+                format!(
+                    "{} stakeholder(s) active: {}",
+                    stakeholders.len(),
+                    names.join(", "),
+                ),
+            );
+        }
+
         // Ensure the shared research directory exists.
         let research_dir = self.config.cwd.join(".ratio").join("research");
         if let Err(e) = std::fs::create_dir_all(&research_dir) {
@@ -647,7 +695,7 @@ impl Orchestrator {
         let planning_prompt = self.build_planning_prompt();
 
         let plan_result = tokio::select! {
-            result = reviewer_conn.prompt(&planning_prompt) => result,
+            result = self.prompt_agent(reviewer_conn, &planning_prompt, "Reviewer") => result,
             _ = abort_rx.recv() => {
                 return self.abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc).await;
             }
@@ -708,7 +756,7 @@ impl Orchestrator {
             );
 
             let synth_result = tokio::select! {
-                result = reviewer_conn.prompt(&synthesis_prompt) => result,
+                result = self.prompt_agent(reviewer_conn, &synthesis_prompt, "Reviewer") => result,
                 _ = abort_rx.recv() => {
                     return self.abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc).await;
                 }
@@ -762,7 +810,7 @@ impl Orchestrator {
             self.save_session(reviewer_conn, worker_conn, "worker");
 
             let worker_result = tokio::select! {
-                result = worker_conn.prompt(&current_instruction) => result,
+                result = self.prompt_agent(worker_conn, &current_instruction, "Worker") => result,
                 _ = abort_rx.recv() => {
                     return self.abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc).await;
                 }
@@ -799,7 +847,7 @@ impl Orchestrator {
                 self.build_review_prompt(cycle, &current_instruction, &worker_output);
 
             let review_result = tokio::select! {
-                result = reviewer_conn.prompt(&review_prompt) => result,
+                result = self.prompt_agent(reviewer_conn, &review_prompt, "Reviewer") => result,
                 _ = abort_rx.recv() => {
                     return self.abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc).await;
                 }
@@ -865,7 +913,7 @@ impl Orchestrator {
                      their `.ratio/research/*.md` files where relevant>"
                 );
 
-                match reviewer_conn.prompt(&synth_prompt).await {
+                match self.prompt_agent(reviewer_conn, &synth_prompt, "Reviewer").await {
                     Ok((_, refined)) if !refined.trim().is_empty() => refined,
                     Ok(_) => {
                         self.log(LogLevel::Warn, "Reviewer review synthesis was empty, using original.");
@@ -1023,7 +1071,7 @@ impl Orchestrator {
                 format!("Stakeholder \"{name}\" is providing input..."),
             );
 
-            match stakeholder.conn.prompt(&prompt).await {
+            match self.prompt_agent(&stakeholder.conn, &prompt, name).await {
                 Ok((_, response)) => {
                     if !response.trim().is_empty() {
                         all_input.push_str(&format!(
