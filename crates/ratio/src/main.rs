@@ -8,23 +8,26 @@ use std::io;
 use std::path::PathBuf;
 
 use clap::Parser;
+use crossterm::ExecutableCommand;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 use agent_client_protocol as acp;
 use ratio::config::{CliOverrides, Config};
-use ratio::orchestrator::{LiveStakeholder, Orchestrator, OrchestratorEvent};
+use ratio::orchestrator::{
+    LiveStakeholder, Orchestrator, OrchestratorEvent, UserMessage, UserMessageTarget,
+};
 use ratio::protocol::AgentEvent;
 use ratio::session::SessionState;
 use ratio::subprocess::{AgentRole, spawn_agent};
-use ratio::ui::{App, EventLoop};
+use ratio::ui::app::AgentSource;
 use ratio::ui::events::Action;
 use ratio::ui::render;
+use ratio::ui::{App, EventLoop};
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -161,12 +164,10 @@ async fn run_tui_inner(
     local_set
         .run_until(async move {
             // ── Channels ────────────────────────────────────────
-            let (orch_event_tx, orch_event_rx) =
-                mpsc::unbounded_channel::<OrchestratorEvent>();
-            let (worker_event_tx, worker_event_rx) =
-                mpsc::unbounded_channel::<AgentEvent>();
-            let (reviewer_event_tx, reviewer_event_rx) =
-                mpsc::unbounded_channel::<AgentEvent>();
+            let (orch_event_tx, orch_event_rx) = mpsc::unbounded_channel::<OrchestratorEvent>();
+            let (worker_event_tx, worker_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+            let (reviewer_event_tx, reviewer_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+            let (user_msg_tx, user_msg_rx) = mpsc::unbounded_channel::<UserMessage>();
             let (abort_tx, abort_rx) = mpsc::unbounded_channel::<()>();
 
             // ── App state ───────────────────────────────────────
@@ -192,8 +193,12 @@ async fn run_tui_inner(
             };
 
             // ── Spawn reviewer agent ────────────────────────────
-            let (mut reviewer_conn, mut reviewer_proc, reviewer_io) =
-                spawn_agent(AgentRole::Reviewer, &config.reviewer, &config.cwd, reviewer_event_tx)?;
+            let (mut reviewer_conn, mut reviewer_proc, reviewer_io) = spawn_agent(
+                AgentRole::Reviewer,
+                &config.reviewer,
+                &config.cwd,
+                reviewer_event_tx,
+            )?;
 
             // Drain reviewer stderr to tracing (prevents pipe buffer deadlock).
             if let Some(stderr) = reviewer_proc.stderr.take() {
@@ -220,8 +225,12 @@ async fn run_tui_inner(
             }
 
             // ── Spawn worker agent ──────────────────────────────
-            let (mut worker_conn, mut worker_proc, worker_io) =
-                spawn_agent(AgentRole::Worker, &config.worker, &config.cwd, worker_event_tx)?;
+            let (mut worker_conn, mut worker_proc, worker_io) = spawn_agent(
+                AgentRole::Worker,
+                &config.worker,
+                &config.cwd,
+                worker_event_tx,
+            )?;
 
             // Drain worker stderr to tracing (prevents pipe buffer deadlock).
             if let Some(stderr) = worker_proc.stderr.take() {
@@ -328,6 +337,7 @@ async fn run_tui_inner(
                         stakeholder_event_rxs,
                         worker_event_rx,
                         reviewer_event_rx,
+                        user_msg_rx,
                         abort_rx,
                     )
                     .await;
@@ -341,17 +351,21 @@ async fn run_tui_inner(
                     render::render(frame, &mut app);
                 })?;
 
-                // Drain any queued user messages.
-                // NOTE: In this architecture the orchestrator owns the connections,
-                // so user messages are logged but not yet sent to the agent.
-                // A future iteration will add a channel from the TUI to the
-                // orchestrator for injecting user messages.
+                // Drain queued user messages and forward to orchestrator.
                 while let Some(msg) = app.message_queue.pop_front() {
-                    tracing::info!(
-                        "User message queued for {:?}: {}",
-                        msg.target,
-                        msg.text
-                    );
+                    let target = match msg.target {
+                        AgentSource::Worker => UserMessageTarget::Worker,
+                        AgentSource::Reviewer => UserMessageTarget::Reviewer,
+                        AgentSource::Stakeholder(idx, _) => UserMessageTarget::Stakeholder(idx),
+                    };
+
+                    if let Err(e) = user_msg_tx.send(UserMessage {
+                        target,
+                        text: msg.text,
+                        immediate: msg.immediate,
+                    }) {
+                        tracing::warn!("Failed to forward user message to orchestrator: {e}");
+                    }
                 }
 
                 match event_loop.tick(&mut app).await {
@@ -378,12 +392,10 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
 
     local_set
         .run_until(async move {
-            let (orch_event_tx, mut orch_event_rx) =
-                mpsc::unbounded_channel::<OrchestratorEvent>();
-            let (worker_event_tx, worker_event_rx) =
-                mpsc::unbounded_channel::<AgentEvent>();
-            let (reviewer_event_tx, reviewer_event_rx) =
-                mpsc::unbounded_channel::<AgentEvent>();
+            let (orch_event_tx, mut orch_event_rx) = mpsc::unbounded_channel::<OrchestratorEvent>();
+            let (worker_event_tx, worker_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+            let (reviewer_event_tx, reviewer_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+            let (_user_msg_tx, user_msg_rx) = mpsc::unbounded_channel::<UserMessage>();
             let (_abort_tx, abort_rx) = mpsc::unbounded_channel::<()>();
 
             let saved_session = if resume {
@@ -401,8 +413,12 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
             };
 
             // Spawn reviewer.
-            let (mut reviewer_conn, mut reviewer_proc, reviewer_io) =
-                spawn_agent(AgentRole::Reviewer, &config.reviewer, &config.cwd, reviewer_event_tx)?;
+            let (mut reviewer_conn, mut reviewer_proc, reviewer_io) = spawn_agent(
+                AgentRole::Reviewer,
+                &config.reviewer,
+                &config.cwd,
+                reviewer_event_tx,
+            )?;
 
             // Drain reviewer stderr (to terminal in --debug, otherwise silently).
             if let Some(stderr) = reviewer_proc.stderr.take() {
@@ -429,8 +445,12 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
             }
 
             // Spawn worker.
-            let (mut worker_conn, mut worker_proc, worker_io) =
-                spawn_agent(AgentRole::Worker, &config.worker, &config.cwd, worker_event_tx)?;
+            let (mut worker_conn, mut worker_proc, worker_io) = spawn_agent(
+                AgentRole::Worker,
+                &config.worker,
+                &config.cwd,
+                worker_event_tx,
+            )?;
 
             // Drain worker stderr (to terminal in --debug, otherwise silently).
             if let Some(stderr) = worker_proc.stderr.take() {
@@ -478,7 +498,10 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                             }
                         });
                         if let Err(e) = sh_conn.handshake(&config.cwd).await {
-                            eprintln!("[ratio] Stakeholder '{}' handshake failed: {e}", sh_cfg.name);
+                            eprintln!(
+                                "[ratio] Stakeholder '{}' handshake failed: {e}",
+                                sh_cfg.name
+                            );
                             continue;
                         }
                         if let Some(ref ac) = sh_cfg.agent {
@@ -553,6 +576,7 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                         stakeholder_event_rxs,
                         worker_event_rx,
                         reviewer_event_rx,
+                        user_msg_rx,
                         abort_rx,
                     )
                     .await;
@@ -579,7 +603,11 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                             record.cycle, record.verdict
                         );
                     }
-                    OrchestratorEvent::StakeholderEvent(_idx, name, AgentEvent::TextChunk(text)) => {
+                    OrchestratorEvent::StakeholderEvent(
+                        _idx,
+                        name,
+                        AgentEvent::TextChunk(text),
+                    ) => {
                         eprint!("[{name}] {text}");
                     }
                     OrchestratorEvent::Finished(phase) => {

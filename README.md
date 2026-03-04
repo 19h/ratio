@@ -345,6 +345,7 @@ The Agent pane is first-class for all agents. Stakeholders are not collapsed int
 | `i` or `:` | Enter message input mode |
 | `Esc` | Exit input mode |
 | `Enter` | Queue message to current agent (input mode) |
+| `Alt+Enter` or `Ctrl+Enter` | Queue message and interrupt current Reviewer/Worker turn |
 | `r` / `R` | Cycle next / previous agent stream (Agent pane focused) |
 | `Tab` | Focus next pane |
 | `Shift+Tab` | Focus previous pane |
@@ -378,7 +379,12 @@ Tool call updates are applied in-place by `tool_call_id`, so entries don't dupli
 
 ### Input mode note
 
-User-entered messages are currently queued and logged in the TUI but not injected into running agent turns yet. Wiring TUI input into orchestrator prompts is planned.
+User-entered messages are forwarded to the orchestrator and routed per target agent.
+
+- `Enter`: queue guidance for the next turn of the selected agent.
+- `Alt+Enter`/`Ctrl+Enter`: request immediate interruption (cancel + restart) of the current Reviewer/Worker turn, with your message appended.
+
+If the target agent is currently idle, the message is applied on its next turn.
 
 ### Session persistence
 

@@ -153,22 +153,20 @@ impl EventLoop {
             KeyCode::Down | KeyCode::Char('j') => app.scroll_down(1),
             KeyCode::PageUp => app.scroll_up(20),
             KeyCode::PageDown => app.scroll_down(20),
-            KeyCode::Home => {
-                match app.focused {
-                    FocusedPane::Agent => {
-                        app.agent_scroll = 0;
-                        app.auto_scroll_agent = false;
-                    }
-                    FocusedPane::Todo => {
-                        app.todo_scroll = 0;
-                        app.auto_scroll_todo = false;
-                    }
-                    FocusedPane::Log => {
-                        app.log_scroll = 0;
-                        app.auto_scroll_log = false;
-                    }
+            KeyCode::Home => match app.focused {
+                FocusedPane::Agent => {
+                    app.agent_scroll = 0;
+                    app.auto_scroll_agent = false;
                 }
-            }
+                FocusedPane::Todo => {
+                    app.todo_scroll = 0;
+                    app.auto_scroll_todo = false;
+                }
+                FocusedPane::Log => {
+                    app.log_scroll = 0;
+                    app.auto_scroll_log = false;
+                }
+            },
             KeyCode::End => app.scroll_to_bottom(),
             _ => {}
         }
@@ -184,7 +182,13 @@ impl EventLoop {
                 app.input_cursor = 0;
             }
             KeyCode::Enter => {
-                app.submit_input();
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    app.submit_input_immediate();
+                } else {
+                    app.submit_input();
+                }
             }
             KeyCode::Backspace => {
                 if app.input_cursor > 0 {

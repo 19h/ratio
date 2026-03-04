@@ -10,6 +10,8 @@
 //! There is **no cycle limit** — the loop runs until the reviewer approves,
 //! explicitly rejects, or the user aborts.
 
+use std::collections::BTreeMap;
+
 use tokio::sync::mpsc;
 
 use crate::config::{Config, StakeholderPhase};
@@ -113,6 +115,28 @@ pub enum OrchestratorEvent {
     Finished(Phase),
 }
 
+/// Target agent for a user message injected from the TUI.
+#[derive(Debug, Clone)]
+pub enum UserMessageTarget {
+    Worker,
+    Reviewer,
+    Stakeholder(usize),
+}
+
+/// A user-authored message queued in the TUI and forwarded to orchestrator.
+#[derive(Debug, Clone)]
+pub struct UserMessage {
+    pub target: UserMessageTarget,
+    pub text: String,
+    /// If true, request interruption of the target agent's current turn.
+    pub immediate: bool,
+}
+
+enum PromptRunOutcome {
+    Completed((StopReason, String)),
+    Aborted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogLevel {
     Info,
@@ -189,6 +213,243 @@ impl Orchestrator {
         let _ = self
             .event_tx
             .send(OrchestratorEvent::Log(level, msg.into()));
+    }
+
+    fn user_target_matches(a: &UserMessageTarget, b: &UserMessageTarget) -> bool {
+        match (a, b) {
+            (UserMessageTarget::Worker, UserMessageTarget::Worker) => true,
+            (UserMessageTarget::Reviewer, UserMessageTarget::Reviewer) => true,
+            (UserMessageTarget::Stakeholder(x), UserMessageTarget::Stakeholder(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    /// Queue a single user message into the per-agent pending buffers.
+    fn queue_user_message(
+        &self,
+        msg: UserMessage,
+        stakeholders: &[LiveStakeholder],
+        pending_worker: &mut Vec<String>,
+        pending_reviewer: &mut Vec<String>,
+        pending_stakeholders: &mut BTreeMap<usize, Vec<String>>,
+    ) {
+        let text = msg.text.trim();
+        if text.is_empty() {
+            return;
+        }
+
+        let when = if msg.immediate {
+            "interrupt requested"
+        } else {
+            "next turn"
+        };
+
+        match msg.target {
+            UserMessageTarget::Worker => {
+                pending_worker.push(text.to_string());
+                self.log(
+                    LogLevel::Info,
+                    format!("Queued user message for Worker ({when})."),
+                );
+            }
+            UserMessageTarget::Reviewer => {
+                pending_reviewer.push(text.to_string());
+                self.log(
+                    LogLevel::Info,
+                    format!("Queued user message for Reviewer ({when})."),
+                );
+            }
+            UserMessageTarget::Stakeholder(idx) => {
+                pending_stakeholders
+                    .entry(idx)
+                    .or_default()
+                    .push(text.to_string());
+
+                let name = stakeholders
+                    .iter()
+                    .find(|s| s.index == idx)
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("Stakeholder");
+
+                self.log(
+                    LogLevel::Info,
+                    format!("Queued user message for {name} ({when})."),
+                );
+            }
+        }
+    }
+
+    /// Drain queued user messages from the TUI into per-agent pending buffers.
+    fn absorb_user_messages(
+        &self,
+        user_msg_rx: &mut mpsc::UnboundedReceiver<UserMessage>,
+        stakeholders: &[LiveStakeholder],
+        pending_worker: &mut Vec<String>,
+        pending_reviewer: &mut Vec<String>,
+        pending_stakeholders: &mut BTreeMap<usize, Vec<String>>,
+    ) {
+        while let Ok(msg) = user_msg_rx.try_recv() {
+            self.queue_user_message(
+                msg,
+                stakeholders,
+                pending_worker,
+                pending_reviewer,
+                pending_stakeholders,
+            );
+        }
+    }
+
+    /// Append pending user messages to a prompt and clear the buffer.
+    fn apply_pending_user_messages(
+        base_prompt: &str,
+        pending_messages: &mut Vec<String>,
+        role_label: &str,
+    ) -> String {
+        if pending_messages.is_empty() {
+            return base_prompt.to_string();
+        }
+
+        let rendered = pending_messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| format!("{}. {}", i + 1, m))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        pending_messages.clear();
+
+        format!(
+            "{base_prompt}\n\n\
+             ═══ USER MESSAGE(S) FOR {role_label} ═══\n\
+             The user added the following guidance. You MUST account for it in your response:\n\
+             {rendered}\n\
+             ═══ END USER MESSAGE(S) ═══"
+        )
+    }
+
+    fn apply_pending_for_target(
+        base_prompt: &str,
+        target: &UserMessageTarget,
+        pending_worker: &mut Vec<String>,
+        pending_reviewer: &mut Vec<String>,
+        pending_stakeholders: &mut BTreeMap<usize, Vec<String>>,
+        role_label: &str,
+    ) -> String {
+        match target {
+            UserMessageTarget::Worker => {
+                Self::apply_pending_user_messages(base_prompt, pending_worker, role_label)
+            }
+            UserMessageTarget::Reviewer => {
+                Self::apply_pending_user_messages(base_prompt, pending_reviewer, role_label)
+            }
+            UserMessageTarget::Stakeholder(idx) => {
+                let pending = pending_stakeholders.entry(*idx).or_default();
+                Self::apply_pending_user_messages(base_prompt, pending, role_label)
+            }
+        }
+    }
+
+    /// Prompt an agent while handling aborts and immediate user-message interrupts.
+    async fn prompt_agent_with_user_controls(
+        &self,
+        conn: &WorkerConnection,
+        base_prompt: &str,
+        role_label: &str,
+        active_target: UserMessageTarget,
+        stakeholders: &[LiveStakeholder],
+        user_msg_rx: &mut mpsc::UnboundedReceiver<UserMessage>,
+        abort_rx: &mut mpsc::UnboundedReceiver<()>,
+        pending_worker: &mut Vec<String>,
+        pending_reviewer: &mut Vec<String>,
+        pending_stakeholders: &mut BTreeMap<usize, Vec<String>>,
+    ) -> anyhow::Result<PromptRunOutcome> {
+        let mut prompt_text = Self::apply_pending_for_target(
+            base_prompt,
+            &active_target,
+            pending_worker,
+            pending_reviewer,
+            pending_stakeholders,
+            role_label,
+        );
+
+        loop {
+            let current_prompt = prompt_text.clone();
+            let prompt_fut = self.prompt_agent(conn, &current_prompt, role_label);
+            tokio::pin!(prompt_fut);
+
+            loop {
+                tokio::select! {
+                    result = &mut prompt_fut => {
+                        return Ok(PromptRunOutcome::Completed(result?));
+                    }
+                    _ = abort_rx.recv() => {
+                        return Ok(PromptRunOutcome::Aborted);
+                    }
+                    maybe_msg = user_msg_rx.recv() => {
+                        let Some(msg) = maybe_msg else {
+                            continue;
+                        };
+
+                        let msg_target = msg.target.clone();
+                        let immediate = msg.immediate;
+
+                        self.queue_user_message(
+                            msg,
+                            stakeholders,
+                            pending_worker,
+                            pending_reviewer,
+                            pending_stakeholders,
+                        );
+
+                        if immediate && Self::user_target_matches(&msg_target, &active_target) {
+                            self.log(
+                                LogLevel::Warn,
+                                format!(
+                                    "Immediate user message for {role_label} — cancelling and restarting current turn."
+                                ),
+                            );
+
+                            conn.cancel().await.ok();
+
+                            match tokio::time::timeout(std::time::Duration::from_secs(30), &mut prompt_fut).await {
+                                Ok(Ok((_stop, _partial))) => {}
+                                Ok(Err(e)) => {
+                                    self.log(
+                                        LogLevel::Warn,
+                                        format!(
+                                            "{role_label} prompt returned error after interrupt cancel: {e}"
+                                        ),
+                                    );
+                                }
+                                Err(_) => {
+                                    self.log(
+                                        LogLevel::Warn,
+                                        format!(
+                                            "{role_label} did not acknowledge interrupt cancel within 30s; restarting anyway."
+                                        ),
+                                    );
+                                }
+                            }
+
+                            // Preserve any previously appended guidance and add
+                            // newly queued user messages on top.
+                            prompt_text = Self::apply_pending_for_target(
+                                &prompt_text,
+                                &active_target,
+                                pending_worker,
+                                pending_reviewer,
+                                pending_stakeholders,
+                                role_label,
+                            );
+
+                            break;
+                        }
+                    }
+                }
+            }
+
+            continue;
+        }
     }
 
     /// Send a prompt to an agent with the stall watchdog enabled.
@@ -511,15 +772,26 @@ impl Orchestrator {
     /// approval when the reviewer mentions "APPROVED" in passing, echoes the
     /// format instructions, or produces ambiguous output.
     fn parse_reviewer_response(&self, response: &str) -> ReviewVerdict {
-        // Strategy: find lines that look like "VERDICT: <word>" and extract
-        // the LAST such line (if the reviewer echoed the format instructions
-        // first and then wrote their actual verdict, we want the final one).
+        // Strategy: collect all explicit lines that look like
+        // "VERDICT: <word>" and resolve them conservatively.
+        //
+        // - If no explicit verdict lines exist, use fallback heuristics.
+        // - If explicit verdict lines conflict (e.g. both NEEDS_REVISION and
+        //   REJECTED appear), default to NEEDS_REVISION.
+        // - If all explicit verdict lines agree, use that verdict.
         //
         // We skip lines that contain the format template
         // "APPROVED|NEEDS_REVISION|REJECTED" since those are the reviewer
         // echoing the instructions, not stating a verdict.
 
-        let mut found_verdict: Option<&str> = None;
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ParsedVerdict {
+            Approved,
+            NeedsRevision,
+            Rejected,
+        }
+
+        let mut explicit_verdicts: Vec<ParsedVerdict> = Vec::new();
 
         for line in response.lines() {
             let trimmed = line.trim();
@@ -530,38 +802,52 @@ impl Orchestrator {
                 continue;
             }
 
-            // Match lines that start with "VERDICT:" (possibly with markdown bold/etc.)
-            // Strip common markdown decorations: **, ##, >, etc.
-            let stripped = upper
-                .trim_start_matches(['*', '#', '>', ' ']);
+            // Match lines that start with "VERDICT:" (possibly with markdown/bullets).
+            // Strip common decorations: **, ##, >, -, backticks, etc.
+            let stripped = upper.trim_start_matches(['*', '#', '>', '-', '`', ' ']);
 
             if let Some(after) = stripped.strip_prefix("VERDICT:") {
                 let after = after.trim();
                 if after.starts_with("APPROVED") {
-                    found_verdict = Some("APPROVED");
-                } else if after.starts_with("NEEDS_REVISION")
-                    || after.starts_with("NEEDS REVISION")
+                    explicit_verdicts.push(ParsedVerdict::Approved);
+                } else if after.starts_with("NEEDS_REVISION") || after.starts_with("NEEDS REVISION")
                 {
-                    found_verdict = Some("NEEDS_REVISION");
+                    explicit_verdicts.push(ParsedVerdict::NeedsRevision);
                 } else if after.starts_with("REJECTED") {
-                    found_verdict = Some("REJECTED");
+                    explicit_verdicts.push(ParsedVerdict::Rejected);
                 }
             }
         }
 
-        // If no structured VERDICT line was found, use a conservative fallback.
-        // CRITICAL: The fallback NEVER produces APPROVED. If the reviewer
-        // didn't write a clear "VERDICT: APPROVED" line, they haven't approved.
-        let verdict_str = found_verdict.unwrap_or_else(|| {
+        // Resolve explicit verdict lines (if any).
+        let verdict_str = if explicit_verdicts.is_empty() {
+            // No structured VERDICT line found: conservative fallback.
+            // CRITICAL: The fallback NEVER produces APPROVED.
             let upper = response.to_uppercase();
             if upper.contains("REJECT") {
                 "REJECTED"
             } else {
                 // Default: if we can't tell, assume revision is needed.
-                // The reviewer must explicitly and unambiguously approve.
                 "NEEDS_REVISION"
             }
-        });
+        } else {
+            let first = explicit_verdicts[0];
+            let conflicting = explicit_verdicts.iter().any(|v| *v != first);
+
+            if conflicting {
+                self.log(
+                    LogLevel::Warn,
+                    "Reviewer produced conflicting VERDICT lines; defaulting to NEEDS_REVISION.",
+                );
+                "NEEDS_REVISION"
+            } else {
+                match first {
+                    ParsedVerdict::Approved => "APPROVED",
+                    ParsedVerdict::NeedsRevision => "NEEDS_REVISION",
+                    ParsedVerdict::Rejected => "REJECTED",
+                }
+            }
+        };
 
         match verdict_str {
             "APPROVED" => {
@@ -629,6 +915,7 @@ impl Orchestrator {
         stakeholder_event_rxs: Vec<mpsc::UnboundedReceiver<AgentEvent>>,
         mut worker_event_rx: mpsc::UnboundedReceiver<AgentEvent>,
         mut reviewer_event_rx: mpsc::UnboundedReceiver<AgentEvent>,
+        mut user_msg_rx: mpsc::UnboundedReceiver<UserMessage>,
         mut abort_rx: mpsc::UnboundedReceiver<()>,
     ) -> anyhow::Result<Phase> {
         // Report stakeholder count to the UI.
@@ -651,7 +938,10 @@ impl Orchestrator {
         if let Err(e) = std::fs::create_dir_all(&research_dir) {
             self.log(
                 LogLevel::Warn,
-                format!("Failed to create research dir {}: {e}", research_dir.display()),
+                format!(
+                    "Failed to create research dir {}: {e}",
+                    research_dir.display()
+                ),
             );
         }
 
@@ -672,13 +962,21 @@ impl Orchestrator {
         // Forward stakeholder events.
         for (i, mut rx) in stakeholder_event_rxs.into_iter().enumerate() {
             let tx = self.event_tx.clone();
-            let name = stakeholders.get(i).map(|s| s.name.clone()).unwrap_or_default();
+            let name = stakeholders
+                .get(i)
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
             tokio::task::spawn_local(async move {
                 while let Some(evt) = rx.recv().await {
                     let _ = tx.send(OrchestratorEvent::StakeholderEvent(i, name.clone(), evt));
                 }
             });
         }
+
+        // Pending user messages (queued in the TUI) by target agent.
+        let mut pending_worker_msgs: Vec<String> = Vec::new();
+        let mut pending_reviewer_msgs: Vec<String> = Vec::new();
+        let mut pending_stakeholder_msgs: BTreeMap<usize, Vec<String>> = BTreeMap::new();
 
         // ── Phase 1: Planning ────────────────────────────────────────────
         // Reviewer deeply investigates the codebase and formulates the work
@@ -692,13 +990,38 @@ impl Orchestrator {
             "Reviewer is analyzing the codebase and formulating work instruction...",
         );
 
+        self.absorb_user_messages(
+            &mut user_msg_rx,
+            stakeholders,
+            &mut pending_worker_msgs,
+            &mut pending_reviewer_msgs,
+            &mut pending_stakeholder_msgs,
+        );
+
         let planning_prompt = self.build_planning_prompt();
 
-        let plan_result = tokio::select! {
-            result = self.prompt_agent(reviewer_conn, &planning_prompt, "Reviewer") => result,
-            _ = abort_rx.recv() => {
-                return self.abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc).await;
+        let plan_result = match self
+            .prompt_agent_with_user_controls(
+                reviewer_conn,
+                &planning_prompt,
+                "Reviewer",
+                UserMessageTarget::Reviewer,
+                stakeholders,
+                &mut user_msg_rx,
+                &mut abort_rx,
+                &mut pending_worker_msgs,
+                &mut pending_reviewer_msgs,
+                &mut pending_stakeholder_msgs,
+            )
+            .await
+        {
+            Ok(PromptRunOutcome::Completed(r)) => Ok(r),
+            Ok(PromptRunOutcome::Aborted) => {
+                return self
+                    .abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc)
+                    .await;
             }
+            Err(e) => Err(e),
         };
 
         let (_, work_instruction) = match plan_result {
@@ -707,7 +1030,9 @@ impl Orchestrator {
                 let msg = format!("Reviewer failed to produce work instruction: {e}");
                 self.log(LogLevel::Error, &msg);
                 self.set_phase(Phase::Failed(msg.clone()));
-                let _ = self.event_tx.send(OrchestratorEvent::Finished(Phase::Failed(msg)));
+                let _ = self
+                    .event_tx
+                    .send(OrchestratorEvent::Finished(Phase::Failed(msg)));
                 return Ok(self.phase.clone());
             }
         };
@@ -716,11 +1041,21 @@ impl Orchestrator {
             let msg = "Reviewer produced an empty work instruction.".to_string();
             self.log(LogLevel::Error, &msg);
             self.set_phase(Phase::Failed(msg.clone()));
-            let _ = self.event_tx.send(OrchestratorEvent::Finished(Phase::Failed(msg)));
+            let _ = self
+                .event_tx
+                .send(OrchestratorEvent::Finished(Phase::Failed(msg)));
             return Ok(self.phase.clone());
         }
 
         // ── Stakeholder consultation (planning) ─────────────────────────
+        self.absorb_user_messages(
+            &mut user_msg_rx,
+            stakeholders,
+            &mut pending_worker_msgs,
+            &mut pending_reviewer_msgs,
+            &mut pending_stakeholder_msgs,
+        );
+
         let stakeholder_input = self
             .consult_stakeholders(
                 stakeholders,
@@ -729,6 +1064,7 @@ impl Orchestrator {
                     "GOAL: {}\n\nDRAFT WORK INSTRUCTION:\n{}",
                     self.config.goal, work_instruction
                 ),
+                &mut pending_stakeholder_msgs,
             )
             .await;
 
@@ -742,7 +1078,15 @@ impl Orchestrator {
                 "Stakeholders provided input — reviewer is synthesizing final plan...",
             );
 
-            let synthesis_prompt = format!(
+            self.absorb_user_messages(
+                &mut user_msg_rx,
+                stakeholders,
+                &mut pending_worker_msgs,
+                &mut pending_reviewer_msgs,
+                &mut pending_stakeholder_msgs,
+            );
+
+            let synthesis_prompt_base = format!(
                 "The following stakeholders have reviewed your draft work instruction \
                  and provided input from their perspectives. You must now produce the \
                  FINAL work instruction that incorporates their feedback where \
@@ -755,21 +1099,44 @@ impl Orchestrator {
                  `.ratio/research/*.md` files the stakeholders created."
             );
 
-            let synth_result = tokio::select! {
-                result = self.prompt_agent(reviewer_conn, &synthesis_prompt, "Reviewer") => result,
-                _ = abort_rx.recv() => {
-                    return self.abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc).await;
+            let synth_result = match self
+                .prompt_agent_with_user_controls(
+                    reviewer_conn,
+                    &synthesis_prompt_base,
+                    "Reviewer",
+                    UserMessageTarget::Reviewer,
+                    stakeholders,
+                    &mut user_msg_rx,
+                    &mut abort_rx,
+                    &mut pending_worker_msgs,
+                    &mut pending_reviewer_msgs,
+                    &mut pending_stakeholder_msgs,
+                )
+                .await
+            {
+                Ok(PromptRunOutcome::Completed(r)) => Ok(r),
+                Ok(PromptRunOutcome::Aborted) => {
+                    return self
+                        .abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc)
+                        .await;
                 }
+                Err(e) => Err(e),
             };
 
             match synth_result {
                 Ok((_, refined)) if !refined.trim().is_empty() => refined,
                 Ok(_) => {
-                    self.log(LogLevel::Warn, "Reviewer synthesis was empty, using original plan.");
+                    self.log(
+                        LogLevel::Warn,
+                        "Reviewer synthesis was empty, using original plan.",
+                    );
                     work_instruction
                 }
                 Err(e) => {
-                    self.log(LogLevel::Warn, format!("Reviewer synthesis failed ({e}), using original plan."));
+                    self.log(
+                        LogLevel::Warn,
+                        format!("Reviewer synthesis failed ({e}), using original plan."),
+                    );
                     work_instruction
                 }
             }
@@ -793,7 +1160,9 @@ impl Orchestrator {
 
             // Check for abort.
             if abort_rx.try_recv().is_ok() {
-                return self.abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc).await;
+                return self
+                    .abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc)
+                    .await;
             }
 
             // ── Send instruction to worker ───────────────────────────────
@@ -809,11 +1178,38 @@ impl Orchestrator {
             });
             self.save_session(reviewer_conn, worker_conn, "worker");
 
-            let worker_result = tokio::select! {
-                result = self.prompt_agent(worker_conn, &current_instruction, "Worker") => result,
-                _ = abort_rx.recv() => {
-                    return self.abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc).await;
+            self.absorb_user_messages(
+                &mut user_msg_rx,
+                stakeholders,
+                &mut pending_worker_msgs,
+                &mut pending_reviewer_msgs,
+                &mut pending_stakeholder_msgs,
+            );
+
+            let worker_prompt_base = current_instruction.clone();
+
+            let worker_result = match self
+                .prompt_agent_with_user_controls(
+                    worker_conn,
+                    &worker_prompt_base,
+                    "Worker",
+                    UserMessageTarget::Worker,
+                    stakeholders,
+                    &mut user_msg_rx,
+                    &mut abort_rx,
+                    &mut pending_worker_msgs,
+                    &mut pending_reviewer_msgs,
+                    &mut pending_stakeholder_msgs,
+                )
+                .await
+            {
+                Ok(PromptRunOutcome::Completed(r)) => Ok(r),
+                Ok(PromptRunOutcome::Aborted) => {
+                    return self
+                        .abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc)
+                        .await;
                 }
+                Err(e) => Err(e),
             };
 
             let (worker_stop, worker_output) = match worker_result {
@@ -843,14 +1239,39 @@ impl Orchestrator {
             self.set_phase(Phase::Reviewing);
             self.save_session(reviewer_conn, worker_conn, "reviewer");
 
+            self.absorb_user_messages(
+                &mut user_msg_rx,
+                stakeholders,
+                &mut pending_worker_msgs,
+                &mut pending_reviewer_msgs,
+                &mut pending_stakeholder_msgs,
+            );
+
             let review_prompt =
                 self.build_review_prompt(cycle, &current_instruction, &worker_output);
 
-            let review_result = tokio::select! {
-                result = self.prompt_agent(reviewer_conn, &review_prompt, "Reviewer") => result,
-                _ = abort_rx.recv() => {
-                    return self.abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc).await;
+            let review_result = match self
+                .prompt_agent_with_user_controls(
+                    reviewer_conn,
+                    &review_prompt,
+                    "Reviewer",
+                    UserMessageTarget::Reviewer,
+                    stakeholders,
+                    &mut user_msg_rx,
+                    &mut abort_rx,
+                    &mut pending_worker_msgs,
+                    &mut pending_reviewer_msgs,
+                    &mut pending_stakeholder_msgs,
+                )
+                .await
+            {
+                Ok(PromptRunOutcome::Completed(r)) => Ok(r),
+                Ok(PromptRunOutcome::Aborted) => {
+                    return self
+                        .abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc)
+                        .await;
                 }
+                Err(e) => Err(e),
             };
 
             let (_, reviewer_response) = match review_result {
@@ -875,6 +1296,14 @@ impl Orchestrator {
             );
 
             // ── Stakeholder consultation (review) ────────────────────────
+            self.absorb_user_messages(
+                &mut user_msg_rx,
+                stakeholders,
+                &mut pending_worker_msgs,
+                &mut pending_reviewer_msgs,
+                &mut pending_stakeholder_msgs,
+            );
+
             let stakeholder_review_input = self
                 .consult_stakeholders(
                     stakeholders,
@@ -885,6 +1314,7 @@ impl Orchestrator {
                          REVIEWER'S DRAFT ASSESSMENT:\n{reviewer_response}",
                         goal = self.config.goal,
                     ),
+                    &mut pending_stakeholder_msgs,
                 )
                 .await;
 
@@ -897,7 +1327,15 @@ impl Orchestrator {
                     "Stakeholders provided review input — reviewer is synthesizing final verdict...",
                 );
 
-                let synth_prompt = format!(
+                self.absorb_user_messages(
+                    &mut user_msg_rx,
+                    stakeholders,
+                    &mut pending_worker_msgs,
+                    &mut pending_reviewer_msgs,
+                    &mut pending_stakeholder_msgs,
+                );
+
+                let synth_prompt_base = format!(
                     "Stakeholders have reviewed the worker's output and your draft \
                      assessment. Consider their input and produce your FINAL verdict.\n\n\
                      Your draft assessment:\n{reviewer_response}\n\n\
@@ -913,14 +1351,42 @@ impl Orchestrator {
                      their `.ratio/research/*.md` files where relevant>"
                 );
 
-                match self.prompt_agent(reviewer_conn, &synth_prompt, "Reviewer").await {
-                    Ok((_, refined)) if !refined.trim().is_empty() => refined,
-                    Ok(_) => {
-                        self.log(LogLevel::Warn, "Reviewer review synthesis was empty, using original.");
+                let synth_result = self
+                    .prompt_agent_with_user_controls(
+                        reviewer_conn,
+                        &synth_prompt_base,
+                        "Reviewer",
+                        UserMessageTarget::Reviewer,
+                        stakeholders,
+                        &mut user_msg_rx,
+                        &mut abort_rx,
+                        &mut pending_worker_msgs,
+                        &mut pending_reviewer_msgs,
+                        &mut pending_stakeholder_msgs,
+                    )
+                    .await;
+
+                match synth_result {
+                    Ok(PromptRunOutcome::Completed((_, refined))) if !refined.trim().is_empty() => {
+                        refined
+                    }
+                    Ok(PromptRunOutcome::Completed(_)) => {
+                        self.log(
+                            LogLevel::Warn,
+                            "Reviewer review synthesis was empty, using original.",
+                        );
                         reviewer_response
                     }
+                    Ok(PromptRunOutcome::Aborted) => {
+                        return self
+                            .abort(reviewer_conn, worker_conn, reviewer_proc, worker_proc)
+                            .await;
+                    }
                     Err(e) => {
-                        self.log(LogLevel::Warn, format!("Reviewer review synthesis failed ({e}), using original."));
+                        self.log(
+                            LogLevel::Warn,
+                            format!("Reviewer review synthesis failed ({e}), using original."),
+                        );
                         reviewer_response
                     }
                 }
@@ -960,7 +1426,7 @@ impl Orchestrator {
 
             let record = CycleRecord {
                 cycle,
-                worker_instruction: current_instruction.clone(),
+                worker_instruction: worker_prompt_base,
                 worker_output: worker_output.clone(),
                 worker_stop_reason: worker_stop.clone(),
                 reviewer_assessment: reviewer_response.clone(),
@@ -982,12 +1448,8 @@ impl Orchestrator {
                     return Ok(Phase::Approved);
                 }
                 ReviewVerdict::NeedsRevision { ref feedback } => {
-                    self.log(
-                        LogLevel::Warn,
-                        format!("Cycle {cycle}: revision needed."),
-                    );
-                    current_instruction =
-                        self.build_revision_prompt(feedback, cycle + 1);
+                    self.log(LogLevel::Warn, format!("Cycle {cycle}: revision needed."));
+                    current_instruction = self.build_revision_prompt(feedback, cycle + 1);
                 }
                 ReviewVerdict::Rejected { ref reason } => {
                     let msg = format!("REJECTED: {reason}");
@@ -1013,14 +1475,11 @@ impl Orchestrator {
         stakeholders: &[LiveStakeholder],
         phase: StakeholderPhase,
         context: &str,
+        pending_stakeholder_msgs: &mut BTreeMap<usize, Vec<String>>,
     ) -> String {
         let relevant: Vec<&LiveStakeholder> = stakeholders
             .iter()
-            .filter(|s| {
-                self.config.stakeholders[s.index]
-                    .phases
-                    .contains(&phase)
-            })
+            .filter(|s| self.config.stakeholders[s.index].phases.contains(&phase))
             .collect();
 
         if relevant.is_empty() {
@@ -1046,7 +1505,7 @@ impl Orchestrator {
             let persona = &self.config.stakeholders[stakeholder.index].persona;
             let name = &stakeholder.name;
 
-            let prompt = format!(
+            let mut prompt = format!(
                 "{persona}\n\n\
                  You are participating as a stakeholder named \"{name}\" in a \
                  software development process. Your role is to provide input from \
@@ -1066,6 +1525,25 @@ impl Orchestrator {
                 stakeholder_file = name.to_lowercase().replace(' ', "-"),
             );
 
+            if let Some(mut notes) = pending_stakeholder_msgs.remove(&stakeholder.index) {
+                if !notes.is_empty() {
+                    let rendered = notes
+                        .drain(..)
+                        .enumerate()
+                        .map(|(i, m)| format!("{}. {}", i + 1, m))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    prompt.push_str(&format!(
+                        "\n\n\
+                         ═══ USER MESSAGE(S) FOR {name} ═══\n\
+                         The user added the following guidance. You MUST account for it in your response:\n\
+                         {rendered}\n\
+                         ═══ END USER MESSAGE(S) ═══"
+                    ));
+                }
+            }
+
             self.log(
                 LogLevel::Info,
                 format!("Stakeholder \"{name}\" is providing input..."),
@@ -1081,7 +1559,10 @@ impl Orchestrator {
                         ));
                         self.log(
                             LogLevel::Info,
-                            format!("Stakeholder \"{name}\" provided {} chars of input.", response.len()),
+                            format!(
+                                "Stakeholder \"{name}\" provided {} chars of input.",
+                                response.len()
+                            ),
                         );
                     }
                 }
@@ -1105,7 +1586,10 @@ impl Orchestrator {
         reviewer_proc: &mut AgentProcess,
         worker_proc: &mut AgentProcess,
     ) -> anyhow::Result<Phase> {
-        self.log(LogLevel::Warn, "Abort signal received — killing all agents.");
+        self.log(
+            LogLevel::Warn,
+            "Abort signal received — killing all agents.",
+        );
         reviewer_conn.cancel().await.ok();
         worker_conn.cancel().await.ok();
         reviewer_proc.kill();
@@ -1119,5 +1603,63 @@ impl Orchestrator {
             .event_tx
             .send(OrchestratorEvent::Finished(Phase::Aborted));
         Ok(Phase::Aborted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_orchestrator() -> Orchestrator {
+        let mut cfg = Config::default();
+        cfg.goal = "test goal".to_string();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Orchestrator::new(cfg, tx)
+    }
+
+    #[test]
+    fn conflicting_explicit_verdicts_default_to_needs_revision() {
+        let orch = test_orchestrator();
+        let response = "\
+VERDICT: NEEDS_REVISION\n\
+ASSESSMENT:\n\
+Needs more work.\n\
+VERDICT: REJECTED\n\
+REASON:\n\
+Conflicting output\n";
+
+        match orch.parse_reviewer_response(response) {
+            ReviewVerdict::NeedsRevision { .. } => {}
+            other => panic!("expected NEEDS_REVISION, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bullet_prefixed_verdict_line_is_parsed() {
+        let orch = test_orchestrator();
+        let response = "\
+- VERDICT: NEEDS_REVISION\n\
+FEEDBACK:\n\
+Fix X and Y.\n";
+
+        match orch.parse_reviewer_response(response) {
+            ReviewVerdict::NeedsRevision { .. } => {}
+            other => panic!("expected NEEDS_REVISION, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_messages_are_appended_and_cleared() {
+        let mut pending = vec![
+            "Prioritize API ergonomics".to_string(),
+            "Keep backward compatibility".to_string(),
+        ];
+
+        let out = Orchestrator::apply_pending_user_messages("BASE PROMPT", &mut pending, "WORKER");
+
+        assert!(out.contains("BASE PROMPT"));
+        assert!(out.contains("Prioritize API ergonomics"));
+        assert!(out.contains("Keep backward compatibility"));
+        assert!(pending.is_empty());
     }
 }

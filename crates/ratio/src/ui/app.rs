@@ -137,6 +137,8 @@ pub struct LogEntry {
 pub struct QueuedMessage {
     pub text: String,
     pub target: AgentSource,
+    /// If true, request interruption of the target agent's current turn.
+    pub immediate: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -366,16 +368,27 @@ impl App {
 
     /// Submit the current input buffer as a queued message.
     pub fn submit_input(&mut self) {
+        self.submit_input_with_mode(false);
+    }
+
+    /// Submit current input and request immediate turn interruption.
+    pub fn submit_input_immediate(&mut self) {
+        self.submit_input_with_mode(true);
+    }
+
+    fn submit_input_with_mode(&mut self, immediate: bool) {
         let text = self.input_buffer.trim().to_string();
         if !text.is_empty() {
             let target = self.active_agent.clone();
+            let mode = if immediate { " interrupt" } else { " queued" };
             self.push_log(
                 LogLevel::Info,
-                format!("[User -> {}] {}", target.label(), text),
+                format!("[User -> {}{mode}] {}", target.label(), text),
             );
             self.message_queue.push_back(QueuedMessage {
                 text: text.clone(),
                 target,
+                immediate,
             });
         }
         self.input_buffer.clear();

@@ -139,15 +139,18 @@ pub fn spawn_agent(
     let client = Rc::new(OrchestratorClient::new(event_tx, true));
     let client_for_conn = Rc::clone(&client);
 
-    let (conn, io_task) =
-        acp::ClientSideConnection::new(client, outgoing, incoming, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+    let (conn, io_task) = acp::ClientSideConnection::new(client, outgoing, incoming, |fut| {
+        tokio::task::spawn_local(fut);
+    });
 
     let stderr = child.stderr.take();
 
     let worker_conn = WorkerConnection::new(conn, client_for_conn);
-    let agent_proc = AgentProcess { child, role, stderr };
+    let agent_proc = AgentProcess {
+        child,
+        role,
+        stderr,
+    };
 
     Ok((worker_conn, agent_proc, io_task))
 }

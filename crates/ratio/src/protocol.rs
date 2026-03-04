@@ -51,14 +51,10 @@ pub enum AgentEvent {
     TodoUpdated(Vec<TodoEntry>),
 
     /// The agent requested permission to perform an action.
-    PermissionRequested {
-        description: String,
-    },
+    PermissionRequested { description: String },
 
     /// The agent's prompt turn ended.
-    TurnComplete {
-        stop_reason: StopReason,
-    },
+    TurnComplete { stop_reason: StopReason },
 
     /// Raw protocol-level message (for the debug pane).
     ProtocolMessage(String),
@@ -328,9 +324,9 @@ impl acp::Client for OrchestratorClient {
 
             if let Some(opt) = option {
                 Ok(acp::RequestPermissionResponse::new(
-                    acp::RequestPermissionOutcome::Selected(
-                        acp::SelectedPermissionOutcome::new(opt.option_id.clone()),
-                    ),
+                    acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                        opt.option_id.clone(),
+                    )),
                 ))
             } else {
                 Ok(acp::RequestPermissionResponse::new(
@@ -342,9 +338,9 @@ impl acp::Client for OrchestratorClient {
             let option = args.options.first();
             if let Some(opt) = option {
                 Ok(acp::RequestPermissionResponse::new(
-                    acp::RequestPermissionOutcome::Selected(
-                        acp::SelectedPermissionOutcome::new(opt.option_id.clone()),
-                    ),
+                    acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                        opt.option_id.clone(),
+                    )),
                 ))
             } else {
                 Ok(acp::RequestPermissionResponse::new(
@@ -520,14 +516,10 @@ impl WorkerConnection {
 
         self.conn
             .initialize(
-                acp::InitializeRequest::new(acp::ProtocolVersion::LATEST)
-                    .client_info(
-                        acp::Implementation::new(
-                            "ratio-orchestrator",
-                            env!("CARGO_PKG_VERSION"),
-                        )
+                acp::InitializeRequest::new(acp::ProtocolVersion::LATEST).client_info(
+                    acp::Implementation::new("ratio-orchestrator", env!("CARGO_PKG_VERSION"))
                         .title("Ratio Orchestrator"),
-                    ),
+                ),
             )
             .await
             .map_err(|e| anyhow::anyhow!("ACP initialize failed: {e}"))?;
@@ -560,14 +552,10 @@ impl WorkerConnection {
 
         self.conn
             .initialize(
-                acp::InitializeRequest::new(acp::ProtocolVersion::LATEST)
-                    .client_info(
-                        acp::Implementation::new(
-                            "ratio-orchestrator",
-                            env!("CARGO_PKG_VERSION"),
-                        )
+                acp::InitializeRequest::new(acp::ProtocolVersion::LATEST).client_info(
+                    acp::Implementation::new("ratio-orchestrator", env!("CARGO_PKG_VERSION"))
                         .title("Ratio Orchestrator"),
-                    ),
+                ),
             )
             .await
             .map_err(|e| anyhow::anyhow!("ACP initialize failed: {e}"))?;
@@ -600,10 +588,7 @@ impl WorkerConnection {
 
         let response = self
             .conn
-            .prompt(acp::PromptRequest::new(
-                session_id,
-                vec![text.into()],
-            ))
+            .prompt(acp::PromptRequest::new(session_id, vec![text.into()]))
             .await
             .map_err(|e| anyhow::anyhow!("ACP prompt failed: {e}"))?;
 
@@ -758,7 +743,8 @@ impl WorkerConnection {
                     self.client.touch_activity();
                     current_prompt = "Continue where you left off. You appear to have stalled — \
                         keep working on the task. Do not repeat completed work. \
-                        Pick up from where you stopped.".to_string();
+                        Pick up from where you stopped."
+                        .to_string();
                     continue;
                 }
             }
@@ -798,7 +784,10 @@ impl WorkerConnection {
             .clone();
 
         self.conn
-            .set_session_model(acp::SetSessionModelRequest::new(session_id, model_id.to_string()))
+            .set_session_model(acp::SetSessionModelRequest::new(
+                session_id,
+                model_id.to_string(),
+            ))
             .await
             .map_err(|e| anyhow::anyhow!("ACP set_session_model failed: {e}"))?;
 

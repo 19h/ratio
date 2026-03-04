@@ -353,7 +353,7 @@ pub fn status_bar<'a>(
         ));
     } else if input_mode {
         spans.push(Span::styled(
-            "Type message, Enter to send, Esc to cancel",
+            "Enter:queue  Alt/Ctrl+Enter:interrupt  Esc:cancel",
             Style::default().fg(Color::Yellow),
         ));
     } else {
