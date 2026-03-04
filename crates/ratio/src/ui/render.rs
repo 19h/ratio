@@ -60,7 +60,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
-            " RATIO ",
+            " RA ",
             Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
         ),
         Span::raw(" "),

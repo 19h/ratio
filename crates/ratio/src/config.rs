@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 // Top-level configuration
 // ---------------------------------------------------------------------------
 
-/// Root configuration for a ratio orchestration session.
+/// Root configuration for a RA orchestration session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {

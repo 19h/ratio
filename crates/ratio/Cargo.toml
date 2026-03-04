@@ -1,5 +1,5 @@
 [package]
-name = "ratio"
+name = "ra"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 description = "LLM agent orchestrator: reviewer-driven code generation via ACP and opencode"
 
 [[bin]]
-name = "ratio"
+name = "ra"
 path = "src/main.rs"
 
 [dependencies]

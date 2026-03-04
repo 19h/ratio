@@ -1,4 +1,4 @@
-//! Ratio — entry point.
+//! RA — entry point.
 //!
 //! Parses CLI arguments, loads configuration, spawns both the reviewer and
 //! worker agent subprocesses, and runs the TUI event loop alongside the
@@ -17,17 +17,17 @@ use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 use agent_client_protocol as acp;
-use ratio::config::{CliOverrides, Config};
-use ratio::orchestrator::{
+use ra::config::{CliOverrides, Config};
+use ra::orchestrator::{
     LiveStakeholder, Orchestrator, OrchestratorEvent, UserMessage, UserMessageTarget,
 };
-use ratio::protocol::AgentEvent;
-use ratio::session::SessionState;
-use ratio::subprocess::{AgentRole, spawn_agent};
-use ratio::ui::app::AgentSource;
-use ratio::ui::events::Action;
-use ratio::ui::render;
-use ratio::ui::{App, EventLoop};
+use ra::protocol::AgentEvent;
+use ra::session::SessionState;
+use ra::subprocess::{AgentRole, spawn_agent};
+use ra::ui::app::AgentSource;
+use ra::ui::events::Action;
+use ra::ui::render;
+use ra::ui::{App, EventLoop};
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -35,9 +35,9 @@ use ratio::ui::{App, EventLoop};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "ratio",
+    name = "ra",
     about = "LLM agent orchestrator — reviewer-driven code generation via ACP",
-    long_about = "Ratio orchestrates two LLM agents (reviewer + worker) through \
+    long_about = "RA orchestrates two LLM agents (reviewer + worker) through \
                   iterative review cycles. The reviewer formulates work instructions, \
                   the worker executes them, and the reviewer validates the output — \
                   enforcing user-specified tools, approaches, and constraints.",
@@ -91,10 +91,10 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("ratio=info".parse().unwrap()),
+                .add_directive("ra=info".parse().unwrap()),
         )
         .with_writer(|| {
-            let path = std::env::temp_dir().join("ratio.log");
+            let path = std::env::temp_dir().join("ra.log");
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -427,7 +427,7 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
 
             tokio::task::spawn_local(async move {
                 if let Err(e) = reviewer_io.await {
-                    eprintln!("[ratio] Reviewer I/O error: {e}");
+                    eprintln!("[ra] Reviewer I/O error: {e}");
                 }
             });
 
@@ -459,7 +459,7 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
 
             tokio::task::spawn_local(async move {
                 if let Err(e) = worker_io.await {
-                    eprintln!("[ratio] Worker I/O error: {e}");
+                    eprintln!("[ra] Worker I/O error: {e}");
                 }
             });
 
@@ -494,14 +494,11 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                         }
                         tokio::task::spawn_local(async move {
                             if let Err(e) = sh_io.await {
-                                eprintln!("[ratio] Stakeholder I/O error: {e}");
+                                eprintln!("[ra] Stakeholder I/O error: {e}");
                             }
                         });
                         if let Err(e) = sh_conn.handshake(&config.cwd).await {
-                            eprintln!(
-                                "[ratio] Stakeholder '{}' handshake failed: {e}",
-                                sh_cfg.name
-                            );
+                            eprintln!("[ra] Stakeholder '{}' handshake failed: {e}", sh_cfg.name);
                             continue;
                         }
                         if let Some(ref ac) = sh_cfg.agent {
@@ -518,7 +515,7 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                         stakeholder_event_rxs.push(sh_event_rx);
                     }
                     Err(e) => {
-                        eprintln!("[ratio] Failed to spawn stakeholder '{}': {e}", sh_cfg.name);
+                        eprintln!("[ra] Failed to spawn stakeholder '{}': {e}", sh_cfg.name);
                     }
                 }
             }
@@ -526,7 +523,7 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
             // Subscribe to raw ACP streams before moving connections
             // into the orchestrator (--debug mode).
             if debug {
-                eprintln!("[ratio] debug: ACP protocol logging enabled");
+                eprintln!("[ra] debug: ACP protocol logging enabled");
 
                 let mut worker_stream = worker_conn.subscribe();
                 tokio::task::spawn_local(async move {
@@ -586,7 +583,7 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
             while let Some(evt) = orch_event_rx.recv().await {
                 match evt {
                     OrchestratorEvent::PhaseChanged(phase) => {
-                        eprintln!("[ratio] phase: {phase:?}");
+                        eprintln!("[ra] phase: {phase:?}");
                     }
                     OrchestratorEvent::WorkerEvent(AgentEvent::TextChunk(text)) => {
                         print!("{text}");
@@ -595,11 +592,11 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                         eprint!("{text}");
                     }
                     OrchestratorEvent::Log(level, msg) => {
-                        eprintln!("[ratio] [{level:?}] {msg}");
+                        eprintln!("[ra] [{level:?}] {msg}");
                     }
                     OrchestratorEvent::CycleCompleted(record) => {
                         eprintln!(
-                            "[ratio] cycle {} completed: {:?}",
+                            "[ra] cycle {} completed: {:?}",
                             record.cycle, record.verdict
                         );
                     }
@@ -611,7 +608,7 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                         eprint!("[{name}] {text}");
                     }
                     OrchestratorEvent::Finished(phase) => {
-                        eprintln!("[ratio] finished: {phase:?}");
+                        eprintln!("[ra] finished: {phase:?}");
                         break;
                     }
                     _ => {}

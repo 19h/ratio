@@ -1,9 +1,9 @@
-# Ratio — example configuration
+# RA — example configuration
 #
 # Copy this to `ratio.toml` and customize for your project.
 # All fields have sensible defaults; only `goal` is required.
 #
-# Ratio orchestrates LLM agents through iterative review cycles:
+# RA orchestrates LLM agents through iterative review cycles:
 #   - Reviewer: formulates tasks, reviews output, enforces constraints
 #   - Worker: executes the coding work
 #   - Stakeholders (optional): provide additional perspectives during

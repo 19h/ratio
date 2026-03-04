@@ -1,6 +1,6 @@
-# ratio
+# ra
 
-Ratio orchestrates LLM agents through iterative review cycles. A **reviewer** agent formulates precise work instructions and evaluates output quality. A **worker** agent executes the coding tasks. Optional **stakeholder** agents bring additional perspectives (security, UX, ops, domain expertise) into planning and review phases. All agents are [opencode](https://opencode.ai) instances communicating over the [Agent Client Protocol (ACP)](https://agentclientprotocol.com).
+RA orchestrates LLM agents through iterative review cycles. A **reviewer** agent formulates precise work instructions and evaluates output quality. A **worker** agent executes the coding tasks. Optional **stakeholder** agents bring additional perspectives (security, UX, ops, domain expertise) into planning and review phases. All agents are [opencode](https://opencode.ai) instances communicating over the [Agent Client Protocol (ACP)](https://agentclientprotocol.com).
 
 The orchestrator enforces user-specified constraints (required tools, forbidden patterns, path restrictions, custom quality rules) and runs a structured approve/revise/reject loop until the reviewer approves, rejects, or the user aborts.
 
@@ -12,7 +12,7 @@ The orchestrator enforces user-specified constraints (required tools, forbidden 
                     └──────┬──────┘
                            │
                     ┌──────▼─────────┐
-                    │      ratio     │
+                    │      ra        │
                     │  Orchestrator  │
                     └─┬────┬───────┬─┘
               ┌───────▼┐ ┌─▼────┐ ┌▼─────────────┐
@@ -115,31 +115,31 @@ The watchdog is active for all agents (reviewer, worker, stakeholders). Set `sta
 ### Build
 
 ```sh
-git clone <repo-url> ratio
-cd ratio
+git clone <repo-url> ra
+cd ra
 cargo build --release
 ```
 
-The binary is at `target/release/ratio`.
+The binary is at `target/release/ra`.
 
 ## Quick start
 
 ### Minimal invocation
 
 ```sh
-ratio --goal "Add comprehensive error handling to src/lib.rs" --cwd /path/to/project
+ra --goal "Add comprehensive error handling to src/lib.rs" --cwd /path/to/project
 ```
 
 ### With a config file
 
 ```sh
-ratio --config ratio.toml
+ra --config ratio.toml
 ```
 
 ### Headless mode (for CI/scripts)
 
 ```sh
-ratio --config ratio.toml --headless > worker_output.txt
+ra --config ratio.toml --headless > worker_output.txt
 ```
 
 In headless mode, worker text streams to stdout. Reviewer text, stakeholder text, orchestrator status, and logs go to stderr.
@@ -147,7 +147,7 @@ In headless mode, worker text streams to stdout. Reviewer text, stakeholder text
 ### Debug mode
 
 ```sh
-ratio --config ratio.toml --headless --debug 2>debug.log
+ra --config ratio.toml --headless --debug 2>debug.log
 ```
 
 Logs all ACP protocol messages (`[acp:worker]`, `[acp:reviewer]`) and subprocess stderr (`[stderr:worker]`, `[stderr:reviewer]`, `[stderr:stakeholder]`) to stderr.
@@ -155,14 +155,14 @@ Logs all ACP protocol messages (`[acp:worker]`, `[acp:reviewer]`) and subprocess
 ### Resume a previous session
 
 ```sh
-ratio --config ratio.toml --resume
+ra --config ratio.toml --resume
 ```
 
 Restores session state (cycle count, agent sessions, UI state) from the saved `.ratio-session.json` in the working directory.
 
 ## Configuration
 
-Ratio uses a TOML config file. Copy the example to get started:
+RA uses a TOML config file. Copy the example to get started:
 
 ```sh
 cp ratio.example.toml ratio.toml
@@ -287,9 +287,9 @@ custom_rules = [
 ## CLI reference
 
 ```
-ratio — LLM agent orchestrator
+ra — LLM agent orchestrator
 
-Usage: ratio [OPTIONS]
+Usage: ra [OPTIONS]
 
 Options:
   -g, --goal <GOAL>                The goal to accomplish
@@ -309,7 +309,7 @@ Options:
 
 ## TUI
 
-Ratio includes a terminal interface built with [ratatui](https://ratatui.rs).
+RA includes a terminal interface built with [ratatui](https://ratatui.rs).
 
 ### Panes
 
@@ -388,7 +388,7 @@ If the target agent is currently idle, the message is applied on its next turn.
 
 ### Session persistence
 
-On interrupt/exit, ratio persists:
+On interrupt/exit, ra persists:
 
 - `.ratio-session.json` — reviewer/worker session IDs, last phase, cycle count, goal
 - `.ratio-ui-state.json` — todos and log entries
@@ -399,7 +399,7 @@ On interrupt/exit, ratio persists:
 
 ### Runtime model
 
-Ratio uses a **single-threaded tokio runtime** (`current_thread` flavor) with a `LocalSet`. This is required because the ACP SDK's `Client` trait uses `#[async_trait(?Send)]` — the futures are `!Send`, so types like `Rc<OrchestratorClient>` can be used instead of `Arc`.
+RA uses a **single-threaded tokio runtime** (`current_thread` flavor) with a `LocalSet`. This is required because the ACP SDK's `Client` trait uses `#[async_trait(?Send)]` — the futures are `!Send`, so types like `Rc<OrchestratorClient>` can be used instead of `Arc`.
 
 ```
 tokio::main (current_thread)
@@ -506,14 +506,14 @@ crates/ratio/src/
 
 ## Logging
 
-Tracing output is written to `$TMPDIR/ratio.log` to avoid interfering with the TUI. The log level is controlled by the `RUST_LOG` environment variable (default: `ratio=info`).
+Tracing output is written to `$TMPDIR/ra.log` to avoid interfering with the TUI. The log level is controlled by the `RUST_LOG` environment variable (default: `ra=info`).
 
 ```sh
 # Watch logs in another terminal
-tail -f "$TMPDIR/ratio.log"
+tail -f "$TMPDIR/ra.log"
 
 # Enable debug-level logging
-RUST_LOG=ratio=debug ratio --config ratio.toml
+RUST_LOG=ra=debug ra --config ratio.toml
 ```
 
 In headless mode with `--debug`, ACP protocol messages and subprocess stderr are printed to stderr in addition to the log file.
@@ -614,12 +614,12 @@ See [`examples/fullstack-stakeholders.toml`](examples/fullstack-stakeholders.tom
 #!/bin/bash
 set -euo pipefail
 
-ratio \
+ra \
   --config ratio.toml \
   --headless \
   --max-cycles 3 \
   --cwd ./my-project \
-  2>ratio-stderr.log
+  2>ra-stderr.log
 
 echo "Orchestration complete"
 ```
@@ -628,14 +628,14 @@ echo "Orchestration complete"
 
 ```sh
 # Full protocol trace
-ratio --config ratio.toml --headless --debug 2>debug.log
+ra --config ratio.toml --headless --debug 2>debug.log
 
 # In debug.log you'll see:
 # [acp:worker] send request id=1 method=initialize params={...}
 # [acp:worker] recv response id=1 result={...}
 # [acp:reviewer] send request id=1 method=prompt params={...}
 # [stderr:worker] Loading model anthropic/claude-sonnet-4-5...
-# [ratio] [Info] Parsed verdict: NEEDS_REVISION (feedback: 2847 chars)
+# [ra] [Info] Parsed verdict: NEEDS_REVISION (feedback: 2847 chars)
 ```
 
 ## License

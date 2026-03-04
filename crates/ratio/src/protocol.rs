@@ -517,8 +517,8 @@ impl WorkerConnection {
         self.conn
             .initialize(
                 acp::InitializeRequest::new(acp::ProtocolVersion::LATEST).client_info(
-                    acp::Implementation::new("ratio-orchestrator", env!("CARGO_PKG_VERSION"))
-                        .title("Ratio Orchestrator"),
+                    acp::Implementation::new("ra-orchestrator", env!("CARGO_PKG_VERSION"))
+                        .title("RA Orchestrator"),
                 ),
             )
             .await
@@ -553,8 +553,8 @@ impl WorkerConnection {
         self.conn
             .initialize(
                 acp::InitializeRequest::new(acp::ProtocolVersion::LATEST).client_info(
-                    acp::Implementation::new("ratio-orchestrator", env!("CARGO_PKG_VERSION"))
-                        .title("Ratio Orchestrator"),
+                    acp::Implementation::new("ra-orchestrator", env!("CARGO_PKG_VERSION"))
+                        .title("RA Orchestrator"),
                 ),
             )
             .await

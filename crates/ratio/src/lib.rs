@@ -1,6 +1,6 @@
-//! Ratio — LLM agent orchestrator with reviewer-driven code generation.
+//! RA — LLM agent orchestrator with reviewer-driven code generation.
 //!
-//! Ratio orchestrates two roles over the Agent Client Protocol (ACP):
+//! RA orchestrates two roles over the Agent Client Protocol (ACP):
 //!
 //! - **Reviewer** (the orchestrator itself): accepts an elaborate goal,
 //!   establishes the task with enforced constraints, delegates work, and

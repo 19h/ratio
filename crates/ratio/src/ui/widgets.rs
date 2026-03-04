@@ -292,7 +292,7 @@ pub fn status_bar<'a>(
 ) -> Line<'a> {
     let mut spans = vec![
         Span::styled(
-            " ratio ",
+            " ra ",
             Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
         ),
         Span::raw(" "),
