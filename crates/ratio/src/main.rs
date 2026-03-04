@@ -288,10 +288,38 @@ async fn run_tui_inner(
                                 tracing::error!("Stakeholder I/O error: {e}");
                             }
                         });
-                        if let Err(e) = sh_conn.handshake(&config.cwd).await {
+
+                        // On resume, try to load the saved session for this
+                        // stakeholder instead of creating a new one.
+                        let saved_sh_session = saved_session.as_ref().and_then(|state| {
+                            state
+                                .stakeholder_sessions
+                                .iter()
+                                .find(|s| s.index == i && s.name == sh_cfg.name)
+                        });
+
+                        if let Some(saved) = saved_sh_session {
+                            if let Err(e) = sh_conn
+                                .load_existing_session(saved.session_id.clone(), &config.cwd)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Stakeholder '{}' session resume failed ({e}), starting fresh",
+                                    sh_cfg.name
+                                );
+                                if let Err(e) = sh_conn.handshake(&config.cwd).await {
+                                    tracing::warn!(
+                                        "Stakeholder '{}' handshake failed: {e}",
+                                        sh_cfg.name
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else if let Err(e) = sh_conn.handshake(&config.cwd).await {
                             tracing::warn!("Stakeholder '{}' handshake failed: {e}", sh_cfg.name);
                             continue;
                         }
+
                         if let Some(ref ac) = sh_cfg.agent {
                             if !ac.model.is_empty() {
                                 let _ = sh_conn.set_model(&ac.model).await;
@@ -333,6 +361,14 @@ async fn run_tui_inner(
                     match resume_agent.as_deref() {
                         Some("worker") => {
                             let _ = worker_conn.prompt(&continue_msg).await;
+                        }
+                        Some(agent) if agent.starts_with("stakeholder:") => {
+                            if let Ok(idx) = agent["stakeholder:".len()..].parse::<usize>() {
+                                if let Some(sh) = live_stakeholders.iter().find(|s| s.index == idx)
+                                {
+                                    let _ = sh.conn.prompt(&continue_msg).await;
+                                }
+                            }
                         }
                         _ => {
                             let _ = reviewer_conn.prompt(&continue_msg).await;
@@ -509,10 +545,38 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                                 eprintln!("[ra] Stakeholder I/O error: {e}");
                             }
                         });
-                        if let Err(e) = sh_conn.handshake(&config.cwd).await {
+
+                        // On resume, try to load the saved session for this
+                        // stakeholder instead of creating a new one.
+                        let saved_sh_session = saved_session.as_ref().and_then(|state| {
+                            state
+                                .stakeholder_sessions
+                                .iter()
+                                .find(|s| s.index == i && s.name == sh_cfg.name)
+                        });
+
+                        if let Some(saved) = saved_sh_session {
+                            if let Err(e) = sh_conn
+                                .load_existing_session(saved.session_id.clone(), &config.cwd)
+                                .await
+                            {
+                                eprintln!(
+                                    "[ra] Stakeholder '{}' session resume failed ({e}), starting fresh",
+                                    sh_cfg.name
+                                );
+                                if let Err(e) = sh_conn.handshake(&config.cwd).await {
+                                    eprintln!(
+                                        "[ra] Stakeholder '{}' handshake failed: {e}",
+                                        sh_cfg.name
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else if let Err(e) = sh_conn.handshake(&config.cwd).await {
                             eprintln!("[ra] Stakeholder '{}' handshake failed: {e}", sh_cfg.name);
                             continue;
                         }
+
                         if let Some(ref ac) = sh_cfg.agent {
                             if !ac.model.is_empty() {
                                 let _ = sh_conn.set_model(&ac.model).await;
@@ -570,6 +634,14 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                     match resume_agent.as_deref() {
                         Some("worker") => {
                             let _ = worker_conn.prompt(&continue_msg).await;
+                        }
+                        Some(agent) if agent.starts_with("stakeholder:") => {
+                            if let Ok(idx) = agent["stakeholder:".len()..].parse::<usize>() {
+                                if let Some(sh) = live_stakeholders.iter().find(|s| s.index == idx)
+                                {
+                                    let _ = sh.conn.prompt(&continue_msg).await;
+                                }
+                            }
                         }
                         _ => {
                             let _ = reviewer_conn.prompt(&continue_msg).await;

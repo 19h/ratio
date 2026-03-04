@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::config::{Config, StakeholderPhase};
 use crate::protocol::{AgentEvent, StopReason, WorkerConnection};
-use crate::session::SessionState;
+use crate::session::{SavedStakeholderSession, SessionState};
 use crate::subprocess::AgentProcess;
 
 /// A live stakeholder — an ACP agent subprocess with its own persona.
@@ -181,6 +181,7 @@ impl Orchestrator {
         &self,
         reviewer_conn: &WorkerConnection,
         worker_conn: &WorkerConnection,
+        stakeholders: &[LiveStakeholder],
         last_active: &str,
     ) {
         let reviewer_id = reviewer_conn
@@ -191,6 +192,19 @@ impl Orchestrator {
             .session_id()
             .map(|s| s.to_string())
             .unwrap_or_default();
+
+        let stakeholder_sessions: Vec<SavedStakeholderSession> = stakeholders
+            .iter()
+            .map(|s| SavedStakeholderSession {
+                index: s.index,
+                name: s.name.clone(),
+                session_id: s
+                    .conn
+                    .session_id()
+                    .map(|sid| sid.to_string())
+                    .unwrap_or_default(),
+            })
+            .collect();
 
         let phase_str = match &self.phase {
             Phase::Idle => "idle",
@@ -211,6 +225,7 @@ impl Orchestrator {
             phase: phase_str.to_string(),
             cycle: self.cycles.len(),
             goal: self.config.goal.clone(),
+            stakeholder_sessions,
         };
 
         if let Err(e) = state.save(&self.config.cwd) {
@@ -993,7 +1008,7 @@ impl Orchestrator {
         // is irrefutably understood.
 
         self.set_phase(Phase::Planning);
-        self.save_session(reviewer_conn, worker_conn, "reviewer");
+        self.save_session(reviewer_conn, worker_conn, stakeholders, "reviewer");
         self.log(
             LogLevel::Info,
             "Reviewer is analyzing the codebase and formulating work instruction...",
@@ -1192,7 +1207,7 @@ impl Orchestrator {
             } else {
                 Phase::Revising
             });
-            self.save_session(reviewer_conn, worker_conn, "worker");
+            self.save_session(reviewer_conn, worker_conn, stakeholders, "worker");
 
             self.absorb_user_messages(
                 &mut user_msg_rx,
@@ -1253,7 +1268,7 @@ impl Orchestrator {
             // ── Send output to reviewer for assessment ───────────────────
 
             self.set_phase(Phase::Reviewing);
-            self.save_session(reviewer_conn, worker_conn, "reviewer");
+            self.save_session(reviewer_conn, worker_conn, stakeholders, "reviewer");
 
             self.absorb_user_messages(
                 &mut user_msg_rx,

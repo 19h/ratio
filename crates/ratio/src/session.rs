@@ -15,6 +15,17 @@ const SESSION_FILE: &str = ".ratio-session.json";
 /// File name for the persisted UI state (todos + logs).
 const UI_STATE_FILE: &str = ".ratio-ui-state.json";
 
+/// A saved stakeholder session — name + ACP session ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedStakeholderSession {
+    /// The stakeholder's index in the config `[[stakeholders]]` array.
+    pub index: usize,
+    /// The stakeholder's display name (for matching on resume).
+    pub name: String,
+    /// The ACP session ID of this stakeholder's opencode process.
+    pub session_id: String,
+}
+
 /// Persisted session state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
@@ -22,7 +33,8 @@ pub struct SessionState {
     pub reviewer_session_id: String,
     /// The ACP session ID of the worker agent.
     pub worker_session_id: String,
-    /// Which agent was last active: "reviewer" or "worker".
+    /// Which agent was last active: "reviewer", "worker", or
+    /// "stakeholder:<index>" (e.g. "stakeholder:0").
     pub last_active_agent: String,
     /// The orchestration phase at save time: "planning", "working",
     /// "reviewing", "revising", "approved", "failed", etc.
@@ -31,6 +43,10 @@ pub struct SessionState {
     pub cycle: usize,
     /// The goal (for validation on resume).
     pub goal: String,
+    /// Saved session IDs for each stakeholder that was active.
+    /// Defaults to empty for backward compatibility with old session files.
+    #[serde(default)]
+    pub stakeholder_sessions: Vec<SavedStakeholderSession>,
 }
 
 /// Persisted UI state — todos and log entries that survive across resumes.
