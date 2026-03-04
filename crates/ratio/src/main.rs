@@ -170,13 +170,14 @@ async fn run_tui_inner(
             let (abort_tx, abort_rx) = mpsc::unbounded_channel::<()>();
 
             // ── App state ───────────────────────────────────────
-            let mut app = App::new(config.goal.clone());
+            let mut app = App::new(config.goal.clone(), config.cwd.clone());
 
             // ── Load saved session if resuming ──────────────────
             let saved_session = if resume {
                 match SessionState::load(&config.cwd)? {
                     Some(state) => {
                         app.current_cycle = state.cycle;
+                        app.restore_ui_state();
                         Some(state)
                     }
                     None => {

@@ -1,11 +1,13 @@
 //! Application state for the TUI.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use chrono::Local;
 
 use crate::orchestrator::{LogLevel, OrchestratorEvent, Phase, ReviewVerdict};
 use crate::protocol::{AgentEvent, ToolCallLocation, ToolCallState, ToolKind};
+use crate::session::{SavedLogEntry, SavedTodoItem, UIState};
 
 /// Maximum number of log lines retained.
 const MAX_LOG_LINES: usize = 2000;
@@ -80,18 +82,13 @@ pub enum StreamEntry {
     Text(String),
     /// A chunk of thinking/reasoning.
     Thought(String),
-    /// A tool call started.
-    ToolStart {
+    /// A tool call (single line — updated in-place as status changes).
+    ToolCall {
         id: String,
-        title: String,
         kind: ToolKind,
-        detail: String,
-    },
-    /// A tool call completed or failed.
-    ToolEnd {
-        id: String,
-        title: String,
         status: ToolCallState,
+        /// Best-effort human-readable summary (file path, command, etc.).
+        detail: String,
     },
     /// A separator between turns / phases.
     Separator(String),
@@ -214,10 +211,13 @@ pub struct App {
 
     /// Queue of messages to send to agents.
     pub message_queue: VecDeque<QueuedMessage>,
+
+    /// Working directory (for persisting UI state).
+    cwd: PathBuf,
 }
 
 impl App {
-    pub fn new(goal: String) -> Self {
+    pub fn new(goal: String, cwd: PathBuf) -> Self {
         Self {
             phase: Phase::Idle,
             active_agent: AgentSource::Reviewer,
@@ -242,6 +242,44 @@ impl App {
             input_buffer: String::new(),
             input_cursor: 0,
             message_queue: VecDeque::new(),
+            cwd,
+        }
+    }
+
+    /// Restore todos and log entries from a previous session's UI state.
+    pub fn restore_ui_state(&mut self) {
+        if let Some(state) = UIState::load(&self.cwd) {
+            self.todos = state
+                .todos
+                .into_iter()
+                .map(|t| TodoItem {
+                    content: t.content,
+                    status: match t.status.as_str() {
+                        "in_progress" => TodoStatus::InProgress,
+                        "completed" => TodoStatus::Completed,
+                        "cancelled" => TodoStatus::Cancelled,
+                        _ => TodoStatus::Pending,
+                    },
+                    priority: match t.priority.as_str() {
+                        "high" => TodoPriority::High,
+                        "low" => TodoPriority::Low,
+                        _ => TodoPriority::Medium,
+                    },
+                })
+                .collect();
+            self.log_entries = state
+                .logs
+                .into_iter()
+                .map(|l| LogEntry {
+                    timestamp: l.timestamp,
+                    level: match l.level.as_str() {
+                        "Warn" => LogLevel::Warn,
+                        "Error" => LogLevel::Error,
+                        _ => LogLevel::Info,
+                    },
+                    message: l.message,
+                })
+                .collect();
         }
     }
 
@@ -383,26 +421,56 @@ impl App {
                 let detail = Self::extract_tool_detail(&kind, &title, &locations, &raw_input);
                 self.push_stream(
                     source,
-                    StreamEntry::ToolStart {
+                    StreamEntry::ToolCall {
                         id,
-                        title,
                         kind,
+                        status: ToolCallState::InProgress,
                         detail,
                     },
                 );
             }
             AgentEvent::ToolCallUpdated {
-                id, title, status, ..
+                id,
+                title,
+                status,
+                raw_input,
+                locations,
+                ..
             } => {
-                if status == ToolCallState::Completed || status == ToolCallState::Failed {
-                    self.push_stream(
-                        source,
-                        StreamEntry::ToolEnd {
-                            id,
-                            title: title.unwrap_or_default(),
-                            status,
-                        },
-                    );
+                let stream = match source {
+                    AgentSource::Worker => &mut self.worker_stream,
+                    AgentSource::Reviewer => &mut self.reviewer_stream,
+                };
+                // Find the existing ToolCall entry and update it in-place.
+                if let Some(entry) = stream
+                    .iter_mut()
+                    .rev()
+                    .find(|e| matches!(e, StreamEntry::ToolCall { id: eid, .. } if *eid == id))
+                {
+                    if let StreamEntry::ToolCall {
+                        status: s,
+                        detail: d,
+                        kind: k,
+                        ..
+                    } = entry
+                    {
+                        *s = status;
+                        // Re-extract detail from the update which often has
+                        // better data (locations filled in, title updated).
+                        let updated_title = title.as_deref().unwrap_or("");
+                        let better =
+                            Self::extract_tool_detail(k, updated_title, &locations, &raw_input);
+                        if !better.is_empty() && better != updated_title {
+                            *d = better;
+                        } else if d.is_empty() || d == updated_title {
+                            // Try the title from the update as last resort.
+                            if let Some(ref t) = title {
+                                if !t.is_empty() {
+                                    *d = t.clone();
+                                }
+                            }
+                        }
+                    }
                 }
             }
             AgentEvent::TodoUpdated(items) => {
@@ -427,6 +495,7 @@ impl App {
                 if self.auto_scroll_todo {
                     self.todo_scroll = u16::MAX;
                 }
+                self.persist_ui_state();
             }
             AgentEvent::PermissionRequested { description } => {
                 self.push_log(
@@ -474,6 +543,49 @@ impl App {
         if self.auto_scroll_log {
             self.log_scroll = u16::MAX;
         }
+        self.persist_ui_state();
+    }
+
+    /// Persist current todos and logs to disk so `--resume` can restore them.
+    fn persist_ui_state(&self) {
+        let state = UIState {
+            todos: self
+                .todos
+                .iter()
+                .map(|t| SavedTodoItem {
+                    content: t.content.clone(),
+                    status: match t.status {
+                        TodoStatus::Pending => "pending",
+                        TodoStatus::InProgress => "in_progress",
+                        TodoStatus::Completed => "completed",
+                        TodoStatus::Cancelled => "cancelled",
+                    }
+                    .to_string(),
+                    priority: match t.priority {
+                        TodoPriority::High => "high",
+                        TodoPriority::Medium => "medium",
+                        TodoPriority::Low => "low",
+                    }
+                    .to_string(),
+                })
+                .collect(),
+            logs: self
+                .log_entries
+                .iter()
+                .map(|l| SavedLogEntry {
+                    timestamp: l.timestamp.clone(),
+                    level: match l.level {
+                        LogLevel::Info => "Info",
+                        LogLevel::Warn => "Warn",
+                        LogLevel::Error => "Error",
+                    }
+                    .to_string(),
+                    message: l.message.clone(),
+                })
+                .collect(),
+        };
+        // Best-effort — don't crash if write fails.
+        let _ = state.save(&self.cwd);
     }
 
     // -----------------------------------------------------------------------
@@ -538,41 +650,99 @@ impl App {
     /// Extract detail from a tool call for inline display.
     ///
     /// Priority: file location > known key shortcuts > all params as key=value.
-    /// Never falls back to just the title — always shows parameters if available.
+    /// Returns empty string if nothing useful can be extracted (caller decides
+    /// what to show in that case).
     fn extract_tool_detail(
         kind: &ToolKind,
         title: &str,
         locations: &[ToolCallLocation],
         raw_input: &Option<serde_json::Value>,
     ) -> String {
-        // For file-oriented operations, show the path.
+        // For file-oriented operations, show the path from locations.
         if let Some(loc) = locations.first() {
             let line_suffix = loc.line.map(|l| format!(":{l}")).unwrap_or_default();
             return format!("{}{line_suffix}", loc.path);
         }
 
         if let Some(serde_json::Value::Object(map)) = raw_input {
-            // For execute, try to find a "command" key.
+            // Execute: show the command.
             if matches!(kind, ToolKind::Execute) {
                 if let Some(serde_json::Value::String(cmd)) = map.get("command") {
                     return truncate(cmd, 120);
                 }
             }
 
-            // For read/edit, try "path" or "file" keys — show as primary detail.
-            for key in &["path", "file", "filePath", "file_path"] {
+            // Search: show the query/pattern + scope.
+            if matches!(kind, ToolKind::Search) {
+                let mut parts = Vec::new();
+                for key in &["pattern", "query", "regex"] {
+                    if let Some(serde_json::Value::String(q)) = map.get(*key) {
+                        parts.push(format!("/{}/", truncate(q, 60)));
+                        break;
+                    }
+                }
+                for key in &["path", "include", "glob"] {
+                    if let Some(serde_json::Value::String(p)) = map.get(*key) {
+                        parts.push(p.clone());
+                        break;
+                    }
+                }
+                if !parts.is_empty() {
+                    return parts.join(" ");
+                }
+            }
+
+            // Read/edit/write: show file path.
+            for key in &["path", "file", "filePath", "file_path", "filename"] {
                 if let Some(serde_json::Value::String(p)) = map.get(*key) {
                     return p.clone();
                 }
             }
 
-            // Fallback: show ALL parameters as compact key=value pairs.
+            // Think: show the first bit of the thought.
+            if matches!(kind, ToolKind::Think) {
+                if let Some(serde_json::Value::String(thought)) = map.get("thought") {
+                    return truncate(thought, 80);
+                }
+            }
+
+            // Fallback: show params as compact key=value (skip huge values).
             if !map.is_empty() {
                 return Self::format_params_inline(map);
             }
         }
 
-        title.to_string()
+        // If title looks like it contains useful info (not just a tool name),
+        // use it. Otherwise return empty.
+        let tool_names = [
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "search",
+            "grep",
+            "glob",
+            "fetch",
+            "todowrite",
+            "todo_write",
+            "think",
+            "mcp_read",
+            "mcp_edit",
+            "mcp_write",
+            "mcp_bash",
+            "mcp_grep",
+            "mcp_glob",
+            "mcp_webfetch",
+            "mcp_todowrite",
+            "mcp_task",
+            "mcp_skill",
+        ];
+        let title_lower = title.to_lowercase();
+        if tool_names.iter().any(|n| *n == title_lower) {
+            String::new()
+        } else {
+            title.to_string()
+        }
     }
 
     /// Format a JSON object's key-value pairs as a compact inline string.

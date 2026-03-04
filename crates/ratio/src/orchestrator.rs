@@ -244,11 +244,22 @@ impl Orchestrator {
              2. IDENTIFY every open question, ambiguity, or missing detail in the goal. \
                 Think about edge cases, implicit requirements, architectural decisions, \
                 and potential conflicts with existing code.\n\
-             3. Keep asking questions and investigating until you are ABSOLUTELY CERTAIN \
+             3. Keep reading and analyzing until you are ABSOLUTELY CERTAIN \
                 that the task is irrefutably understood. Leave NO open questions.\n\
              4. Once you are confident, write a comprehensive `agents.md` file with your \
                 analysis and create an initial todo list with the TodoWrite tool.\n\
              5. THEN produce a DETAILED, PRECISE work instruction for the worker agent.\n\n\
+             ═══ CRITICAL: YOUR ROLE BOUNDARIES ═══\n\
+             You are the REVIEWER, not the worker. During this planning phase:\n\
+             - You MAY read files to understand the codebase\n\
+             - You MAY write agents.md and use TodoWrite\n\
+             - You MUST NOT edit or create source code files\n\
+             - You MUST NOT run builds, tests, or any shell commands that modify state\n\
+             - You MUST NOT implement any part of the solution yourself\n\
+             - Your ONLY deliverable is a work instruction for the worker agent\n\
+             If you catch yourself writing code or running builds, STOP — that is \
+             the worker's job, not yours.\n\
+             ═══ END ROLE BOUNDARIES ═══\n\n\
              The worker agent has access to the filesystem, can run commands, and can \
              edit files. Be specific about:\n\
              - What files to examine, modify, or create\n\
@@ -300,6 +311,16 @@ impl Orchestrator {
              IMPORTANT: Read the agents.md file and the current todo list to understand \
              the full context. Check the actual files on disk — don't just trust the \
              worker's summary.\n\n\
+             ═══ CRITICAL: YOUR ROLE BOUNDARIES ═══\n\
+             You are the REVIEWER, not the worker. During this review phase:\n\
+             - You MAY read files to verify the worker's changes\n\
+             - You MAY run tests or builds in READ-ONLY fashion to check correctness\n\
+             - You MAY update agents.md and use TodoWrite\n\
+             - You MUST NOT edit or create source code files\n\
+             - You MUST NOT fix issues yourself — report them as NEEDS_REVISION feedback\n\
+             - You MUST NOT implement any part of the solution yourself\n\
+             If you find a bug, do NOT fix it — tell the worker to fix it.\n\
+             ═══ END ROLE BOUNDARIES ═══\n\n\
              Review the worker's output thoroughly. Check:\n\
              1. Did the worker accomplish the goal?\n\
              2. Were all required tools used?\n\

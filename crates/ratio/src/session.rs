@@ -2,6 +2,9 @@
 //!
 //! Writes a `.ratio-session.json` file in the working directory containing
 //! the session IDs for both agents and the current orchestration phase.
+//!
+//! A companion `.ratio-ui-state.json` file stores the TUI state (todos and
+//! log entries) so they survive across resume cycles.
 
 use std::path::{Path, PathBuf};
 
@@ -9,6 +12,8 @@ use serde::{Deserialize, Serialize};
 
 /// File name for the persisted session state.
 const SESSION_FILE: &str = ".ratio-session.json";
+/// File name for the persisted UI state (todos + logs).
+const UI_STATE_FILE: &str = ".ratio-ui-state.json";
 
 /// Persisted session state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +31,29 @@ pub struct SessionState {
     pub cycle: usize,
     /// The goal (for validation on resume).
     pub goal: String,
+}
+
+/// Persisted UI state — todos and log entries that survive across resumes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UIState {
+    pub todos: Vec<SavedTodoItem>,
+    pub logs: Vec<SavedLogEntry>,
+}
+
+/// A serialisable todo item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedTodoItem {
+    pub content: String,
+    pub status: String,
+    pub priority: String,
+}
+
+/// A serialisable log entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedLogEntry {
+    pub timestamp: String,
+    pub level: String,
+    pub message: String,
 }
 
 impl SessionState {
@@ -54,6 +82,35 @@ impl SessionState {
     }
 
     /// Remove the session file.
+    pub fn remove(cwd: &Path) {
+        let path = Self::path(cwd);
+        let _ = std::fs::remove_file(path);
+        UIState::remove(cwd);
+    }
+}
+
+impl UIState {
+    /// Path to the UI state file for a given working directory.
+    pub fn path(cwd: &Path) -> PathBuf {
+        cwd.join(UI_STATE_FILE)
+    }
+
+    /// Save UI state to disk.
+    pub fn save(&self, cwd: &Path) -> anyhow::Result<()> {
+        let path = Self::path(cwd);
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(&path, json)?;
+        Ok(())
+    }
+
+    /// Load UI state from disk, if it exists.
+    pub fn load(cwd: &Path) -> Option<Self> {
+        let path = Self::path(cwd);
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    /// Remove the UI state file.
     pub fn remove(cwd: &Path) {
         let path = Self::path(cwd);
         let _ = std::fs::remove_file(path);

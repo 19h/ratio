@@ -79,33 +79,35 @@ pub fn agent_stream_paragraph<'a>(
                     lines.push(Line::from(Span::styled(line.to_string(), style)));
                 }
             }
-            StreamEntry::ToolStart {
-                title,
+            StreamEntry::ToolCall {
                 kind,
+                status,
                 detail,
                 ..
             } => {
-                let kind_label = tool_kind_label(kind);
-                let kind_color = tool_kind_color(kind);
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  [{kind_label}] "),
-                        Style::default().fg(kind_color).bold(),
-                    ),
-                    Span::styled(detail.clone(), Style::default().fg(Color::White)),
-                    Span::styled(format!("  {title}"), Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-            StreamEntry::ToolEnd { title, status, .. } => {
-                let (marker, color) = match status {
+                let (badge, badge_color) = match status {
+                    ToolCallState::InProgress => (tool_kind_label(kind), tool_kind_color(kind)),
                     ToolCallState::Completed => ("ok", Color::Green),
                     ToolCallState::Failed => ("FAIL", Color::Red),
-                    _ => ("?", Color::DarkGray),
+                    ToolCallState::Other(_) => ("?", Color::DarkGray),
                 };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  [{marker}] "), Style::default().fg(color)),
-                    Span::styled(title.clone(), Style::default().fg(Color::DarkGray)),
-                ]));
+                let detail_style = match status {
+                    ToolCallState::InProgress => Style::default().fg(Color::White),
+                    ToolCallState::Completed => Style::default().fg(Color::DarkGray),
+                    ToolCallState::Failed => Style::default().fg(Color::Red),
+                    ToolCallState::Other(_) => Style::default().fg(Color::DarkGray),
+                };
+                let mut spans = vec![Span::styled(
+                    format!("  [{badge}] "),
+                    Style::default().fg(badge_color).bold(),
+                )];
+                if !detail.is_empty() {
+                    spans.push(Span::styled(detail.clone(), detail_style));
+                }
+                if matches!(status, ToolCallState::InProgress) {
+                    spans.push(Span::styled(" ...", Style::default().fg(Color::DarkGray)));
+                }
+                lines.push(Line::from(spans));
             }
             StreamEntry::Separator(label) => {
                 lines.push(Line::from(""));
