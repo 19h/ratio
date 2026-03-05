@@ -694,7 +694,12 @@ async fn run_headless(config: Config, resume: bool, debug: bool) -> anyhow::Resu
                     }
                     OrchestratorEvent::Finished(phase) => {
                         eprintln!("[ra] finished: {phase:?}");
+                        // In headless mode, there is no user to send
+                        // continuation messages, so we exit immediately.
                         break;
+                    }
+                    OrchestratorEvent::Resumed => {
+                        eprintln!("[ra] resumed");
                     }
                     _ => {}
                 }

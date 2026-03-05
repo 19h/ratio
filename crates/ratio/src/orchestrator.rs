@@ -116,7 +116,10 @@ pub enum OrchestratorEvent {
     /// A review cycle completed.
     CycleCompleted(CycleRecord),
     /// The entire orchestration finished (approved or failed).
+    /// The orchestrator is still alive and waiting for a user continuation message.
     Finished(Phase),
+    /// The user sent a continuation message and orchestration is resuming.
+    Resumed,
 }
 
 /// Target agent for a user message injected from the TUI.
@@ -138,6 +141,16 @@ pub struct UserMessage {
 
 enum PromptRunOutcome {
     Completed((StopReason, String)),
+    Aborted,
+}
+
+/// Result of waiting for a user continuation message after a terminal verdict.
+enum ContinuationResult {
+    /// The reviewer produced a new work instruction — re-enter the loop.
+    NewInstruction(String),
+    /// The user quit (channel closed) — return the current phase.
+    Quit,
+    /// The user requested an abort.
     Aborted,
 }
 
@@ -1476,7 +1489,39 @@ impl Orchestrator {
                     let _ = self
                         .event_tx
                         .send(OrchestratorEvent::Finished(Phase::Approved));
-                    return Ok(Phase::Approved);
+
+                    // Wait for a user continuation message instead of returning.
+                    // If the user sends a message, we re-enter the review loop.
+                    match self
+                        .wait_for_continuation(
+                            &mut user_msg_rx,
+                            &mut abort_rx,
+                            reviewer_conn,
+                            worker_conn,
+                            reviewer_proc,
+                            worker_proc,
+                            stakeholders,
+                            &mut pending_worker_msgs,
+                            &mut pending_reviewer_msgs,
+                            &mut pending_stakeholder_msgs,
+                        )
+                        .await
+                    {
+                        ContinuationResult::NewInstruction(instruction) => {
+                            current_instruction = instruction;
+                        }
+                        ContinuationResult::Quit => return Ok(Phase::Approved),
+                        ContinuationResult::Aborted => {
+                            return self
+                                .abort(
+                                    reviewer_conn,
+                                    worker_conn,
+                                    reviewer_proc,
+                                    worker_proc,
+                                )
+                                .await;
+                        }
+                    }
                 }
                 ReviewVerdict::NeedsRevision { ref feedback } => {
                     self.log(LogLevel::Warn, format!("Cycle {cycle}: revision needed."));
@@ -1489,7 +1534,38 @@ impl Orchestrator {
                     let _ = self
                         .event_tx
                         .send(OrchestratorEvent::Finished(Phase::Failed(msg)));
-                    return Ok(self.phase.clone());
+
+                    // Wait for a user continuation message instead of returning.
+                    match self
+                        .wait_for_continuation(
+                            &mut user_msg_rx,
+                            &mut abort_rx,
+                            reviewer_conn,
+                            worker_conn,
+                            reviewer_proc,
+                            worker_proc,
+                            stakeholders,
+                            &mut pending_worker_msgs,
+                            &mut pending_reviewer_msgs,
+                            &mut pending_stakeholder_msgs,
+                        )
+                        .await
+                    {
+                        ContinuationResult::NewInstruction(instruction) => {
+                            current_instruction = instruction;
+                        }
+                        ContinuationResult::Quit => return Ok(self.phase.clone()),
+                        ContinuationResult::Aborted => {
+                            return self
+                                .abort(
+                                    reviewer_conn,
+                                    worker_conn,
+                                    reviewer_proc,
+                                    worker_proc,
+                                )
+                                .await;
+                        }
+                    }
                 }
             }
         }
@@ -1749,6 +1825,148 @@ impl Orchestrator {
         }
 
         all_input
+    }
+
+    /// Wait for the user to send a continuation message after a terminal verdict.
+    ///
+    /// Blocks on the user message channel. When a message arrives, it is sent
+    /// to the reviewer as a follow-up prompt so the reviewer can formulate a
+    /// new work instruction and re-enter the work-review loop.
+    ///
+    /// Returns `ContinuationResult::NewInstruction` with the reviewer's new
+    /// instruction if the user continued, `Quit` if the channel closed (user
+    /// quit), or `Aborted` if the user sent an abort signal.
+    #[allow(clippy::too_many_arguments)]
+    async fn wait_for_continuation(
+        &mut self,
+        user_msg_rx: &mut mpsc::UnboundedReceiver<UserMessage>,
+        abort_rx: &mut mpsc::UnboundedReceiver<()>,
+        reviewer_conn: &WorkerConnection,
+        worker_conn: &WorkerConnection,
+        _reviewer_proc: &mut AgentProcess,
+        _worker_proc: &mut AgentProcess,
+        stakeholders: &[LiveStakeholder],
+        pending_worker: &mut Vec<String>,
+        pending_reviewer: &mut Vec<String>,
+        pending_stakeholders: &mut BTreeMap<usize, Vec<String>>,
+    ) -> ContinuationResult {
+        self.log(
+            LogLevel::Info,
+            "Waiting for user message to continue, or press q to quit.",
+        );
+
+        // Block until a user message or abort arrives.
+        loop {
+            tokio::select! {
+                maybe_msg = user_msg_rx.recv() => {
+                    let Some(msg) = maybe_msg else {
+                        // Channel closed — TUI quit.
+                        return ContinuationResult::Quit;
+                    };
+
+                    // Collect the user's text. We only act on reviewer-targeted
+                    // messages (or any message, really — the user is speaking
+                    // to the orchestrator at this point). Queue non-reviewer
+                    // messages for later but continue waiting.
+                    let user_text = msg.text.trim().to_string();
+                    if user_text.is_empty() {
+                        continue;
+                    }
+
+                    // Any message at this point is treated as a continuation
+                    // request directed at the reviewer, regardless of the
+                    // nominal target. The user is past the verdict and wants
+                    // to keep going.
+                    self.log(
+                        LogLevel::Info,
+                        format!(
+                            "User continuation message received ({} chars). \
+                             Sending to reviewer for a new work instruction.",
+                            user_text.len()
+                        ),
+                    );
+
+                    // Signal the TUI that orchestration is resuming.
+                    let _ = self.event_tx.send(OrchestratorEvent::Resumed);
+
+                    // Build a continuation prompt for the reviewer.
+                    let previous_verdict = match &self.phase {
+                        Phase::Approved => "APPROVED".to_string(),
+                        Phase::Failed(msg) => format!("FAILED ({msg})"),
+                        other => format!("{other:?}"),
+                    };
+
+                    let continuation_prompt = format!(
+                        "The previous review cycle ended with verdict: {previous_verdict}\n\n\
+                         The user has sent a follow-up message requesting further work:\n\n\
+                         ═══ USER MESSAGE ═══\n\
+                         {user_text}\n\
+                         ═══ END USER MESSAGE ═══\n\n\
+                         Based on this message, you must formulate a NEW work instruction \
+                         for the worker. Follow the same format and rules as before. \
+                         The worker still has access to the codebase and all prior context.\n\n\
+                         Produce the work instruction now."
+                    );
+
+                    self.set_phase(Phase::Planning);
+                    self.save_session(reviewer_conn, worker_conn, stakeholders, "reviewer");
+
+                    let result = self
+                        .prompt_agent_with_user_controls(
+                            reviewer_conn,
+                            &continuation_prompt,
+                            "Reviewer",
+                            UserMessageTarget::Reviewer,
+                            stakeholders,
+                            user_msg_rx,
+                            abort_rx,
+                            pending_worker,
+                            pending_reviewer,
+                            pending_stakeholders,
+                        )
+                        .await;
+
+                    match result {
+                        Ok(PromptRunOutcome::Completed((_, instruction))) => {
+                            let instruction = instruction.trim().to_string();
+                            if instruction.is_empty() {
+                                self.log(
+                                    LogLevel::Warn,
+                                    "Reviewer produced an empty instruction on continuation. \
+                                     Waiting for another user message.",
+                                );
+                                continue;
+                            }
+                            self.log(
+                                LogLevel::Info,
+                                format!(
+                                    "Reviewer produced new work instruction ({} chars). \
+                                     Resuming work-review loop.",
+                                    instruction.len()
+                                ),
+                            );
+                            return ContinuationResult::NewInstruction(instruction);
+                        }
+                        Ok(PromptRunOutcome::Aborted) => {
+                            return ContinuationResult::Aborted;
+                        }
+                        Err(e) => {
+                            self.log(
+                                LogLevel::Error,
+                                format!(
+                                    "Reviewer failed to produce continuation instruction: {e}. \
+                                     Waiting for another user message.",
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+                }
+                _ = abort_rx.recv() => {
+                    return ContinuationResult::Aborted;
+                }
+            }
+        }
     }
 
     /// Emergency-stop all agents (reviewer, worker, stakeholders).

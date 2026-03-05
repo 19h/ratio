@@ -362,7 +362,7 @@ pub fn status_bar<'a>(
         ));
     } else if finished {
         spans.push(Span::styled(
-            "Press q to quit",
+            "q:quit  i:continue with new message",
             Style::default().fg(Color::Green),
         ));
     } else if input_mode {

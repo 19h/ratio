@@ -495,6 +495,10 @@ impl App {
                 self.finished = true;
                 self.final_phase = Some(phase);
             }
+            OrchestratorEvent::Resumed => {
+                self.finished = false;
+                self.final_phase = None;
+            }
         }
     }
 
