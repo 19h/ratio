@@ -19,7 +19,10 @@ pub(super) fn history(reader: &RunReader, run: &str, query: &Query) -> Result<Va
             && get("kind").is_none_or(|kind| {
                 item.kind == kind
                     || (kind == "mcp"
-                        && matches!(item.data["tool"].as_str(), Some("mcp_call" | "mcp_list")))
+                        && matches!(
+                            item.data["tool"].as_str(),
+                            Some("mcp_call" | "mcp_list" | "tool_search")
+                        ))
             })
             && get("phase").is_none_or(|phase| item.phase == phase)
             && get("cycle")

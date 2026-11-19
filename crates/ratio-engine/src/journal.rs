@@ -559,7 +559,7 @@ impl RunReader {
                 ELSE data END
             FROM audit_events a WHERE run_id=?1 AND (?2 IS NULL OR sequence<?2) AND (?3 IS NULL OR sequence>?3)
             AND (?4 IS NULL OR actor=?4 OR (kind='ipc' AND EXISTS(SELECT 1 FROM json_each(data,'$.to') WHERE value=?4)))
-            AND (?5 IS NULL OR kind=?5 OR (?5='mcp' AND kind='tool' AND json_extract(data,'$.tool') IN ('mcp_list','mcp_call')))
+            AND (?5 IS NULL OR kind=?5 OR (?5='mcp' AND kind='tool' AND json_extract(data,'$.tool') IN ('mcp_list','tool_search','mcp_call')))
             AND (?6 IS NULL OR cycle=?6) AND (?7 IS NULL OR phase=?7)
             AND (?8 IS NULL OR sequence IN (SELECT rowid FROM audit_search WHERE audit_search MATCH ?8)
                 OR (kind='tool' AND EXISTS (SELECT 1 FROM audit_events result

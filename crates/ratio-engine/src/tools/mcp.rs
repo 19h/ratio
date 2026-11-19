@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -84,6 +84,7 @@ impl Connections {
 struct Request {
     server: String,
     name: Option<String>,
+    query: Option<String>,
     offset: Option<usize>,
     #[serde(default)]
     arguments: Map<String, Value>,
@@ -93,19 +94,25 @@ enum Operation<'a> {
     Call(&'a str, &'a Map<String, Value>),
     List {
         name: Option<&'a str>,
-        offset: Option<usize>,
-        before_call: bool,
+        offset: usize,
+    },
+    Search {
+        query: &'a str,
+        offset: usize,
     },
 }
 
 #[derive(Debug)]
 enum Output {
     Response(Value),
-    Catalog {
-        tools: BTreeMap<String, Value>,
-        offset: Option<usize>,
-        named: bool,
-        before_call: bool,
+    Names {
+        names: Vec<String>,
+        offset: usize,
+    },
+    Schemas {
+        tools: Vec<Value>,
+        offset: usize,
+        match_kind: &'static str,
     },
 }
 
@@ -150,13 +157,19 @@ pub(crate) fn schemas(servers: &BTreeMap<String, McpServer>, access: Access) -> 
     vec![
         super::schema(
             "mcp_list",
-            "Discover allowed MCP tools for this phase. Use this first when the goal calls for an external service. Supply name for its schema, or next_offset to continue.",
-            json!({"server":server, "name":{"type":"string"}, "offset":{"type":"integer","minimum":0}}),
+            "List permitted MCP tool names. Continue with next_offset. Use tool_search for schemas.",
+            json!({"server":server, "offset":{"type":"integer","minimum":0}}),
             &["server"],
         ),
         super::schema(
+            "tool_search",
+            "Fetch current MCP tool schemas by exact name, substring, or fuzzy match. Continue with next_offset.",
+            json!({"server":server, "query":{"type":"string"}, "offset":{"type":"integer","minimum":0}}),
+            &["server", "query"],
+        ),
+        super::schema(
             "mcp_call",
-            "Run an allowed MCP tool using its input schema from mcp_list.",
+            "Call a permitted MCP tool by exact name. Fetch its schema with tool_search.",
             json!({"server":server, "name":{"type":"string"}, "arguments":{"type":"object"}}),
             &["server", "name"],
         ),
@@ -192,44 +205,62 @@ pub(crate) async fn dispatch(
     .await
     {
         Ok(Ok((_, Output::Response(value)))) => same(format!("{OUTPUT_HEADER}{value}")),
+        Ok(Ok((_, Output::Names { names, offset }))) => {
+            let page = output_page(&names, offset, output_limit);
+            let omitted = page.is_empty() && offset < names.len();
+            let next = offset + page.len() + usize::from(omitted);
+            let next_offset = (next < names.len()).then_some(next);
+            let mut visible =
+                json!({"tool_names":page,"total":names.len(),"next_offset":next_offset});
+            if omitted {
+                visible["omitted"] = json!(1);
+            }
+            let full = if offset == 0 {
+                json!({"tool_names":names,"total":names.len(),"next_offset":null})
+            } else if omitted {
+                json!({"tool_names":[names[offset]],"total":names.len(),"next_offset":next_offset})
+            } else {
+                visible.clone()
+            };
+            (
+                format!("{OUTPUT_HEADER}{visible}"),
+                format!("{OUTPUT_HEADER}{full}"),
+            )
+        }
         Ok(Ok((
             key,
-            Output::Catalog {
+            Output::Schemas {
                 tools,
                 offset,
-                named,
-                before_call,
+                match_kind,
             },
         ))) => {
-            let prefix = if before_call {
-                "REFUSED: MCP schema refreshed after restart. Review the current schema and retry if appropriate.\n"
+            let page = output_page(&tools, offset, output_limit);
+            let next = offset + page.len();
+            if page.is_empty() && offset < tools.len() {
+                let next_offset = (offset + 1 < tools.len()).then_some(offset + 1);
+                let tool = &tools[offset];
+                let visible = json!({
+                    "match":match_kind,"tools":[],"tool_names":[tool["name"]],"total":tools.len(),
+                    "next_offset":next_offset,"error":"Schema exceeds tool output budget. See full tool audit."
+                });
+                let full = json!({"match":match_kind,"tools":[tool],"total":tools.len(),"next_offset":next_offset});
+                (
+                    format!("{OUTPUT_HEADER}{visible}"),
+                    format!("{OUTPUT_HEADER}{full}"),
+                )
             } else {
-                OUTPUT_HEADER
-            };
-            let full = offset.is_none().then(|| {
-                let listing = json!({"tools":tools.values().collect::<Vec<_>>()});
-                format!("{prefix}{listing}")
-            });
-            let visible = match &full {
-                Some(output) if output.len() <= output_limit => {
-                    if let Some(refreshed) = &sessions.refreshed {
-                        let mut refreshed = refreshed.borrow_mut();
-                        let known = refreshed.entry(key).or_default();
-                        for name in tools.keys() {
-                            known.entry(name.clone()).or_insert(false);
-                        }
+                if let Some(refreshed) = &sessions.refreshed {
+                    let mut refreshed = refreshed.borrow_mut();
+                    let known = refreshed.entry(key).or_default();
+                    for name in page.iter().filter_map(|tool| tool["name"].as_str()) {
+                        known.entry(name.into()).or_insert(false);
                     }
-                    output.clone()
                 }
-                Some(_) if before_call => "REFUSED: Current MCP schema exceeds the tool output budget. See the full schema in the tool audit.".into(),
-                Some(output) if named => output.clone(),
-                _ => format!(
-                    "{OUTPUT_HEADER}{}",
-                    catalog_page(&tools, offset.unwrap_or(0), output_limit)
-                ),
-            };
-            let full = full.unwrap_or_else(|| visible.clone());
-            (visible, full)
+                let next_offset = (next < tools.len()).then_some(next);
+                let listing = json!({"match":match_kind,"tools":page,"total":tools.len(),"next_offset":next_offset});
+                same(format!("{OUTPUT_HEADER}{listing}"))
+            }
         }
         Ok(Err(error)) if error.to_string().starts_with("REFUSED") => same(format!("{error:#}")),
         Ok(Err(error)) => {
@@ -295,33 +326,38 @@ async fn run(
         );
     }
     let key = (input.server.clone(), actor.into(), workspace.to_owned());
-    let operation = if call.function.name == "mcp_call" {
-        let name = input.name.as_deref().context("mcp_call requires name")?;
-        if sessions.refreshed.as_ref().is_some_and(|refreshed| {
-            refreshed
-                .borrow()
-                .get(&key)
-                .and_then(|tools| tools.get(name))
-                != Some(&true)
-        }) {
-            Operation::List {
-                name: Some(name),
-                offset: None,
-                before_call: true,
-            }
-        } else {
+    let operation = match call.function.name.as_str() {
+        "mcp_call" => {
+            let name = input.name.as_deref().context("mcp_call requires name")?;
+            ensure!(
+                sessions.refreshed.as_ref().is_none_or(|refreshed| {
+                    refreshed
+                        .borrow()
+                        .get(&key)
+                        .and_then(|tools| tools.get(name))
+                        == Some(&true)
+                }),
+                "REFUSED: Fetch the current schema with tool_search before calling {name:?} after restart."
+            );
             Operation::Call(name, &input.arguments)
         }
-    } else {
-        ensure!(
-            input.name.is_none() || input.offset.is_none(),
-            "choose name or offset for mcp_list"
-        );
-        Operation::List {
+        "mcp_list" => Operation::List {
             name: input.name.as_deref(),
-            offset: input.offset,
-            before_call: false,
+            offset: input.offset.unwrap_or(0),
+        },
+        "tool_search" => {
+            let query = input
+                .query
+                .as_deref()
+                .map(str::trim)
+                .filter(|query| !query.is_empty())
+                .context("tool_search requires a nonempty query")?;
+            Operation::Search {
+                query,
+                offset: input.offset.unwrap_or(0),
+            }
         }
+        _ => anyhow::bail!("unsupported MCP operation"),
     };
     let result = if server.lifetime == McpLifetime::Worker {
         let slot = sessions
@@ -372,34 +408,34 @@ async fn invoke(
             }
             result.map(Output::Response)
         }
-        Operation::List {
-            name,
-            offset,
-            before_call,
-        } => {
-            let tools = discover(client, server, access, name).await?;
-            if let Some(name) = name {
-                ensure!(
-                    tools.contains_key(name),
-                    "MCP tool {name:?} was not advertised"
-                );
-            }
-            Ok(Output::Catalog {
+        Operation::List { name, offset } => {
+            let names = discover(client, server, access, name, |_, _| Ok(()))
+                .await?
+                .into_keys()
+                .collect::<Vec<_>>();
+            let offset = offset.min(names.len());
+            Ok(Output::Names { names, offset })
+        }
+        Operation::Search { query, offset } => {
+            let catalog = discover(client, server, access, None, schema_entry).await?;
+            let (match_kind, tools) = search(catalog, query);
+            let offset = offset.min(tools.len());
+            Ok(Output::Schemas {
                 tools,
                 offset,
-                named: name.is_some(),
-                before_call,
+                match_kind,
             })
         }
     }
 }
 
-async fn discover(
+async fn discover<T>(
     client: &mut Client,
     server: &McpServer,
     access: Access,
     name: Option<&str>,
-) -> Result<BTreeMap<String, Value>> {
+    mut entry: impl FnMut(&str, &Value) -> Result<T>,
+) -> Result<BTreeMap<String, T>> {
     let mut selected = BTreeMap::new();
     let mut cursor = None;
     let mut seen = BTreeSet::new();
@@ -414,13 +450,7 @@ async fn discover(
             if permitted(server, access, advertised)
                 && name.is_none_or(|requested| requested == advertised)
             {
-                ensure!(
-                    tool["inputSchema"].is_object(),
-                    "MCP tool is missing an input schema"
-                );
-                selected.insert(advertised.to_owned(), json!({
-                    "name":advertised, "description":tool["description"], "inputSchema":tool["inputSchema"]
-                }));
+                selected.insert(advertised.to_owned(), entry(advertised, tool)?);
                 if name.is_some() {
                     return Ok(selected);
                 }
@@ -437,21 +467,96 @@ async fn discover(
     }
 }
 
-fn catalog_page(catalog: &BTreeMap<String, Value>, offset: usize, output_limit: usize) -> Value {
+fn schema_entry(name: &str, tool: &Value) -> Result<Value> {
+    ensure!(
+        tool["inputSchema"].is_object(),
+        "MCP tool {name:?} is missing an input schema"
+    );
+    Ok(json!({"name":name,"description":tool["description"],"inputSchema":tool["inputSchema"]}))
+}
+
+fn search(mut catalog: BTreeMap<String, Value>, query: &str) -> (&'static str, Vec<Value>) {
+    if let Some(tool) = catalog.remove(query) {
+        return ("exact", vec![tool]);
+    }
+    let query = query.to_lowercase();
+    let candidates = catalog
+        .into_iter()
+        .map(|(name, tool)| (name.to_lowercase(), tool))
+        .collect::<Vec<_>>();
+    if candidates.iter().any(|(name, _)| name.contains(&query)) {
+        let mut matches = candidates
+            .into_iter()
+            .filter(|(name, _)| name.contains(&query))
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|(name, _)| (name != &query, !name.starts_with(&query)));
+        return (
+            "substring",
+            matches.into_iter().map(|(_, tool)| tool).collect(),
+        );
+    }
+
+    let query = query.chars().take(129).collect::<Vec<_>>();
+    if query.len() > 128 {
+        return ("none", Vec::new());
+    }
+    let limit = (query.len() / 3).clamp(1, 4);
+    let mut matches = candidates
+        .into_iter()
+        .filter_map(|(name, tool)| {
+            std::iter::once(name.as_str())
+                .chain(name.split(['_', '-', '.']))
+                .filter(|part| !part.is_empty())
+                .filter_map(|part| edit_distance(&query, part, limit))
+                .min()
+                .map(|distance| (distance, tool))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(distance, _)| *distance);
+    let kind = if matches.is_empty() { "none" } else { "fuzzy" };
+    (kind, matches.into_iter().map(|(_, tool)| tool).collect())
+}
+
+fn edit_distance(query: &[char], candidate: &str, limit: usize) -> Option<usize> {
+    let candidate = candidate
+        .chars()
+        .take(query.len() + limit + 1)
+        .collect::<Vec<_>>();
+    if query.len().abs_diff(candidate.len()) > limit {
+        return None;
+    }
+    let mut row = (0..=query.len()).collect::<Vec<_>>();
+    for (index, character) in candidate.into_iter().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = index + 1;
+        for (column, &expected) in query.iter().enumerate() {
+            let above = row[column + 1];
+            row[column + 1] = (above + 1)
+                .min(row[column] + 1)
+                .min(diagonal + usize::from(character != expected));
+            diagonal = above;
+        }
+    }
+    let distance = row[query.len()];
+    (distance <= limit).then_some(distance)
+}
+
+fn output_page<T: Serialize>(items: &[T], offset: usize, output_limit: usize) -> &[T] {
     let budget = output_limit.saturating_sub(OUTPUT_HEADER.len());
-    let offset = offset.min(catalog.len());
     let mut remaining = budget.saturating_sub(128);
-    let mut names = Vec::new();
-    for name in catalog.keys().skip(offset) {
-        let cost = Value::String(name.clone()).to_string().len() + 1;
-        if cost > remaining && !names.is_empty() {
+    let mut next = offset;
+    for item in &items[offset..] {
+        let cost = serde_json::to_vec(item)
+            .expect("serializable MCP catalog entry")
+            .len()
+            + 1;
+        if cost > remaining {
             break;
         }
-        remaining = remaining.saturating_sub(cost);
-        names.push(name);
+        remaining -= cost;
+        next += 1;
     }
-    let next = offset + names.len();
-    json!({"tool_names":names,"total":catalog.len(),"next_offset":(next < catalog.len()).then_some(next)})
+    &items[offset..next]
 }
 
 pub async fn check(config: &Config, name: &str) -> Result<Value> {
@@ -463,7 +568,7 @@ pub async fn check(config: &Config, name: &str) -> Result<Value> {
         Duration::from_secs(config.orchestration.command_timeout_secs),
         async {
             let mut client = Client::open(server, &config.cwd).await?;
-            discover(&mut client, server, Access::Work, None).await
+            discover(&mut client, server, Access::Work, None, schema_entry).await
         },
     )
     .await
@@ -631,6 +736,37 @@ mod tests {
     use super::*;
     use crate::api::Function;
 
+    #[test]
+    fn searches_exact_names_then_substrings_then_close_spellings() {
+        let catalog = ["get_segments", "segments", "segments_info", "inspect"]
+            .into_iter()
+            .map(|name| (name.to_owned(), json!({"name":name})))
+            .collect::<BTreeMap<_, _>>();
+        let find = |query| {
+            let (kind, tools) = search(catalog.clone(), query);
+            (
+                kind,
+                tools
+                    .into_iter()
+                    .map(|tool| tool["name"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(find("segments"), ("exact", vec!["segments".to_owned()]));
+        assert_eq!(
+            find("SEGMENT"),
+            (
+                "substring",
+                ["segments", "segments_info", "get_segments"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        assert_eq!(find("segmetns").0, "fuzzy");
+        assert!(find("segmetns").1.contains(&"get_segments".to_owned()));
+        assert_eq!(find("unrelated_xyz"), ("none", Vec::new()));
+    }
+
     #[tokio::test]
     async fn lists_allowed_tools_using_the_legacy_handshake() {
         let directory = tempfile::tempdir().unwrap();
@@ -678,6 +814,7 @@ mod tests {
         .0;
         assert!(listing.contains("query"), "{listing}");
         assert!(!listing.contains("unlisted"));
+        assert!(!listing.contains("inputSchema"));
         let refused = run(
             &Connections::default(),
             "fixture",
@@ -835,10 +972,12 @@ mod tests {
             let json_from = |output: &str| {
                 serde_json::from_str::<Value>(output.strip_prefix(OUTPUT_HEADER).unwrap()).unwrap()
             };
+            assert!(!first.contains("inputSchema"));
+            assert!(!full.contains("inputSchema"));
             let first = json_from(&first);
             let expected = if deny { 99 } else { 100 };
             assert_eq!(
-                json_from(&full)["tools"].as_array().unwrap().len(),
+                json_from(&full)["tool_names"].as_array().unwrap().len(),
                 expected
             );
             let mut names = Vec::new();
@@ -860,14 +999,24 @@ mod tests {
             assert_eq!(names.contains(&json!(excluded)), !deny);
             let (schema, _) = execute(
                 Access::Inspect,
-                "mcp_list",
-                json!({"server":"fixture","name":"inspect_098"}),
+                "tool_search",
+                json!({"server":"fixture","query":"SPECT"}),
             )
             .await;
             assert_eq!(
                 json_from(&schema)["tools"][0]["inputSchema"]["type"],
                 "object"
             );
+            assert_eq!(json_from(&schema)["match"], "substring");
+            assert_eq!(json_from(&schema)["total"], 1);
+            let (schema, _) = execute(
+                Access::Inspect,
+                "tool_search",
+                json!({"server":"fixture","query":"inspec_098"}),
+            )
+            .await;
+            assert_eq!(json_from(&schema)["match"], "fuzzy");
+            assert_eq!(json_from(&schema)["tools"][0]["name"], "inspect_098");
             let (called, _) = execute(
                 Access::Work,
                 "mcp_call",
@@ -881,9 +1030,7 @@ mod tests {
             }
             let (inspection, _) =
                 execute(Access::Inspect, "mcp_list", json!({"server":"fixture"})).await;
-            let tools = json_from(&inspection)["tools"].as_array().unwrap().clone();
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0]["name"], "inspect_098");
+            assert_eq!(json_from(&inspection)["tool_names"], json!(["inspect_098"]));
             let (called, _) = execute(
                 Access::Inspect,
                 "mcp_call",

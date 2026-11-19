@@ -8,12 +8,13 @@ output_tokens = 8192
 allow_inspection_shell = true
 
 [mcp_servers.assist]
-command = "/Users/int/.idapro/plugins/assist/bin/assist"
+# Resolve Assist through PATH, or set the executable path in a local profile.
+command = "assist"
 args = ["--mcp"]
 protocol = "2025-11-25"
 lifetime = "worker"
 allow_all = true
-instructions = "For unloaded binaries, call file_load_facts via mcp_call with an absolute arguments.path. For open IDA databases, use the matching list_databases hash as arguments.target for get_binary_type, get_segments, get_imports or list_functions. For managed instances, use list_instances then instance_info. Use read_file for raw bytes."
+instructions = "Use tool_search to inspect Assist tool schemas. For unloaded binaries, call file_load_facts via mcp_call with an absolute arguments.path. For open IDA databases, use the matching list_databases hash as arguments.target for get_binary_type, get_segments, get_imports or list_functions. For managed instances, use list_instances then instance_info. Use read_file for raw bytes."
 # Also available to agents during inspection phases, including before plan ACK.
 inspection_tools = [
     "file_load_facts",

@@ -327,7 +327,7 @@ During execution under a frozen worker plan, Ratio can queue one additional-work
 
 The SQLite WAL journal at `.ratio/runs.sqlite3` stores run state, IPC, tool outcomes, and budgets. An interrupted workspace tool is recorded as having an unknown outcome and requires inspection before relying on its effects. Interrupted IPC, memory, and acknowledgement operations can resume from their checkpoints. Ratio can import legacy format-2 JSON checkpoints and still maintains a format-2 mirror. Keep `.ratio/` private and outside version control because it contains transcripts and workspace data.
 
-Each resumed model request uses the current native tool schemas and access settings. For example, an updated `allow_inspection_shell` takes effect in inspection. For MCP, Ratio opens fresh connections and uses the current server policy. Agents can fetch live schemas with `mcp_list`. If an agent tries a tool before seeing its current schema, Ratio returns the schema and asks the agent to reconsider the call. Service-side handles that lived only in the previous connection may need to be reopened.
+Each resumed model request uses the current native tool schemas and access settings. For example, an updated `allow_inspection_shell` takes effect in inspection. For MCP, Ratio opens fresh connections and uses the current server policy. Resumed agents fetch current schemas with `tool_search` before calling external tools. Service-side handles that lived only in the previous connection may need to be reopened.
 
 ## Context, limits, and automation
 
@@ -388,13 +388,21 @@ Choose one tool policy per stdio MCP server. The policy applies to both discover
 | `allow_all = true` | Every tool on the server |
 | `deny_tools = ["replace_interface"]` | Every tool except the named exclusions |
 
-Tool lists accept any number of entries. `ra --check-mcp project_tools` prints the full permitted catalog and verifies that explicitly allowed names exist. For large catalogs, `mcp_list` returns a page of tool names. Pass the returned `next_offset` as `offset` for the next page. Supply `name` to inspect a single tool's schema.
+Tool lists accept any number of entries. Agents discover MCP tools in three steps.
+
+| Tool | Arguments | Result |
+| --- | --- | --- |
+| `mcp_list` | `server`, optional `offset` | Permitted tool names |
+| `tool_search` | `server`, `query`, optional `offset` | Matching names, descriptions, and input schemas |
+| `mcp_call` | `server`, exact `name`, `arguments` | Tool result |
+
+`tool_search` prefers an exact name, then case-insensitive substrings, then close spellings if there are no substring matches. Pass `next_offset` as `offset` to continue a result set. `ra --check-mcp project_tools` prints the full permitted catalog for the operator and verifies that explicitly allowed names exist.
 
 Set `inspection_tools` to the server tool names reviewers, stakeholders, and workers may discover and call during inspection phases, including before plan acknowledgement. Each name must also be permitted by the server policy. Choose only observational tools for this list. Workers gain access to the full configured policy after passing the write gate. The default `lifetime = "call"` starts a new server process per invocation. Set `lifetime = "worker"` to reuse a server per agent within a phase. A call with an unknown outcome is recorded without automatic replay. Ratio also supports the explicit MCP revision `2026-07-28`.
 
 Optional `instructions` give agents a short workflow in their system prompt during phases where the server is available. Tool access still follows the configured policy.
 
-The [MorphLLM + Assist example](examples/morph-assist.toml) uses `morph-dsv41flash-abliterated` and launches `/Users/int/.idapro/plugins/assist/bin/assist --mcp` over stdio. It sets `allow_all = true` for work and exposes file and database inspection throughout the run. For an unloaded binary, `file_load_facts` takes an absolute `path` and reports format and load evidence directly from the file. Assist controls permission to access the file. For database queries, open the relevant database in IDA. Set `RATIO_API_KEY` to your MorphLLM credential and run these commands from the Ratio checkout.
+The [MorphLLM + Assist example](examples/morph-assist.toml) uses `morph-dsv41flash-abliterated` and launches `assist --mcp` over stdio. Put `assist` on your `PATH` or set `command` to its executable path in a local copy of the profile. The example sets `allow_all = true` for work and exposes file and database inspection throughout the run. For an unloaded binary, `file_load_facts` takes an absolute `path` and reports format and load evidence directly from the file. Assist controls permission to access the file. For database queries, open the relevant database in IDA. Set `RATIO_API_KEY` to your MorphLLM credential and run these commands from the Ratio checkout.
 
 ```sh
 ra --config examples/morph-assist.toml --check-mcp assist

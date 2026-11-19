@@ -97,7 +97,8 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
           firstWork();
           await gate;
           output = completion("Inspect tool metadata and evidence.",
-            call("mcp_list",{server:"fixture"}),call("mcp_call",{server:"fixture",name:"inspect",arguments:{subject:"interface"}}));
+            call("mcp_list",{server:"fixture"}),call("tool_search",{server:"fixture",query:"spe"}),
+            call("mcp_call",{server:"fixture",name:"inspect",arguments:{subject:"interface"}}));
         } else {
           sawGuidance = JSON.stringify(input.messages).includes("Additional interface evidence");
           await workGate;
@@ -209,6 +210,7 @@ tools = ["inspect"]
     await page.locator("#navigation").getByRole("link",{name:"Tools & files"}).click();
     await page.getByRole("link",{name:"MCP",exact:true}).click();
     await page.getByRole("heading",{name:"MCP calls",exact:true}).waitFor();
+    await page.getByRole("link",{name:"fixture / tool_search",exact:true}).waitFor();
     await page.getByRole("searchbox",{name:"Search entries",exact:true}).fill("AuditInteriorMarker");
     await page.getByRole("button",{name:"Apply",exact:true}).click();
     await page.waitForURL(url => url.searchParams.get("q") === "AuditInteriorMarker");
@@ -291,8 +293,8 @@ test("resume after restarting the dashboard preserves the run and refreshes tool
           beforeRestart();
           return;
         }
-        output = completion("Initial inspection.", call("mcp_list", {
-          server: "fixture", name: "inspect",
+        output = completion("Initial inspection.", call("tool_search", {
+          server: "fixture", query: "inspect",
         }, "old-schema"));
       } else if (functions.has("submit_verdict")) {
         output = completion(null, call("submit_verdict", { verdict: "approved", assessment: "Restart verified" }));
@@ -307,19 +309,24 @@ test("resume after restarting the dashboard preserves the run and refreshes tool
         attempts++;
         if (!result("stale-one")) {
           const args = { server: "fixture", name: "inspect", arguments: { old_subject: "stale" } };
-          output = completion(null, call("mcp_call", args, "stale-one"), call("mcp_call", args, "stale-two"));
-        } else if (!result("current")) {
-          for (const id of ["stale-one", "stale-two"]) {
-            assert.match(result(id), /^REFUSED: MCP schema refreshed after restart/);
-            assert.match(result(id), /new_subject/);
-          }
-          output = completion(null,
-            call("mcp_call", { server: "fixture", name: "inspect", arguments: { new_subject: "current" } }, "current"),
-            call("shell", { command: "echo inspection-after-restart" }, "shell-after-restart"));
+          output = completion(null, call("mcp_call", args, "stale-one"),
+            call("tool_search", { server: "fixture", query: "inspect" }, "current-schema"),
+            call("mcp_call", args, "stale-two"));
         } else {
-          assert.match(result("current"), /accepted-current-subject/);
-          assert.match(result("shell-after-restart"), /inspection-after-restart/);
-          output = completion("Continue the original run.");
+          for (const id of ["stale-one", "stale-two"]) {
+            assert.match(result(id), /^REFUSED: Fetch the current schema with tool_search/);
+            assert.doesNotMatch(result(id), /new_subject/);
+          }
+          assert.match(result("current-schema"), /new_subject/);
+          if (!result("current")) {
+            output = completion(null,
+              call("mcp_call", { server: "fixture", name: "inspect", arguments: { new_subject: "current" } }, "current"),
+              call("shell", { command: "echo inspection-after-restart" }, "shell-after-restart"));
+          } else {
+            assert.match(result("current"), /accepted-current-subject/);
+            assert.match(result("shell-after-restart"), /inspection-after-restart/);
+            output = completion("Continue the original run.");
+          }
         }
       }
       response.setHeader("Content-Type", "application/json");

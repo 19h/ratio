@@ -802,7 +802,7 @@ impl<'a> Orchestrator<'a> {
                     tools.output_bytes,
                     dialogue,
                 )),
-                ("mcp_list" | "mcp_call", _) => {
+                ("mcp_list" | "tool_search" | "mcp_call", _) => {
                     crate::tools::mcp::dispatch(
                         &self.mcp,
                         peer.author,
@@ -889,10 +889,10 @@ impl<'a> Orchestrator<'a> {
         if self.config.resume
             && schemas
                 .iter()
-                .any(|schema| schema["function"]["name"] == "mcp_list")
+                .any(|schema| schema["function"]["name"] == "tool_search")
         {
             system.to_mut().push_str(
-                "\nRunner resumed. Fetch current MCP schemas with mcp_list. Reopen external session handles as needed.",
+                "\nRunner resumed. Fetch current MCP schemas with tool_search. Reopen external session handles as needed.",
             );
         }
         if !peer.repairing && matches!(access, Access::Inspect) && tools.allow_inspection_shell {

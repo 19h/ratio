@@ -1752,7 +1752,10 @@ instructions = "Use the work-only server during execution."
                 .find(|schema| schema["function"]["name"] == name)
         };
         assert!(schema("mcp_list").is_some());
+        assert!(schema("tool_search").is_some());
         assert!(schema("mcp_call").is_some());
+        assert!(schema("inspect").is_none());
+        assert!(schema("change").is_none());
         let mcp = |name| tool(name, "mcp_call", json!({"server":"fixture","name":name}));
         let history = request["messages"].to_string();
         let working = system.contains("Phase: execute");
