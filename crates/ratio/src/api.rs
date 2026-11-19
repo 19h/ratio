@@ -293,14 +293,29 @@ impl Api {
                 .filter(|c| !c.is_control())
                 .collect();
             let status = status.as_u16();
-            return if code == "context_length_exceeded"
+            let context_rejection = code == "context_length_exceeded"
                 || status == 413
                 || (matches!(status, 400 | 422)
                     && (lower.contains("maximum context length")
                         || lower.contains("context window")
                         || lower.contains("context length exceeded")
-                        || lower.contains("context size")))
-            {
+                        || lower.contains("context size")));
+            let usage = body
+                .pointer("/usage/prompt_tokens")
+                .and_then(Value::as_u64)
+                .zip(
+                    body.pointer("/usage/completion_tokens")
+                        .and_then(Value::as_u64),
+                );
+            if let Some((prompt, completion)) = usage {
+                self.budget
+                    .reconcile(reserved, prompt.saturating_add(completion))?;
+            } else if status == 429 || context_rejection {
+                // The provider explicitly refused admission. Keep the attempt
+                // charge, but release the token reservation.
+                self.budget.reconcile(reserved, 0)?;
+            }
+            return if context_rejection {
                 Err(ApiError::Context { status, detail })
             } else {
                 Err(ApiError::Status {

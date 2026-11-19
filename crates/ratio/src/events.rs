@@ -78,12 +78,7 @@ impl Reporter {
         match self {
             Self::Silent => {}
             Self::Terminal => {
-                let limit = if matches!(kind, Kind::Output) {
-                    600
-                } else {
-                    24 * 1024
-                };
-                eprintln!("{title}\n{}", clip(&body, limit));
+                eprintln!("{title}\n{}", clip(&body, 24 * 1024));
             }
             Self::Tui(sender) => {
                 let _ = sender.send(Event {

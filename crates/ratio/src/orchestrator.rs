@@ -458,11 +458,10 @@ impl<'a> Orchestrator<'a> {
             schemas.push(plan_schema());
         }
         let window_budget = self.config.context_window - self.config.output_tokens;
-        let default_budget = window_budget - window_budget / 10;
         let mut budget = dialogue
             .estimated_budget
-            .unwrap_or(default_budget)
-            .min(default_budget);
+            .unwrap_or(window_budget)
+            .min(window_budget);
         let mut retries = 0;
         let mut length_repaired = false;
         loop {
@@ -471,7 +470,8 @@ impl<'a> Orchestrator<'a> {
                 model,
                 system,
                 tools: &schemas,
-                input_budget: budget,
+                input_budget: budget - budget / 10,
+                hard_limit: budget,
                 output_tokens: self.config.output_tokens,
             };
             let compacted = compact
@@ -503,7 +503,7 @@ impl<'a> Orchestrator<'a> {
                 .prompt_tokens
                 .filter(|actual| *actual > projected)
             {
-                let calibrated = default_budget.saturating_mul(projected) / actual;
+                let calibrated = window_budget.saturating_mul(projected) / actual;
                 dialogue.estimated_budget = Some(budget.min(calibrated));
             }
             let Message::Assistant {
@@ -1490,8 +1490,24 @@ fn parse_plan(
             .remove(&id)
             .with_context(|| format!("missing ownership for {id}"))?;
         for entry in &mut paths {
-            ensure!(!entry.path.as_os_str().is_empty() && entry.path.components().all(|component| matches!(component, Component::Normal(name) if name != ".git" && name != ".ratio")), "invalid write path {:?}", entry.path);
-            entry.path = entry.path.components().collect();
+            ensure!(
+                entry.path.components().all(|component| match component {
+                    Component::CurDir => true,
+                    Component::Normal(name) => name != ".git" && name != ".ratio",
+                    _ => false,
+                }),
+                "invalid write path {:?}",
+                entry.path
+            );
+            entry.path = entry
+                .path
+                .components()
+                .filter(|component| *component != Component::CurDir)
+                .collect();
+            ensure!(
+                !entry.path.as_os_str().is_empty(),
+                "ownership path must name a file or directory below the workspace"
+            );
             for ancestor in entry
                 .path
                 .ancestors()

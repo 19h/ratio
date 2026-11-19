@@ -229,6 +229,7 @@ fn provider_retry_counts_against_run_budget() {
         1 => {
             let (status, mut response) = text("Plan complete.");
             response["test_terminal"] = json!(true);
+            response["usage"] = json!({"prompt_tokens":17,"completion_tokens":5});
             (status, response)
         }
         _ => panic!("provider request exceeded run budget"),
@@ -240,6 +241,14 @@ fn provider_retry_counts_against_run_budget() {
     );
     assert_eq!(run.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&run.stdout).contains("provider attempts"));
+    let ledger = std::fs::read_dir(temp.path().join(".ratio"))
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("budget-"))
+        .unwrap();
+    let ledger: Value = serde_json::from_slice(&std::fs::read(ledger.path()).unwrap()).unwrap();
+    assert_eq!(ledger["requests"], 2);
+    assert_eq!(ledger["tokens"], 22);
     server.join().unwrap();
 }
 
@@ -623,7 +632,10 @@ fn provider_context_limit_retries_with_compacted_history() {
 
 #[test]
 fn stakeholder_input_reaches_synthesis_and_revision() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix(&"long-workspace-".repeat(7))
+        .tempdir()
+        .unwrap();
     let config = temp.path().join("ratio.toml");
     std::fs::write(
         &config,
@@ -684,7 +696,10 @@ phases = ["planning", "review"]
 
 #[test]
 fn parallel_panel_delivers_bwp_and_reactivates_finished_agents() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix(&"long-workspace-".repeat(7))
+        .tempdir()
+        .unwrap();
     let config = temp.path().join("ratio.toml");
     std::fs::write(
         &config,
@@ -1131,7 +1146,7 @@ persona = "Own worker_3.txt."
                     "plan",
                     "submit_plan",
                     json!({"plan":plan,"ownership":{
-                        "worker_1":[{"path":"worker_1.txt","directory":false}],
+                        "worker_1":[{"path":"./worker_1.txt","directory":false}],
                         "worker_2":[{"path":"worker_2.txt","directory":false}],
                         "worker_3":[{"path":"worker_3.txt","directory":false}]
                     }}),

@@ -139,6 +139,7 @@ pub struct Compact<'a> {
     pub system: &'a str,
     pub tools: &'a [Value],
     pub input_budget: usize,
+    pub hard_limit: usize,
     pub output_tokens: usize,
 }
 
@@ -163,8 +164,8 @@ impl Compact<'_> {
                 })
                 .collect::<Vec<_>>();
             let essential = estimate(&essential, self.tools);
-            if essential >= self.input_budget && !dialogue.peer_context.is_empty() {
-                let mut offset = (essential - self.input_budget + 32)
+            if essential > self.hard_limit && !dialogue.peer_context.is_empty() {
+                let mut offset = (essential - self.hard_limit + 32)
                     .saturating_mul(3)
                     .min(dialogue.peer_context.len());
                 while !dialogue.peer_context.is_char_boundary(offset) {
@@ -177,16 +178,23 @@ impl Compact<'_> {
                 continue;
             }
             ensure!(
-                essential < self.input_budget,
+                essential <= self.hard_limit,
                 "required system prompt, current task and tool schemas exceed the input budget ({essential} estimated tokens, {} available)",
-                self.input_budget
+                self.hard_limit
             );
+            let target = self.input_budget.max(essential);
+            if total <= target || (essential >= self.input_budget && total <= self.hard_limit) {
+                return Ok(compacted);
+            }
             if dialogue.groups.len() <= 1 {
-                self.fit_recent(dialogue, total - self.input_budget)?;
+                if total <= self.hard_limit {
+                    return Ok(compacted);
+                }
+                self.fit_recent(dialogue, total - self.hard_limit)?;
                 continue;
             }
 
-            let desired = total - self.input_budget.saturating_mul(4) / 5;
+            let desired = total - target.saturating_mul(4) / 5;
             let mut selected = 0;
             let mut tokens = 0;
             // Leave the newest exchange intact. Fold older exchanges into the
@@ -218,6 +226,9 @@ impl Compact<'_> {
                 estimate(&dialogue.messages(&new_prefix), self.tools).saturating_sub(tokens);
             if new_total >= total {
                 dialogue.summary = previous;
+                if total <= self.hard_limit {
+                    return Ok(compacted);
+                }
                 anyhow::bail!("compaction could not reduce the projected context");
             }
             dialogue.groups.drain(..selected);

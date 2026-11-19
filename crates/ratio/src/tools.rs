@@ -137,7 +137,8 @@ impl Tools<'_> {
             }
             "list_directory" => {
                 let args: PathArg = serde_json::from_str(arguments)?;
-                self.list(&args.path).await
+                let output = self.list(&args.path).await?;
+                Ok(format!("Untrusted directory listing\n{output}"))
             }
             "git_status" => {
                 let _: Empty = serde_json::from_str(arguments)?;
@@ -241,7 +242,8 @@ impl Tools<'_> {
             "shell" if matches!(self.access, Access::Work) => {
                 let args: Shell = serde_json::from_str(arguments)?;
                 ensure!(!args.command.trim().is_empty(), "shell command is empty");
-                self.run(shell().arg(args.command)).await
+                let output = self.run(shell().arg(args.command)).await?;
+                Ok(format!("Untrusted command output\n{output}"))
             }
             name => anyhow::bail!("tool {name} is unavailable in this role"),
         }
