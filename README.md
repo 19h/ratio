@@ -1,11 +1,14 @@
 # Ratio
 
-Ratio is a local coding-agent harness with a separate lead reviewer. Give it a goal, an OpenAI-compatible endpoint, and a workspace. The reviewer plans the work, workers use local tools, and the reviewer records a typed decision. For larger changes, Ratio can coordinate a team, run independent tasks in parallel, and verify a staged candidate before applying it to the live worktree.
+Ratio is a local coding-agent harness with terminal and web interfaces. Give it a goal, an OpenAI-compatible endpoint, and a workspace. The lead reviewer plans the work, workers use native and stdio MCP tools, and the reviewer records a typed decision. Ratio can coordinate a team, run independent tasks in parallel, and verify a staged candidate before applying it to the live worktree.
 
 ## How a run works
 
 ```text
-  Operator: refine the goal and panel in the TUI, or supply a goal headlessly
+  Request from the CLI, terminal setup, or web dashboard
+                                      |
+                                      v
+               Propose a team, use a configured roster, or run solo
                                       |
                                       v
                        +-----------------------------+
@@ -14,7 +17,7 @@ Ratio is a local coding-agent harness with a separate lead reviewer. Give it a g
                                       |
                     +-----------------+------------------+
                     |                                    |
-            No configured team                    Configured team
+               Solo worker                      Worker roster selected
                     |                                    |
                     |                  +-----------------v----------------+
                     |             +--->| A. Coordinate workers            |
@@ -62,34 +65,35 @@ Ratio is a local coding-agent harness with a separate lead reviewer. Give it a g
 Planning and review panels are optional. The write gate applies when a worker roster is configured. Coordination and acknowledgement expose workspace inspection tools. After the gate opens, workers can create and edit files or run commands. The digest binds the exact plan, roster, cycle, attempt, write ownership, and task graph when present. An objection invalidates the plan and uses another planning attempt. Run budgets can stop execution independently of the verdict.
 
 ```text
-  ra CLI / inline TUI                     Attached TUI / control client
-          |                                            |
-   goal, run, resume                            private local IPC
-          |                                            |
-          +----------------------+---------------------+
-                                 |
-                                 v
-                  +-----------------------------+
-                  | ratio-engine                |<--> Provider SSE / JSON
-                  | Phase machine, request loop |<--> Workspace tools
-                  | Mailbox, context compaction |<--> Staging and verification
-                  +--------------+--------------+
-                                 |
-                      checkpoint transactions
-                                 |
-                                 v
-                  +-----------------------------+
-                  | .ratio/runs.sqlite3 (WAL)    |
-                  | State, budget, IPC, effects  |
-                  +--------------+--------------+
-                                 |
-                         typed run records
-                                 |
-                                 v
-                   Attach / JSONL / metrics / trace
+  Browser <-- loopback HTTP / SSE --> ra --web ------ start / resume / fork ---+
+                                        |                                      |
+  Attached TUI / control CLI -----------+                                      |
+                                        |                                      |
+                                 private local control                         |
+                                        |                                      |
+                                        v                                      v
+  Inline TUI / headless CLI ------> +--------------------------------------------+
+                                    | Active runner / ratio-engine               |
+                                    | Scheduler, mailbox, context compaction     |
+                                    +------+------------------------------+------+
+                                           |                              |
+                     Provider SSE / JSON <-+-> Native tools and stdio MCP |
+                                           +-> Staging and verification   |
+                                                                          |
+                                                             checkpoint transactions
+                                                                          |
+                                                                          v
+                                                       +--------------------------------+
+                                                       | .ratio/runs.sqlite3 (WAL)      |
+                                                       | State, budget, IPC, tool audit |
+                                                       +---------------+----------------+
+                                                                       |
+                                                                   history reads
+                                                                       v
+                                             Web dashboard / attached TUI / CLI exports
 ```
 
-[`ra`](crates/ratio) owns the CLI, terminal UI, and detached process control. [`ratio-engine`](crates/ratio-engine) owns execution and persistence. [`ratio-protocol`](crates/ratio-protocol) defines the task graph, run events, and control messages. An attached TUI reads the journal and sends live controls through the detached process's private local endpoint.
+[`ra`](crates/ratio) owns the CLI, terminal UI, browser dashboard, and process control. [`ratio-engine`](crates/ratio-engine) owns execution and persistence. [`ratio-protocol`](crates/ratio-protocol) defines the task graph, run events, and control messages. The browser dashboard and attached TUI read the journal and send live controls through the active runner's private endpoint.
 
 ## Build and run
 
@@ -106,7 +110,7 @@ ra -C /path/to/project \
   --goal 'Fix the parser regression and verify all supported inputs.'
 ```
 
-For repeat use, save your provider settings in `$XDG_CONFIG_HOME/ratio/config.toml` or `~/.config/ratio/config.toml`. On Windows, use `%APPDATA%\ratio\config.toml`. An explicit `--config` selects a different file. With a provider profile and no configured worker roster, Ratio proposes workers, reviewers, stakeholders, and acceptance criteria, then starts the run.
+For repeat use, save your provider settings in `$XDG_CONFIG_HOME/ratio/config.toml` or `~/.config/ratio/config.toml`. On Windows, use `%APPDATA%\ratio\config.toml`. An explicit `--config` selects a different file. With a provider profile and no configured worker roster, Ratio proposes workers, reviewers, stakeholders, and acceptance criteria. Use `--web` to enter a request in a browser, or supply it directly through the CLI.
 
 ```sh
 ra -C PROJECT 'Implement the solver and verify convergence'
@@ -225,7 +229,7 @@ Staging snapshots tracked edits and unignored untracked files. Worker deltas are
 
 Shell commands and local MCP subprocesses inherit the operator's host permissions. Staged ownership checks cover changes in the staged tree. Shell can act outside that tree or bypass native path ownership in a direct run. Keep the workspace, commands, and local Git configuration within your trust boundary.
 
-## Terminal UI and run history
+## Interfaces and run history
 
 ### Web dashboard
 
@@ -234,20 +238,20 @@ ra -C PROJECT --web
 ra -C PROJECT --config ratio.toml --web --web-port 7350
 ```
 
-Open the private URL printed by Ratio. The dashboard runs on loopback and uses the provider configuration and CLI overrides supplied at startup. Start, resume, or fork a run from the browser, or follow an existing terminal or detached run. Closing the dashboard leaves the runner active.
+Open the private URL printed by Ratio. The dashboard binds to `127.0.0.1` and chooses a free port by default. It uses the provider configuration and CLI overrides supplied at startup. Use **Start run** to enter a request, or select a run from the workspace history. Live controls let you pause, resume, and stop a run. Saved runs can be resumed from their latest checkpoint or forked into a new run. Closing the dashboard leaves its managed runner active.
 
 | View | Use it to |
 | --- | --- |
 | Overview | Inspect the live roster, task dependencies, ownership, acknowledgements, verification, and verdict |
 | Timeline | Search recorded conversations, IPC, tools, phases, and operator actions |
 | Agents | Follow each agent's conversation, file operations, tools, and incoming or outgoing messages |
-| Communication | Follow BWP messages by sequence or agent lane, inspect each recipient's delivery, and search routes |
+| Communication | Switch between message sequence, agent lanes, and the route matrix. Inspect reply links and each recipient's delivery. |
 | Tools & files | Browse MCP and native tools, expand arguments and captured output, and jump to the exact assistant turn |
 | Triage | Submit information for automatic routing, retry failed classification, or track a worker request |
 
 The journal preserves tool invocations and receipts independently of conversation compaction. Expand **Full result** for the captured audit payload and **Model-visible result** for what the model received. Payloads can contain source and command output. Per-tool limits apply within the 8 MiB per-payload ceiling, with omission markers for truncated captures. Older journals expose the messages and tool receipts their checkpoints retained.
 
-Automatic triage uses the lead reviewer to classify and route information within the existing run permissions. The inbox shows the decision, recipients, and delivery receipts. Pending items are marked deferred if the run finishes before delivery. **Add worker** requests a separate, read-only onboarding phase followed by unanimous acknowledgement of the amended plan.
+Automatic triage uses the lead reviewer to classify and route information within the existing run permissions. The inbox shows the decision, recipients, and delivery receipts. Pending items are marked deferred if the run finishes before delivery. **Add worker** requests a separate, read-only onboarding phase followed by unanimous acknowledgement of the amended plan. The worker request links to its onboarding IPC.
 
 To exercise the dashboard with Playwright, build `target/debug/ra`, install Playwright in your test environment, and run `node --test crates/ratio/tests/web_dashboard.mjs`. Set `RATIO_PLAYWRIGHT` to the module path if it is installed outside this workspace.
 
@@ -285,7 +289,7 @@ ra -C PROJECT --config ratio.toml --resume --run-id RUN_ID
 ra -C PROJECT --config ratio.toml --fork RUN_ID --goal 'Evaluate a second approach'
 ```
 
-Foreground headless and detached runs expose control through a private Unix socket or a Windows named pipe restricted to the operator and SYSTEM. The detached launch response provides the combined progress and assessment log path and the run ID when the process is still active. `--events` emits checkpoint records as JSON Lines. `--resume` defaults to the latest run. A fork starts a new conversation and budget from the recorded roster and goal, using the current workspace as its baseline. Supply `--goal` to override the inherited goal.
+Inline, foreground headless, and detached runs expose execution controls through a private Unix socket or a Windows named pipe restricted to the operator and SYSTEM. The detached launch response provides the combined progress and assessment log path and the run ID when the process is still active. `--events` emits checkpoint records as JSON Lines. `--resume` defaults to the latest run. A fork starts a new conversation and budget from the recorded roster and goal, using the current workspace as its baseline. Supply `--goal` to override the inherited goal.
 
 During execution under a frozen worker plan, Ratio can queue one additional-worker request at a time. It finishes pending tool batches, proposes disjoint write paths and a new assignment, and requires read-only BWP exchanges with an incumbent worker and a stakeholder or temporary adviser. Every worker then acknowledges the amended plan ID before execution resumes. A declined request returns the incumbent team to its existing plan. The Workflow pane records the result.
 
@@ -365,14 +369,15 @@ Choose one tool policy per stdio MCP server. The policy applies to both discover
 | `allow_all = true` | Every tool on the server |
 | `deny_tools = ["replace_interface"]` | Every tool except the named exclusions |
 
-Tool lists accept any number of entries. `ra --check-mcp project_tools` prints the full permitted catalog and verifies that explicitly allowed names exist. For large catalogs, `mcp_list` returns a page of tool names and a `next_offset` for the next call. Supply `name` to inspect a single tool's schema.
+Tool lists accept any number of entries. `ra --check-mcp project_tools` prints the full permitted catalog and verifies that explicitly allowed names exist. For large catalogs, `mcp_list` returns a page of tool names. Pass the returned `next_offset` as `offset` for the next page. Supply `name` to inspect a single tool's schema.
 
 Workers gain access after the write gate. The default `lifetime = "call"` starts a new server process per invocation. Set `lifetime = "worker"` to reuse a server for a worker during execution. A call with an unknown outcome is recorded without automatic replay. Ratio also supports the explicit MCP revision `2026-07-28`.
 
-The [MorphLLM + Assist example](examples/morph-assist.toml) uses DeepSeek V4.1 Flash Abliterated and starts the installed `assist --mcp` executable over stdio. Open a database in IDA and set `RATIO_API_KEY` to your MorphLLM credential before starting the run.
+The [MorphLLM + Assist example](examples/morph-assist.toml) uses `morph-dsv41flash-abliterated` and launches `/Users/int/.idapro/plugins/assist/bin/assist --mcp` over stdio. It sets `allow_all = true` and reuses an Assist process per worker. Open a database in IDA and set `RATIO_API_KEY` to your MorphLLM credential before starting the run. Run these commands from the Ratio checkout.
 
 ```sh
 ra --config examples/morph-assist.toml --check-mcp assist
+ra -C PROJECT --config examples/morph-assist.toml --web
 ra -C PROJECT --config examples/morph-assist.toml --fixed-team \
   'Use Assist to identify the open IDA database and summarize its segments and imports.'
 ```
