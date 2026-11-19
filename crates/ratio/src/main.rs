@@ -34,7 +34,13 @@ async fn main() -> ExitCode {
 async fn run() -> Result<u8> {
     let mut cli = Cli::parse();
     if cli.web {
-        return web::serve(Config::history_workspace(&cli)?, cli.web_port).await;
+        return web::serve(
+            Config::history_workspace(&cli)?,
+            cli.web_port,
+            cli.web_share_port,
+            cli.web_share_origin.as_deref(),
+        )
+        .await;
     }
     if cli.goal_stdin {
         let mut request = String::new();

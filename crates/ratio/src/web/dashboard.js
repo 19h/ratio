@@ -2,12 +2,17 @@
 
 const $ = (selector, scope = document) => scope.querySelector(selector);
 const main = $("#content");
-const launch = new URLSearchParams(location.hash.slice(1)).get("access");
+const readOnly = document.body.hasAttribute("data-read-only");
+const sharingEnabled = document.body.hasAttribute("data-sharing");
+const shareRunId = readOnly ? route().run : undefined;
+const tokenKey = readOnly ? "ratio-share:" + shareRunId : "ratio-access";
+const launch = new URLSearchParams(location.hash.slice(1)).get(readOnly ? "share" : "access");
 if (launch && /^[a-f0-9]{64}$/.test(launch)) {
-  sessionStorage.setItem("ratio-access", launch);
+  sessionStorage.setItem(tokenKey, launch);
   history.replaceState(null, "", location.pathname + location.search);
 }
-const token = sessionStorage.getItem("ratio-access");
+const token = sessionStorage.getItem(tokenKey);
+$("#share-mode").hidden = !readOnly;
 const views = {
   overview: "Overview", history: "Timeline", agents: "Agents",
   ipc: "Communication", tools: "Tools & files", triage: "Triage",
@@ -122,7 +127,9 @@ async function api(path, options = {}) {
   const response = await fetch(path, { ...options, headers: { Authorization: "Bearer " + (token ?? ""), ...options.headers } });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.error ?? `Request failed (${response.status})`);
+    const error = new Error(payload.error ?? `Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -168,10 +175,10 @@ function renderNavigation() {
         task ? node("small", { class: "task-state", "data-state": task.state }, title(task.state)) : null))],
     runUrl("agent/" + encodeURIComponent(agent.id)), { "aria-current": state.route.actor === agent.id ? "page" : undefined });
   }));
-  const here = !selected ? "Runs" : current === "agent" ? actorName(state.route.actor)
+  const here = !selected ? readOnly ? "Shared run" : "Runs" : current === "agent" ? actorName(state.route.actor)
     : current === "archive" ? "Checkpoint archive" : views[current] ?? "Run";
   const slash = () => node("span", { class: "slash", "aria-hidden": "true" }, "/");
-  fill($("#breadcrumb"), link(node("strong", {}, "ratio"), "/"), slash(),
+  fill($("#breadcrumb"), link(node("strong", {}, "ratio"), readOnly ? runUrl("overview") : "/"), slash(),
     selected ? [link(node("strong", {}, selected.slice(-10)), runUrl("overview"), { title: "Run " + selected }), slash()] : null,
     node("strong", { class: "here" }, here));
   $("#global-search").hidden = !selected;
@@ -186,9 +193,9 @@ function renderLive() {
   connection.dataset.state = status;
   $("span", connection).textContent = state.live
     ? state.live.paused ? "Paused" : `Live · ${state.live.generations?.length ?? 0} generating`
-    : state.route.run ? "Recorded run" : "Local workspace";
+    : state.route.run ? "Recorded run" : readOnly ? "Shared run" : "Local workspace";
   const controls = $("#controls");
-  const actions = state.live ? [
+  const actions = readOnly ? [] : state.live ? [
     button("Add worker", () => openAction("add_worker"), { disabled: state.summary?.run?.phase !== "Work" }),
     button(state.live.paused ? "Resume" : "Pause", () => sendAction(state.live.paused ? "resume" : "pause").catch(captureError)),
     button("Stop", () => openAction("stop"), { class: "danger" }),
@@ -198,10 +205,14 @@ function renderLive() {
     }),
     button("Fork", () => openAction("fork")),
   ] : [];
-  if (controls.dataset.mode !== status || controls.dataset.phase !== state.summary?.run?.phase) {
+  const phase = state.summary?.run?.phase ?? "";
+  const currentRun = state.route.run ?? "";
+  if (controls.dataset.mode !== status || controls.dataset.phase !== phase || controls.dataset.run !== currentRun) {
+    if (!readOnly && sharingEnabled && state.summary) actions.push(button("Share", () => openShare().catch(captureError)));
     fill(controls, actions);
     controls.dataset.mode = status;
-    controls.dataset.phase = state.summary?.run?.phase ?? "";
+    controls.dataset.phase = phase;
+    controls.dataset.run = currentRun;
   }
   for (const card of document.querySelectorAll("[data-preview-actor]")) {
     const active = generation(card.dataset.previewActor);
@@ -486,7 +497,11 @@ function inspector(detail, close) {
   }
   return node("aside", { class: "inspector", "aria-label": "Inspector", "data-scroll": "inspector" },
     node("header", { class: "bar" }, node("h2", {}, hush("[ "), event.kind === "ipc" ? "Message inspector" : "Inspector", hush(" ]")), spacer(),
-      close ? [button("Copy link", () => navigator.clipboard.writeText(location.href).catch(captureError)),
+      close ? [button("Copy link", () => {
+        const url = new URL(location.href);
+        if (readOnly) url.hash = "share=" + token;
+        navigator.clipboard.writeText(url.href).catch(captureError);
+      }),
         go("×", close, { "aria-label": "Close selection", title: "Close selection" })] : node("span", { class: "muted" }, "latest")),
     rows);
 }
@@ -539,9 +554,8 @@ function sequence(items, query, focus) {
   for (const item of items) for (const status of item.to.values()) tally[status] += 1;
   const lanes = (...content) => node("span", { class: "seq-lanes", "aria-hidden": "true" }, content);
   const diagram = node("div", { class: "seq" },
-    node("div", { class: "seq-head" }, node("span", {}, "Message"), node("span"),
-      lanes(ids.map((id, index) => place(node("span", { class: "alias", "data-role": role(id), title: actorName(id) }, alias(id)), `${index * 2 + 1} / span 2`))),
-      node("span")),
+    node("div", { class: "seq-head" }, node("span", {}, "Message"),
+      lanes(ids.map((id, index) => place(node("span", { class: "alias", "data-role": role(id), title: actorName(id) }, alias(id)), `${index * 2 + 1} / span 2`)))),
     items.map(item => {
       const { event } = item;
       const from = ids.indexOf(event.actor);
@@ -559,8 +573,7 @@ function sequence(items, query, focus) {
         "aria-label": `Message ${event.sequence} from ${actorName(event.actor)} to ${[...item.to].map(([id, status]) => `${actorName(id)} (${status})`).join(", ")}`,
       });
     }));
-  diagram.style.setProperty("--lanes", ids.length);
-  return section({ label: "Message sequence", meta: `${ids.length} participants | ${items.length} messages`, flush: true },
+  const panel = section({ label: "Message sequence", meta: `${ids.length} participants | ${items.length} messages`, flush: true },
     node("div", { class: "seq-summary" },
       node("span", { "data-state": "delivered" }, mark("delivered"), `${tally.delivered} delivered`),
       node("span", { "data-state": "queued" }, mark("queued"), `${tally.queued} queued`),
@@ -570,6 +583,9 @@ function sequence(items, query, focus) {
       node("span", {}, mark("queued"), "queued"), node("span", {}, mark("dropped"), "dropped"),
       node("span", {}, node("i", { class: "wire fan" }), "fan-out"), spacer(),
       node("span", {}, node("kbd", {}, "↑/↓"), "select")));
+  panel.classList.add("seq-panel");
+  panel.style.setProperty("--lanes", ids.length);
+  return panel;
 }
 
 function messageInspector(detail) {
@@ -658,8 +674,10 @@ async function triageView(route) {
   const [inbox, admissions] = await Promise.all([api(apiRun("inbox", { before: query.inbox_before })), api(apiRun("admissions"))]);
   const working = state.live && state.summary.run.phase === "Work";
   return view(heading("Triage", null,
-    button("Submit information", () => openAction("triage"), { class: "primary", disabled: !state.live }),
-    button("Request worker", () => openAction("add_worker"), { disabled: !working })), [
+    !readOnly ? [
+      button("Submit information", () => openAction("triage"), { class: "primary", disabled: !state.live }),
+      button("Request worker", () => openAction("add_worker"), { disabled: !working }),
+    ] : null), [
     workflow?.worker_addition ? section("Worker admission", node("p", {}, workflow.worker_addition),
       plan?.id ? row(caption("Amended plan"), code(plan.id)) : null,
       workflow.active_worker_request ? go("Open onboarding IPC", runUrl("ipc", { phase: "OnboardWorker", worker_request: workflow.active_worker_request })) : null,
@@ -669,7 +687,7 @@ async function triageView(route) {
         [node("div", {}, code(`#${item.id}`), pre(item.request), item.detail ? muted(item.detail) : null), pill(item.state),
           item.plan?.id ? node("details", {}, node("summary", {}, code(item.plan.id)), pre(JSON.stringify(item.plan.ownership, null, 2))) : "—",
           go("Onboarding IPC", runUrl("ipc", { phase: "OnboardWorker", worker_request: item.id }))]))
-      : empty("No worker has been requested. Request one while the run is in the work phase.")),
+      : empty(readOnly ? "No worker has been requested." : "No worker has been requested. Request one while the run is in the work phase.")),
     section({ label: "Information inbox", meta: inbox.rows.length || null, flush: true },
       inbox.rows.map(item => node("article", { class: `entry${Number(query.item) === item.id ? " selected" : ""}`, id: `inbox-${item.id}` },
         node("header", {}, time(item.submitted_ms), code(`#${item.id}`), pill(item.state)),
@@ -678,11 +696,11 @@ async function triageView(route) {
           item.decision?.recipients?.length ? row(caption("Route"), item.decision.recipients.map(id => actorLink(id))) : null,
           item.delivered?.length ? row(caption("Delivered to"), item.delivered.map(id => actorLink(id))) : null,
           item.decision?.worker_recommendation ? row(muted(item.decision.worker_recommendation),
-            button("Use in worker request", () => openAction("add_worker", item.decision.worker_recommendation), { disabled: !working })) : null,
-          item.state === "failed" ? row(button("Retry triage", () => sendAction("retry_triage", String(item.id)).catch(captureError), { disabled: !state.live })) : null),
+            !readOnly ? button("Use in worker request", () => openAction("add_worker", item.decision.worker_recommendation), { disabled: !working }) : null) : null,
+          !readOnly && item.state === "failed" ? row(button("Retry triage", () => sendAction("retry_triage", String(item.id)).catch(captureError), { disabled: !state.live })) : null),
         node("footer", {}, item.decision?.category ? tag(item.decision.category, "category") : null,
           item.decision?.priority ? tag(item.decision.priority, "priority") : null))),
-      !inbox.rows.length ? empty("Nothing submitted yet. Submit information and the lead reviewer routes it to the right agents.") : null,
+      !inbox.rows.length ? empty(readOnly ? "Nothing submitted yet." : "Nothing submitted yet. Submit information and the lead reviewer routes it to the right agents.") : null,
       inbox.rows.length >= 60 ? pagination("Inbox pagination", link("Older information", runUrl("triage", { inbox_before: inbox.rows.at(-1).id }))) : null),
   ]);
 }
@@ -733,8 +751,10 @@ async function historyView(route) {
           { "aria-current": (query.direction ?? "all") === direction ? "page" : undefined }))));
   } else if (page === "history") {
     head.push(heading("Timeline", historyData.legacy ? "Recoverable checkpoint entries. Coverage depends on what the older run retained." : null,
-      go("Checkpoint archive", runUrl("archive")),
-      go(query.legacy ? "Audit timeline" : "Recoverable checkpoint entries", runUrl("history", { legacy: query.legacy ? undefined : 1 })),
+      !readOnly ? [
+        go("Checkpoint archive", runUrl("archive")),
+        go(query.legacy ? "Audit timeline" : "Recoverable checkpoint entries", runUrl("history", { legacy: query.legacy ? undefined : 1 })),
+      ] : null,
       state.live ? button(state.follow ? "Live follow" : "Follow paused", () => {
         state.follow = !state.follow;
         load(false);
@@ -791,7 +811,7 @@ async function archive(route) {
 }
 
 function hasPageInteraction() {
-  return $("#action-dialog").open || main.contains(document.activeElement) || $("details[open]", main);
+  return $("#action-dialog").open || $("#share-dialog").open || main.contains(document.activeElement) || $("details[open]", main);
 }
 
 async function load(restart = true, preserveInteraction = false) {
@@ -809,7 +829,7 @@ async function load(restart = true, preserveInteraction = false) {
   main.setAttribute("aria-busy", "true");
   try {
     const [runs, summary, live] = await Promise.all([
-      api("/api/runs"),
+      readOnly ? { runs: [] } : api("/api/runs"),
       wanted.run ? api(apiRun("overview")) : null,
       wanted.run ? api(apiRun("live")).catch(() => null) : null,
     ]);
@@ -820,7 +840,8 @@ async function load(restart = true, preserveInteraction = false) {
     state.live = live;
     if (restart || navigationChanged || !wanted.run) renderNavigation();
     else renderLive();
-    const nodes = !wanted.run ? workspace() : wanted.page === "overview" ? overview()
+    const nodes = !wanted.run ? readOnly ? view(heading("Shared run"), muted("Open a run’s share link.")) : workspace()
+      : wanted.page === "overview" ? overview()
       : wanted.page === "agents" ? agentsView()
         : wanted.page === "archive" ? await archive(wanted) : await historyView(wanted);
     if (version !== state.version) return;
@@ -848,7 +869,7 @@ async function load(restart = true, preserveInteraction = false) {
     }
     if (wanted.run && !state.stream) connect(wanted.run, summary);
   } catch (error) {
-    if (version === state.version) fill(main, view(heading("Run unavailable"), section("Connection", muted(error.message), go("Workspace runs", "/"))));
+    if (version === state.version) fill(main, view(heading("Run unavailable"), section("Connection", muted(error.message), !readOnly ? go("Workspace runs", "/") : null)));
   } finally {
     if (version === state.version) {
       main.inert = false;
@@ -866,6 +887,10 @@ async function connect(run, summary) {
     try {
       const stream = await fetch(`/api/run/${encodeURIComponent(run)}/stream?checkpoint=${checkpoint}&after=${after}`,
         { headers: { Authorization: "Bearer " + token }, signal: controller.signal });
+      if (stream.status >= 500) {
+        await stream.body?.cancel();
+        throw new Error(`Live stream unavailable (${stream.status})`);
+      }
       if (!stream.ok || !stream.body) break;
       const reader = stream.body.pipeThrough(new TextDecoderStream()).getReader();
       let pending = "";
@@ -914,6 +939,7 @@ const descriptions = {
 };
 
 function openAction(name, initial = "") {
+  if (readOnly) return;
   const [label, hint, field, required] = descriptions[name];
   actionState = { name, run: state.route.run, id: crypto.randomUUID() };
   $("#action-title").textContent = label;
@@ -933,13 +959,72 @@ function openAction(name, initial = "") {
   (field ? input : $("#submit-action")).focus();
 }
 
-async function sendAction(action, text, run = state.route.run, id = crypto.randomUUID()) {
-  const receipt = await api("/api/action", { method: "POST", headers: { "Content-Type": "application/json" },
+function postAction(action, text, run = state.route.run, id = crypto.randomUUID()) {
+  return api("/api/action", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action, text, run, id }) });
+}
+
+async function sendAction(action, text, run = state.route.run, id = crypto.randomUUID()) {
+  if (readOnly) return;
+  const receipt = await postAction(action, text, run, id);
   notify(receipt.detail);
   if (receipt.run_id && receipt.run_id !== state.route.run) navigate(runUrl("overview", {}, receipt.run_id));
   else load(false);
 }
+
+let shareTarget;
+function showShareState({ active, url }) {
+  $("#share-state").textContent = url
+    ? "Copy this link before closing the dialog."
+    : active ? "A link is active. Replacing it invalidates the previous link." : "No active link.";
+  $("#share-link").hidden = !url;
+  $("#share-url").value = url ?? "";
+  $("#revoke-share").hidden = !active;
+  $("#create-share").textContent = active ? "Replace link" : "Create link";
+}
+
+async function openShare() {
+  const run = state.route.run;
+  const status = await api(apiRun("share"));
+  if (state.route.run !== run || $("#share-dialog").open) return;
+  shareTarget = run;
+  $("#share-error").hidden = true;
+  showShareState(status);
+  $("#share-dialog").showModal();
+}
+
+async function updateShare(action) {
+  const run = shareTarget;
+  const controls = [$("#create-share"), $("#revoke-share"), $("#close-share")];
+  for (const control of controls) control.disabled = true;
+  const errorLine = $("#share-error");
+  errorLine.hidden = true;
+  try {
+    showShareState(await postAction(action, undefined, run));
+  } catch (error) {
+    errorLine.textContent = error.message;
+    errorLine.hidden = false;
+  } finally {
+    for (const control of controls) control.disabled = false;
+  }
+}
+
+$("#close-share").addEventListener("click", () => $("#share-dialog").close());
+$("#share-dialog").addEventListener("cancel", event => {
+  if ($("#close-share").disabled) event.preventDefault();
+});
+$("#create-share").addEventListener("click", () => updateShare("create_share"));
+$("#revoke-share").addEventListener("click", () => updateShare("revoke_share"));
+$("#copy-share").addEventListener("click", async () => {
+  const input = $("#share-url");
+  input.select();
+  try {
+    await navigator.clipboard.writeText(input.value);
+    $("#share-state").textContent = "Link copied. Replacing it invalidates the previous link.";
+  } catch {
+    $("#share-state").textContent = "Copy the selected link.";
+  }
+});
 
 document.addEventListener("click", event => {
   if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -978,7 +1063,7 @@ $("#action-form").addEventListener("submit", async event => {
   } finally { submit.disabled = false; }
 });
 document.addEventListener("keydown", event => {
-  if ($("#action-dialog").open || event.metaKey || event.ctrlKey || event.altKey
+  if ($("#action-dialog").open || $("#share-dialog").open || event.metaKey || event.ctrlKey || event.altKey
     || event.target.matches?.("input, textarea, select") || !state.route.run) return;
   const page = Object.keys(views)[Number(event.key) - 1];
   const messages = [...document.querySelectorAll(".seq-row")];
@@ -998,7 +1083,7 @@ async function pollLive() {
   const run = state.route.run;
   const version = state.version;
   try {
-    if (!run) return;
+    if (!run || (readOnly && !state.summary)) return;
     const live = await api(apiRun("live"));
     if (version !== state.version) return;
     if (!live && state.live?.token_usage) {
@@ -1013,10 +1098,20 @@ async function pollLive() {
       lastTriageRefresh = performance.now();
     }
     refreshLivePage();
-  } catch {
-    // A disconnected dashboard can resume on its next poll.
+  } catch (error) {
+    if (readOnly && error.status === 401 && version === state.version) {
+      state.version++;
+      state.stream?.abort();
+      state.stream = null;
+      state.summary = null;
+      state.live = null;
+      renderNavigation();
+      fill(main, view(heading("Share unavailable"), section("Access", muted(error.message))));
+      main.inert = false;
+      main.setAttribute("aria-busy", "false");
+    }
   } finally {
-    setTimeout(pollLive, state.live?.generations?.length ? 180 : 1000);
+    setTimeout(pollLive, readOnly ? 1500 : state.live?.generations?.length ? 180 : 1000);
   }
 }
 

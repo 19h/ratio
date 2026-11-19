@@ -142,7 +142,7 @@ command = ${JSON.stringify(process.execPath)}
 args = ["-e", ${JSON.stringify(mcp)}]
 tools = ["inspect"]
 `);
-  const child = spawn(bin,["-C",dir,"--config",profile,"--web","--web-port=0","--model","browser-cli-model"],{stdio:["ignore","pipe","pipe"]});
+  const child = spawn(bin,["-C",dir,"--config",profile,"--web","--web-port=0","--web-share-port=0","--model","browser-cli-model"],{stdio:["ignore","pipe","pipe"]});
   let errors = "";
   child.stderr.on("data",data => { errors += data; });
   const lines = createInterface({input:child.stdout});
@@ -210,6 +210,70 @@ tools = ["inspect"]
     assert.ok(update.cursor > 0);
     assert.ok(update.events.some(event => event.kind === "phase"));
     await events.cancel();
+    await page.getByRole("button", { name: "Share", exact: true }).click();
+    await page.getByRole("button", { name: "Create link", exact: true }).click();
+    await page.locator("#share-url").waitFor();
+    const shared = new URL(await page.locator("#share-url").inputValue());
+    const shareToken = url => new URLSearchParams(url.hash.slice(1)).get("share");
+    assert.notEqual(shared.origin, address.origin);
+    assert.match(shareToken(shared), /^[a-f0-9]{64}$/);
+    const publicPath = `/api/run/${run}`;
+    const publicRead = (path, credential = shareToken(shared)) => fetch(new URL(path, shared), {
+      headers: { Authorization: "Bearer " + credential }, signal: AbortSignal.timeout(5000),
+    });
+    assert.equal((await publicRead(publicPath + "/overview")).status, 200);
+    const sharedLive = await (await publicRead(publicPath + "/live")).json();
+    assert.deepEqual(Object.keys(sharedLive).sort(), ["generations", "paused", "token_usage"]);
+    assert.equal((await publicRead(publicPath + "/overview", token)).status, 401);
+    assert.equal((await publicRead("/api/run/1-2/overview")).status, 401);
+    for (const path of ["/api/runs", "/api/action", publicPath + "/share", publicPath + "/checkpoint",
+      publicPath + "/history?legacy=1", publicPath + "/entry/legacy-1"]) {
+      assert.equal((await publicRead(path)).status, 403, path);
+    }
+    assert.equal((await fetch(address.origin + publicPath + "/overview", {
+      headers: { Authorization: "Bearer " + shareToken(shared) },
+    })).status, 401);
+    for (const credential of [shareToken(shared), token]) {
+      for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+        const control = await fetch(new URL("/api/action", shared), {
+          method,
+          headers: { Authorization: "Bearer " + credential, Origin: shared.origin, "Content-Type": "application/json" },
+          body: JSON.stringify({ id: "forbidden", action: "pause", run }),
+        });
+        assert.equal(control.status, 403, method);
+      }
+    }
+    const visitor = await browser.newPage();
+    visitor.setDefaultTimeout(10_000);
+    await visitor.goto(shared.href);
+    await visitor.getByRole("heading", { name: "Run overview" }).waitFor();
+    assert.equal(new URL(visitor.url()).hash, "");
+    await visitor.getByText("Read only", { exact: true }).waitFor();
+    assert.equal(await visitor.locator("#new-run").isVisible(), false);
+    assert.equal(await visitor.locator("#controls button").count(), 0);
+    await visitor.locator("#navigation").getByRole("link", { name: "Timeline" }).click();
+    await visitor.getByRole("heading", { name: "Timeline" }).waitFor();
+    assert.equal(await visitor.getByRole("link", { name: "Checkpoint archive" }).count(), 0);
+    await visitor.locator("#navigation").getByRole("link", { name: "Triage" }).click();
+    await visitor.getByRole("heading", { name: "Triage" }).waitFor();
+    assert.equal(await visitor.getByRole("button", { name: /Submit information|Request worker|Retry triage/ }).count(), 0);
+    const streamBeforeRotation = await publicRead(publicPath + "/stream");
+    assert.equal(streamBeforeRotation.status, 200);
+    const publicEvents = streamBeforeRotation.body.getReader();
+    assert.equal((await publicEvents.read()).done, false);
+    await page.getByRole("button", { name: "Replace link", exact: true }).click();
+    await page.waitForFunction(previous => document.querySelector("#share-url").value !== previous, shared.href);
+    const replacement = new URL(await page.locator("#share-url").inputValue());
+    assert.notEqual(shareToken(replacement), shareToken(shared));
+    assert.equal((await publicRead(publicPath + "/overview")).status, 401);
+    assert.equal((await publicRead(publicPath + "/overview", shareToken(replacement))).status, 200);
+    while (!(await publicEvents.read()).done) {}
+    await visitor.getByRole("heading", { name: "Share unavailable" }).waitFor();
+    await visitor.close();
+    await page.getByRole("button", { name: "Revoke link", exact: true }).click();
+    await page.getByText("No active link.", { exact: true }).waitFor();
+    assert.equal((await publicRead(publicPath + "/overview", shareToken(replacement))).status, 401);
+    await page.getByRole("button", { name: "Close", exact: true }).click();
     await page.locator("#navigation").getByRole("link",{name:"Triage"}).click();
     await page.getByRole("button",{name:"Submit information"}).click();
     await page.getByLabel("Information",{exact:true}).fill("Additional interface evidence");
@@ -235,6 +299,47 @@ tools = ["inspect"]
     assert.deepEqual(sequenceIds, [...sequenceIds].sort((a, b) => b - a));
     assert.equal(await page.locator(".seq-row:first-of-type.selected").count(), 1);
     assert.equal(await page.locator(".view-scroll").evaluate(element => element.scrollTop), 0);
+    const sequencePage = await browser.newPage({ viewport: { width: 1500, height: 900 } });
+    await sequencePage.route(`**/api/run/${run}/overview`, async route => {
+      const response = await route.fetch();
+      const summary = await response.json();
+      const agents = summary.event.workflow.agents;
+      while (agents.length < 14) {
+        const id = `stakeholder_${agents.length}`;
+        agents.push({ id, name: id });
+      }
+      await route.fulfill({ response, json: summary });
+    });
+    const sequenceUrl = new URL(page.url());
+    sequenceUrl.hash = address.hash;
+    await sequencePage.goto(sequenceUrl.href);
+    const diagram = sequencePage.locator(".seq-panel");
+    await diagram.locator(".seq-head .alias").nth(13).waitFor();
+    await sequencePage.locator(".inspector").waitFor();
+    for (const [width, shouldScroll] of [[1500, false], [1100, true], [480, true]]) {
+      await sequencePage.setViewportSize({ width, height: 900 });
+      const layout = await diagram.evaluate(panel => {
+        const scroll = panel.parentElement;
+        const row = panel.querySelector(".seq-row");
+        const lanes = row.querySelector(".seq-lanes");
+        const lastAlias = panel.querySelector(".seq-head .alias:last-child");
+        const overflows = scroll.scrollWidth > scroll.clientWidth;
+        scroll.scrollLeft = scroll.scrollWidth;
+        const viewport = scroll.getBoundingClientRect();
+        return {
+          overflows,
+          lastLaneVisible: lastAlias.getBoundingClientRect().right <= viewport.right + 1,
+          lanesWithinRow: lanes.getBoundingClientRect().right <= row.getBoundingClientRect().right,
+          headerMatchesRow: panel.querySelector(".seq-head").clientWidth === row.clientWidth,
+          controlsVisible: [...panel.querySelectorAll(".panel-head, .seq-summary, .seq-legend")].every(element =>
+            element.getBoundingClientRect().left >= viewport.left - 1),
+        };
+      });
+      assert.deepEqual(layout, {
+        overflows: shouldScroll, lastLaneVisible: true, lanesWithinRow: true, headerMatchesRow: true, controlsVisible: true,
+      }, `Sequence geometry at ${width}px`);
+    }
+    await sequencePage.close();
     await page.keyboard.press("ArrowDown");
     await page.waitForURL(url => url.searchParams.has("entry"));
     await page.locator(".inspector").getByRole("link",{name:"Close selection"}).waitFor();
@@ -480,8 +585,8 @@ inspection_tools = ["inspect"]
 instructions = "${updated ? "Current" : "Initial"} fixture instructions."
 `);
   };
-  const launch = async () => {
-    const child = spawn(bin, ["-C", dir, "--config", profile, "--fixed-team", "--web"],
+  const launch = async (sharePort = 0) => {
+    const child = spawn(bin, ["-C", dir, "--config", profile, "--fixed-team", "--web", `--web-share-port=${sharePort}`],
       { stdio: ["ignore", "pipe", "pipe"] });
     dashboards.push(child);
     let errors = "";
@@ -510,6 +615,8 @@ instructions = "${updated ? "Current" : "Initial"} fixture instructions."
     activeRun = launched.run_id;
     assert.ok(activeRun);
     await ready;
+    const shared = await api(first, "/api/action", { id: "share", action: "create_share", run: activeRun });
+    const shareUrl = new URL(shared.url);
     const previous = await api(first, `/api/run/${activeRun}/live`);
     await api(first, "/api/action", { id: "pause", action: "pause", run: activeRun });
     const exited = once(dashboards[0], "exit");
@@ -517,11 +624,27 @@ instructions = "${updated ? "Current" : "Initial"} fixture instructions."
     await exited;
     updated = true;
     await writeProfile();
-    const second = await launch();
+    const second = await launch(shareUrl.port);
+    const sharing = await api(second, `/api/run/${activeRun}/share`);
+    assert.equal(sharing.active, true);
+    assert.equal(sharing.origin, shareUrl.origin);
     const paused = await api(second, `/api/run/${activeRun}/live`);
     assert.equal(paused.paused, true);
     assert.equal(paused.pid, previous.pid);
     browser = await chromium.launch();
+    const visitor = await browser.newPage();
+    let streamRequests = 0;
+    await visitor.route("**/stream?*", route => {
+      return ++streamRequests === 1 ? route.fulfill({ status: 502 }) : route.continue();
+    });
+    await Promise.all([
+      visitor.waitForResponse(response => response.url().includes("/stream?") && response.ok(), { timeout: 5_000 }),
+      visitor.goto(shareUrl.href),
+    ]);
+    await visitor.getByRole("heading", { name: "Run overview" }).waitFor({ timeout: 10_000 });
+    await visitor.getByText("Read only", { exact: true }).waitFor();
+    assert.equal(streamRequests, 2);
+    await visitor.close();
     const page = await browser.newPage();
     page.setDefaultTimeout(10_000);
     const target = new URL(`/run/${activeRun}/overview`, second);

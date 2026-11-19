@@ -648,6 +648,11 @@ impl Store {
         RunReader::open(&workspace.join(".ratio/runs.sqlite3")).context("open Ratio run history")
     }
 
+    pub fn set_web_share(workspace: &Path, run: &str, digest: Option<&[u8]>) -> Result<()> {
+        Journal::set_web_share(&workspace.join(".ratio/runs.sqlite3"), run, digest)
+            .context("save Ratio web share")
+    }
+
     pub(crate) fn budget_path(&self, session: &Session) -> Result<PathBuf> {
         ensure!(
             !session.run_id.is_empty()

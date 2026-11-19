@@ -20,6 +20,12 @@ pub struct Cli {
     /// Loopback port for --web. Zero selects a free port.
     #[arg(long, requires = "web", default_value_t = 0)]
     pub web_port: u16,
+    /// Enable a separate, read-only loopback listener for shared runs. Zero selects a free port.
+    #[arg(long, requires = "web")]
+    pub web_share_port: Option<u16>,
+    /// Public HTTPS origin used in share links, such as https://ratio.example.ts.net.
+    #[arg(long, requires = "web_share_port")]
+    pub web_share_origin: Option<String>,
     /// Request to plan and implement.
     #[arg(short, long, conflicts_with_all = ["request", "goal_stdin"])]
     pub goal: Option<String>,

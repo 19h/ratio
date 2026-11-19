@@ -32,6 +32,7 @@ use ratio_engine::{
     session::Store,
 };
 use ratio_protocol::{ControlAction, ControlReply, ControlRequest};
+use ring::digest::{SHA256, digest};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
@@ -73,50 +74,123 @@ struct Dashboard {
     launch_args: Vec<OsString>,
     host: String,
     authorization: String,
+    share: Option<ShareSite>,
     actions: Mutex<VecDeque<(String, Value)>>,
     runner_pid: AtomicU32,
 }
 
-pub async fn serve(workspace: PathBuf, port: u16) -> Result<u8> {
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
-    let host = listener.local_addr()?.to_string();
+struct ShareSite {
+    loopback: String,
+    host: String,
+    origin: String,
+}
+
+impl ShareSite {
+    fn new(loopback: String, public_origin: Option<&str>) -> Result<Self> {
+        let Some(origin) = public_origin else {
+            return Ok(Self {
+                origin: format!("http://{loopback}"),
+                host: loopback.clone(),
+                loopback,
+            });
+        };
+        let url = url::Url::parse(origin).context("Invalid --web-share-origin")?;
+        ensure!(
+            url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "--web-share-origin must be an HTTPS origin without a path, credentials, query, or fragment"
+        );
+        Ok(Self {
+            loopback,
+            host: url[url::Position::BeforeHost..url::Position::AfterPort].to_string(),
+            origin: url.origin().ascii_serialization(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Operator,
+    Share,
+}
+
+fn new_token() -> Result<String> {
     let mut token = [0u8; 32];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut token)
-        .map_err(|_| anyhow::anyhow!("cannot generate dashboard launch token"))?;
-    let token = token
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+        .map_err(|_| anyhow::anyhow!("cannot generate dashboard token"))?;
+    Ok(token.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+pub async fn serve(
+    workspace: PathBuf,
+    port: u16,
+    share_port: Option<u16>,
+    share_origin: Option<&str>,
+) -> Result<u8> {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    let host = listener.local_addr()?.to_string();
+    let (share_listener, share) = if let Some(port) = share_port {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .context("bind read-only dashboard listener")?;
+        let site = ShareSite::new(listener.local_addr()?.to_string(), share_origin)?;
+        eprintln!("Read-only dashboard listening on {}", site.loopback);
+        (Some(listener), Some(site))
+    } else {
+        (None, None)
+    };
+    let token = new_token()?;
     println!("http://{host}/#access={token}");
     let app = Arc::new(Dashboard {
         workspace,
         launch_args: runner_args(std::env::args_os().skip(1)),
         host,
         authorization: format!("Bearer {token}"),
+        share,
         actions: Mutex::new(VecDeque::new()),
         runner_pid: AtomicU32::new(0),
     });
+    let public = async {
+        match share_listener {
+            Some(listener) => listen(listener, app.clone(), Surface::Share).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => signal?,
+        result = listen(listener, app.clone(), Surface::Operator) => result?,
+        result = public => result?,
+    }
+    Ok(0)
+}
+
+async fn listen(listener: TcpListener, app: Arc<Dashboard>, surface: Surface) -> Result<()> {
     let capacity = Arc::new(Semaphore::new(48));
     loop {
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => { signal?; return Ok(0); }
-            accepted = listener.accept() => {
-                let (socket, _) = accepted?;
-                let Ok(permit) = capacity.clone().try_acquire_owned() else { continue };
+        let (socket, _) = listener.accept().await?;
+        let Ok(permit) = capacity.clone().try_acquire_owned() else {
+            continue;
+        };
+        let app = app.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let service = service_fn(move |request| {
                 let app = app.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let service = service_fn(move |request| {
-                        let app = app.clone();
-                        async move { Ok::<_,std::convert::Infallible>(handle(app, request).await) }
-                    });
-                    let mut connection = http1::Builder::new();
-                    connection.timer(hyper_util::rt::TokioTimer::new())
-                        .header_read_timeout(Duration::from_secs(8));
-                    let _ = connection.serve_connection(TokioIo::new(socket), service).await;
-                });
-            }
-        }
+                async move { Ok::<_, std::convert::Infallible>(handle(app, surface, request).await) }
+            });
+            let mut connection = http1::Builder::new();
+            connection
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(Duration::from_secs(8));
+            let _ = connection
+                .serve_connection(TokioIo::new(socket), service)
+                .await;
+        });
     }
 }
 
@@ -126,23 +200,31 @@ fn runner_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--web") => {}
-            Some("--web-port") => {
+            Some("--web-port" | "--web-share-port" | "--web-share-origin") => {
                 args.next();
             }
-            Some(value) if value.starts_with("--web-port=") => {}
+            Some(value)
+                if ["--web-port=", "--web-share-port=", "--web-share-origin="]
+                    .iter()
+                    .any(|prefix| value.starts_with(prefix)) => {}
             _ => launch.push(arg),
         }
     }
     launch
 }
 
-async fn handle(app: Arc<Dashboard>, request: Request<Incoming>) -> Reply {
-    if request
+async fn handle(app: Arc<Dashboard>, surface: Surface, request: Request<Incoming>) -> Reply {
+    let host = request
         .headers()
         .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        != Some(&app.host)
-    {
+        .and_then(|value| value.to_str().ok());
+    let valid_host = match surface {
+        Surface::Operator => host == Some(&app.host),
+        Surface::Share => app.share.as_ref().is_some_and(|site| {
+            host.is_some_and(|host| host == site.loopback || host.eq_ignore_ascii_case(&site.host))
+        }),
+    };
+    if !valid_host {
         return error(StatusCode::FORBIDDEN, "Invalid dashboard host");
     }
     let path = request.uri().path().to_owned();
@@ -154,7 +236,7 @@ async fn handle(app: Arc<Dashboard>, request: Request<Incoming>) -> Reply {
             "/dashboard.css" => response(StatusCode::OK, "text/css; charset=utf-8", CSS),
             "/dashboard.js" => response(StatusCode::OK, "text/javascript; charset=utf-8", JS),
             "/favicon.svg" => response(StatusCode::OK, "image/svg+xml", ICON),
-            "/" => response(StatusCode::OK, "text/html; charset=utf-8", HTML),
+            "/" => page(&app, surface),
             path if path.starts_with("/fonts/") => FONTS
                 .iter()
                 .find(|(name, _)| path.strip_prefix("/fonts/") == Some(*name))
@@ -162,11 +244,12 @@ async fn handle(app: Arc<Dashboard>, request: Request<Incoming>) -> Reply {
                     || error(StatusCode::NOT_FOUND, "Page not found"),
                     |(_, font)| response(StatusCode::OK, "font/ttf", *font),
                 ),
-            path if path.starts_with("/run/") => {
-                response(StatusCode::OK, "text/html; charset=utf-8", HTML)
-            }
+            path if path.starts_with("/run/") => page(&app, surface),
             _ => error(StatusCode::NOT_FOUND, "Page not found"),
         };
+    }
+    if surface == Surface::Share {
+        return read_shared(app, request, &path).await;
     }
     if request
         .headers()
@@ -188,9 +271,6 @@ async fn handle(app: Arc<Dashboard>, request: Request<Incoming>) -> Reply {
     {
         return error(StatusCode::FORBIDDEN, "Invalid dashboard origin");
     }
-    let query = url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
-        .into_owned()
-        .collect::<Query>();
     if request.method() == Method::POST {
         if path != "/api/action" {
             return error(StatusCode::NOT_FOUND, "Endpoint not found");
@@ -228,12 +308,116 @@ async fn handle(app: Arc<Dashboard>, request: Request<Incoming>) -> Reply {
         })
         .await;
     }
-    let route = path
-        .strip_prefix("/api/run/")
-        .and_then(|tail| tail.split_once('/'));
-    let Some((run, view)) = route.filter(|(run, _)| valid_run(run)) else {
+    let Some((run, view)) = run_route(&path) else {
         return error(StatusCode::NOT_FOUND, "Unknown run or endpoint");
     };
+    if view == "share" {
+        let Some(site) = &app.share else {
+            return error(StatusCode::NOT_FOUND, "Sharing listener is disabled");
+        };
+        let origin = site.origin.clone();
+        let run = run.to_owned();
+        return read_json(move || {
+            let active = Store::reader(&app.workspace)?
+                .web_share_digest(&run)?
+                .is_some();
+            Ok(json!({"active":active,"origin":origin}))
+        })
+        .await;
+    }
+    read_run(app, run, view, parse_query(&request), None).await
+}
+
+fn page(app: &Dashboard, surface: Surface) -> Reply {
+    let mime = "text/html; charset=utf-8";
+    match surface {
+        Surface::Share => response(
+            StatusCode::OK,
+            mime,
+            HTML.replacen("<body>", "<body data-read-only>", 1),
+        ),
+        Surface::Operator if app.share.is_some() => response(
+            StatusCode::OK,
+            mime,
+            HTML.replacen("<body>", "<body data-sharing>", 1),
+        ),
+        Surface::Operator => response(StatusCode::OK, mime, HTML),
+    }
+}
+
+fn run_route(path: &str) -> Option<(&str, &str)> {
+    path.strip_prefix("/api/run/")?
+        .split_once('/')
+        .filter(|(run, _)| valid_run(run))
+}
+
+fn parse_query(request: &Request<Incoming>) -> Query {
+    url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+        .into_owned()
+        .collect()
+}
+
+fn permits_share(reader: &RunReader, run: &str, token_digest: &[u8]) -> bool {
+    reader.web_share_digest(run).ok().flatten().as_deref() == Some(token_digest)
+}
+
+async fn read_shared(app: Arc<Dashboard>, request: Request<Incoming>, path: &str) -> Reply {
+    if request.method() != Method::GET {
+        return error(StatusCode::FORBIDDEN, "Shared runs are read-only");
+    }
+    let Some((run, view)) = run_route(path) else {
+        return error(StatusCode::FORBIDDEN, "Share links can only open their run");
+    };
+    let query = parse_query(&request);
+    if !(matches!(
+        view,
+        "overview" | "history" | "routes" | "stream" | "live" | "inbox" | "admissions"
+    ) || view
+        .strip_prefix("entry/")
+        .is_some_and(|key| !key.starts_with("legacy-")))
+        || query.contains_key("legacy")
+    {
+        return error(
+            StatusCode::FORBIDDEN,
+            "Endpoint is unavailable for shared runs",
+        );
+    }
+    let unauthorized = || {
+        error(
+            StatusCode::UNAUTHORIZED,
+            "Invalid or revoked run share link",
+        )
+    };
+    let Some(token) = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    else {
+        return unauthorized();
+    };
+    let token_digest = digest(&SHA256, token.as_bytes()).as_ref().to_vec();
+    let (workspace, owned_run, check) =
+        (app.workspace.clone(), run.to_owned(), token_digest.clone());
+    let allowed = tokio::task::spawn_blocking(move || {
+        Store::reader(&workspace).is_ok_and(|reader| permits_share(&reader, &owned_run, &check))
+    })
+    .await
+    .unwrap_or(false);
+    if !allowed {
+        return unauthorized();
+    }
+    read_run(app, run, view, query, Some(token_digest)).await
+}
+
+async fn read_run(
+    app: Arc<Dashboard>,
+    run: &str,
+    view: &str,
+    query: Query,
+    share_digest: Option<Vec<u8>>,
+) -> Reply {
     if view == "stream" {
         let checkpoint = query
             .get("checkpoint")
@@ -243,7 +427,7 @@ async fn handle(app: Arc<Dashboard>, request: Request<Incoming>) -> Reply {
             .get("after")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
-        return stream(app, run.into(), checkpoint, cursor);
+        return stream(app, run.into(), checkpoint, cursor, share_digest);
     }
     if view == "live" {
         let status = control::request_control(
@@ -257,10 +441,27 @@ async fn handle(app: Arc<Dashboard>, request: Request<Incoming>) -> Reply {
         .await
         .ok()
         .filter(|reply| reply.accepted && reply.run_id == run);
-        return json_reply(json!(status));
+        return if share_digest.is_some() {
+            json_reply(json!(status.map(|status| json!({
+                "paused":status.paused, "generations":status.generations, "token_usage":status.token_usage
+            }))))
+        } else {
+            json_reply(json!(status))
+        };
     }
     let (run, view) = (run.to_owned(), view.to_owned());
-    read_json(move || select(&Store::reader(&app.workspace)?, &run, &view, &query)).await
+    read_json(move || {
+        let reader = Store::reader(&app.workspace)?;
+        if share_digest.is_some() && view == "history" && reader.audit_head(&run)? == 0 {
+            return Ok(json!({"rows":[]}));
+        }
+        let mut value = select(&reader, &run, &view, &query)?;
+        if share_digest.is_some() && view == "overview" {
+            value["parent_run"] = Value::Null;
+        }
+        Ok(value)
+    })
+    .await
 }
 
 fn select(reader: &RunReader, run: &str, view: &str, query: &Query) -> Result<Value> {
@@ -460,17 +661,27 @@ fn legacy_projection(snapshot: Value) -> Value {
     json!({"phase":snapshot["phase"],"cycle":snapshot["cycle"],"dialogs":dialogs})
 }
 
-fn stream(app: Arc<Dashboard>, run: String, checkpoint: u64, cursor: u64) -> Reply {
+fn stream(
+    app: Arc<Dashboard>,
+    run: String,
+    checkpoint: u64,
+    cursor: u64,
+    share_digest: Option<Vec<u8>>,
+) -> Reply {
     let frames = futures_util::stream::unfold(
-        (app, run, checkpoint, cursor, true),
-        |(app, run, previous, cursor, first)| async move {
+        (app, run, checkpoint, cursor, true, share_digest),
+        |(app, run, previous, cursor, first, share_digest)| async move {
             if !first {
                 tokio::time::sleep(Duration::from_millis(900)).await;
             }
             let workspace = app.workspace.clone();
             let run_id = run.clone();
-            let (head, updates) = tokio::task::spawn_blocking(move || {
+            let check = share_digest.clone();
+            let update = tokio::task::spawn_blocking(move || {
                 let reader = Store::reader(&workspace).ok()?;
+                if check.is_some_and(|digest| !permits_share(&reader, &run_id, &digest)) {
+                    return None;
+                }
                 Some((
                     reader.run(&run_id).ok()??.last_sequence,
                     reader.audit_updates(&run_id, cursor).ok()?,
@@ -478,8 +689,11 @@ fn stream(app: Arc<Dashboard>, run: String, checkpoint: u64, cursor: u64) -> Rep
             })
             .await
             .ok()
-            .flatten()
-            .unwrap_or((previous, Vec::new()));
+            .flatten();
+            if share_digest.is_some() && update.is_none() {
+                return None;
+            }
+            let (head, updates) = update.unwrap_or((previous, Vec::new()));
             let next = updates
                 .last()
                 .and_then(|item| item["sequence"].as_u64())
@@ -495,7 +709,7 @@ fn stream(app: Arc<Dashboard>, run: String, checkpoint: u64, cursor: u64) -> Rep
             };
             Some((
                 Ok(Frame::data(Bytes::from(output))),
-                (app, run, head, next, false),
+                (app, run, head, next, false, share_digest),
             ))
         },
     );
@@ -540,6 +754,36 @@ impl Dashboard {
             .map(str::trim)
             .filter(|text| !text.is_empty());
         let receipt = match action.action.as_str() {
+            "create_share" | "revoke_share" => {
+                let site = self
+                    .share
+                    .as_ref()
+                    .context("Sharing listener is disabled")?;
+                let run = run.context("Choose a run")?;
+                let run_id = run.to_owned();
+                let workspace = self.workspace.clone();
+                let create = action.action == "create_share";
+                let token = tokio::task::spawn_blocking(move || {
+                    ensure!(
+                        Store::reader(&workspace)?.run(&run_id)?.is_some(),
+                        "Run not found"
+                    );
+                    let token = create.then(new_token).transpose()?;
+                    let hash = token
+                        .as_ref()
+                        .map(|token| digest(&SHA256, token.as_bytes()));
+                    Store::set_web_share(
+                        &workspace,
+                        &run_id,
+                        hash.as_ref().map(|hash| hash.as_ref()),
+                    )?;
+                    Ok::<_, anyhow::Error>(token)
+                })
+                .await??;
+                let url =
+                    token.map(|token| format!("{}/run/{run}/overview#share={token}", site.origin));
+                json!({"active": create, "url": url})
+            }
             "start" | "resume" | "resume_saved" | "fork" => {
                 let resume = matches!(action.action.as_str(), "resume" | "resume_saved");
                 let active = control::request_control(

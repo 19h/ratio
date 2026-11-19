@@ -96,6 +96,27 @@ fn check_version(connection: &Connection, allow_new: bool) -> Result<u32> {
 }
 
 impl Journal {
+    pub(crate) fn set_web_share(path: &Path, run: &str, digest: Option<&[u8]>) -> Result<()> {
+        let connection = connect(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        check_version(&connection, false)?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS web_shares (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+                digest BLOB NOT NULL
+            ) WITHOUT ROWID;",
+        )?;
+        if let Some(digest) = digest {
+            connection.execute(
+                "INSERT INTO web_shares(run_id,digest) VALUES (?1,?2)
+                 ON CONFLICT(run_id) DO UPDATE SET digest=excluded.digest",
+                params![run, digest],
+            )?;
+        } else {
+            connection.execute("DELETE FROM web_shares WHERE run_id=?1", [run])?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn record_control(&mut self, run: &str, action: &str, detail: &str) -> Result<()> {
         self.record_signal(run, "control", "user", action, detail)
     }
@@ -512,6 +533,24 @@ fn decode_event(row: &rusqlite::Row<'_>) -> Result<RunEvent> {
 }
 
 impl RunReader {
+    pub fn web_share_digest(&self, run: &str) -> Result<Option<Vec<u8>>> {
+        let exists: bool = self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='web_shares' AND type='table')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        self.0
+            .query_row(
+                "SELECT digest FROM web_shares WHERE run_id=?1",
+                [run],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
     pub fn worker_admissions(&self, run: &str) -> Result<Vec<serde_json::Value>> {
         if !self.has_audit()? {
             return Ok(Vec::new());

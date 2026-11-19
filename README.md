@@ -331,6 +331,20 @@ Automatic triage uses the lead reviewer to classify and route information within
 
 Press `1` to `6` to switch views and `/` to search the run. In the message sequence, the arrow keys or `j` and `k` move the selection.
 
+#### Share a run through Tailscale Funnel
+
+```sh
+ra -C PROJECT --config ratio.toml --web --web-port 7350 \
+  --web-share-port 7351 --web-share-origin https://YOUR-NODE.YOUR-TAILNET.ts.net
+tailscale funnel --bg http://127.0.0.1:7351
+```
+
+Point Funnel at the separate read-only port, `7351` in this example. Open the private dashboard URL printed by Ratio, select a run, and choose **Share** → **Create link**. Copy the link from the dialog. [Tailscale Funnel command reference](https://tailscale.com/docs/reference/tailscale-cli/funnel)
+
+Anyone holding the link can view that run’s live activity and recorded history, including prompts, messages, tool arguments and outputs, and operator notes. The public listener serves only run-scoped reads and denies API access to controls, other runs, and the checkpoint archive.
+
+Each run has one active link. **Replace link** invalidates the previous URL, and **Revoke link** also disconnects active visitors. Links remain valid across dashboard restarts when the same workspace and public origin are used. To preview sharing locally, omit `--web-share-origin` and use a fixed `--web-share-port`.
+
 ### Terminal UI
 
 **Activity** shows a grid of agent cards above the shared transcript. Each card shows its current generation, running tool, or latest observed result. Active agents appear first. Use Up/Down or the mouse wheel over the grid to see more agents. **Communication** shows the message sequence, route matrix, and inspector. **Workflow** shows acknowledgements, task state, acceptance criteria, compaction, and verification evidence.

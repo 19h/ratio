@@ -18,15 +18,16 @@
       <span class="spacer"></span>
       <form id="global-search" role="search" hidden><input type="search" name="q" placeholder="search run history  /" aria-label="Search run history" spellcheck="false" autocomplete="off"></form>
       <div id="connection" class="connection" aria-live="polite"><i></i><span>Connecting</span></div>
+      <span id="share-mode" class="label" hidden>Read only</span>
       <div id="controls" class="run-controls"></div>
     </header>
     <div class="workspace">
       <aside class="side" aria-label="Workspace navigation">
-        <div class="side-run"><label class="label" for="run-select">Run</label><select id="run-select"></select></div>
+        <div class="side-run" data-operator-only><label class="label" for="run-select">Run</label><select id="run-select"></select></div>
         <nav id="navigation" aria-label="Run views" hidden></nav>
         <div id="agent-heading" class="side-heading" hidden><span>Agents</span><small id="agent-count"></small></div>
         <nav id="agent-nav" aria-label="Individual agents"></nav>
-        <footer class="bar"><button id="new-run" class="primary">Start run</button></footer>
+        <footer class="bar" data-operator-only><button id="new-run" class="primary">Start run</button></footer>
       </aside>
       <div class="stage">
         <div id="notice" class="notice" role="status" hidden><span></span><button type="button" id="dismiss-notice" aria-label="Dismiss notice">×</button></div>
@@ -47,6 +48,20 @@
       </div>
       <footer class="bar"><span class="spacer"></span><button type="button" id="close-action">Cancel</button><button type="submit" class="primary" id="submit-action">Submit</button></footer>
     </form>
+  </dialog>
+  <dialog id="share-dialog" aria-labelledby="share-title">
+    <div class="dialog-body">
+      <h2 id="share-title">Share run</h2>
+      <p class="muted">Anyone with the link can read this run, including live previews, messages, tool arguments and outputs, and operator notes.</p>
+      <p id="share-state" role="status"></p>
+      <div id="share-link" hidden>
+        <label class="label" for="share-url">Share link</label>
+        <input id="share-url" type="text" readonly>
+        <button type="button" id="copy-share">Copy link</button>
+      </div>
+      <p class="action-error" id="share-error" role="alert" hidden></p>
+    </div>
+    <footer class="bar"><span class="spacer"></span><button type="button" id="close-share">Close</button><button type="button" id="revoke-share" class="danger">Revoke link</button><button type="button" id="create-share" class="primary">Create link</button></footer>
   </dialog>
 </body>
 </html>
