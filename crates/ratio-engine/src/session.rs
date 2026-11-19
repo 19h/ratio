@@ -52,6 +52,8 @@ pub struct Verdict {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Phase {
+    ProposeTeam,
+    OnboardWorker,
     Plan,
     PlanConsult,
     PlanSynthesize,
@@ -71,6 +73,8 @@ pub enum Phase {
 impl Phase {
     pub fn label(self) -> &'static str {
         match self {
+            Self::ProposeTeam => "Propose team",
+            Self::OnboardWorker => "Onboard worker",
             Self::Plan => "Reviewer plan",
             Self::PlanConsult => "Planning consultation",
             Self::PlanSynthesize => "Plan synthesis",
@@ -97,6 +101,20 @@ impl Phase {
 pub struct Session {
     version: u32,
     pub goal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub team_acceptance: Vec<String>,
+    #[serde(default)]
+    pub(crate) work_intake_closed: bool,
+    #[serde(default)]
+    pub(crate) last_worker_request: Option<i64>,
+    #[serde(default)]
+    pub(crate) active_worker_request: Option<i64>,
+    #[serde(default)]
+    pub(crate) worker_addition_status: Option<String>,
+    #[serde(default)]
+    pub(crate) onboarding: Option<WorkerOnboarding>,
     pub phase: Phase,
     pub cycle: usize,
     pub plan_attempt: usize,
@@ -107,7 +125,7 @@ pub struct Session {
     pub(crate) stopped: Option<RunStop>,
     pub(crate) budget_started: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) require_task_graph: bool,
+    pub require_task_graph: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) staging_commands: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,6 +152,17 @@ pub struct Session {
     pub(crate) panel: Option<PanelProgress>,
     #[serde(default, skip_serializing_if = "SharedMemory::is_empty")]
     pub(crate) memory: SharedMemory,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct WorkerOnboarding {
+    pub worker: Worker,
+    pub plan: WorkerPlan,
+    pub mentor: usize,
+    pub stakeholder: Option<usize>,
+    pub briefed: bool,
+    #[serde(default)]
+    pub brief: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -257,6 +286,8 @@ pub(crate) struct PanelProgress {
     pub mailbox: MailboxState,
     pub gate: Option<GateState>,
     pub agents: Vec<WorkerProgress>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actor_ids: Vec<String>,
 }
 
 impl Session {
@@ -265,6 +296,12 @@ impl Session {
             stopped: self.stopped,
             plan_attempt: self.plan_attempt,
             parent_run: self.parent_run_id.clone(),
+            worker_addition: self.worker_addition_status.clone(),
+            active_worker_request: self.active_worker_request,
+            panel_actors: self
+                .panel
+                .as_ref()
+                .map_or_else(Vec::new, |panel| panel.actor_ids.clone()),
             verdict: self
                 .verdict
                 .as_ref()
@@ -317,6 +354,20 @@ impl Session {
                         name: agent.name.clone(),
                     }),
             );
+        }
+        if let Some(newcomer) = &self.onboarding {
+            let count = self.workers.as_ref().map_or(0, Vec::len);
+            workflow.agents.push(AgentView {
+                id: format!("worker_{}", count + 1),
+                name: newcomer.worker.name.clone(),
+            });
+            if newcomer.stakeholder.is_none() {
+                let stakeholders = self.stakeholders.as_ref().map_or(0, Vec::len);
+                workflow.agents.push(AgentView {
+                    id: format!("stakeholder_{}", stakeholders + 1),
+                    name: "Onboarding adviser".into(),
+                });
+            }
         }
         self.for_each_dialogue(|actor, dialogue| {
             if let Some(receipt) = &dialogue.last_compaction {
@@ -396,11 +447,16 @@ impl Session {
     }
 
     pub fn fork(self, goal: Option<String>) -> Self {
+        let same_goal = goal.as_ref().is_none_or(|goal| goal == &self.goal);
         let mut next = Self::new(goal.unwrap_or(self.goal));
         next.parent_run_id = Some(self.run_id);
         next.reviewers = self.reviewers;
         next.stakeholders = self.stakeholders;
         next.workers = self.workers;
+        next.require_task_graph = self.require_task_graph;
+        if same_goal {
+            next.team_acceptance = self.team_acceptance;
+        }
         next
     }
 
@@ -473,6 +529,13 @@ impl Session {
             stakeholders: None,
             reviewers: None,
             workers: None,
+            request: None,
+            team_acceptance: Vec::new(),
+            work_intake_closed: false,
+            last_worker_request: None,
+            active_worker_request: None,
+            worker_addition_status: None,
+            onboarding: None,
             worker_plan: None,
             worker_progress: Vec::new(),
             team_ipc: None,
@@ -495,6 +558,63 @@ impl Drop for Store {
 }
 
 impl Store {
+    pub fn record_control(&self, run: &str, action: &str, detail: &str) -> Result<()> {
+        Ok(self
+            .journal
+            .borrow_mut()
+            .record_control(run, action, detail)?)
+    }
+    pub fn submit_triage(&self, run: &str, text: &str) -> Result<i64> {
+        let text = text.trim();
+        ensure!(
+            !text.is_empty() && text.len() <= 4096,
+            "Triage information requires 1 to 4096 UTF-8 bytes"
+        );
+        let session = self.load_run(Some(run))?;
+        ensure!(
+            !session.phase.done() && session.stopped.is_none() && session.phase != Phase::Publish,
+            "This run is no longer accepting triage"
+        );
+        Ok(self.journal.borrow().submit_triage(run, text)?)
+    }
+
+    pub fn retry_triage(&self, run: &str, id: i64) -> Result<bool> {
+        Ok(self.journal.borrow().retry_triage(run, id)?)
+    }
+
+    pub fn request_worker(&self, run: &str, request: &str) -> Result<i64> {
+        let request = request.trim();
+        ensure!(
+            !request.is_empty() && request.len() <= 4096,
+            "worker request must be 1 to 4096 UTF-8 bytes"
+        );
+        let session = self.load_run(Some(run))?;
+        let workers = session.workers.as_deref().unwrap_or_default();
+        ensure!(
+            session.phase == Phase::Work
+                && session.stopped.is_none()
+                && !session.work_intake_closed
+                && (1..64).contains(&workers.len())
+                && session
+                    .worker_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.verified(session.cycle, workers)),
+            "a worker can be added during Work under a verified frozen plan with fewer than 64 workers"
+        );
+        ensure!(
+            self.pending_worker(run)?.is_none(),
+            "a worker request is already pending"
+        );
+        Ok(self.journal.borrow().enqueue_worker(run, request)?)
+    }
+
+    pub(crate) fn pending_worker(&self, run: &str) -> Result<Option<(i64, String)>> {
+        Ok(self.journal.borrow().worker_request(run)?)
+    }
+
+    pub(crate) fn finish_worker_request(&self, id: i64) -> Result<()> {
+        Ok(self.journal.borrow().finish_worker_request(id)?)
+    }
     pub fn mark_stopped(&self, run_id: &str, reason: RunStop) -> Result<()> {
         let Some(bytes) = self.journal.borrow().checkpoint(Some(run_id))? else {
             return Ok(());
@@ -610,6 +730,21 @@ impl Store {
 
     pub(crate) fn save_with_traffic(&self, session: &Session, ipc: Vec<IpcEvent>) -> Result<()> {
         let bytes = serde_json::to_vec(session)?;
+        let mut audit = Vec::new();
+        session.for_each_dialogue(|actor, dialogue| {
+            let actor = actor
+                .strip_prefix("panel_")
+                .and_then(|slot| slot.parse::<usize>().ok())
+                .and_then(|slot| slot.checked_sub(1))
+                .and_then(|slot| session.panel.as_ref()?.actor_ids.get(slot))
+                .map_or(actor, String::as_str);
+            audit.extend(dialogue.audit.pending().into_iter().map(|mut event| {
+                if event.actor.is_empty() {
+                    event.actor = actor.into();
+                }
+                event
+            }));
+        });
         self.journal
             .borrow_mut()
             .commit_checkpoint(
@@ -621,9 +756,11 @@ impl Store {
                     effects: session.effects(),
                     ipc,
                     workflow: session.workflow(),
+                    audit,
                 },
             )
             .context("commit Ratio run checkpoint")?;
+        session.for_each_dialogue(|_, dialogue| dialogue.audit.committed());
         // The JSON file remains a compatibility projection. Resume reads the journal.
         let mut temp = tempfile::NamedTempFile::new_in(&self.directory)?;
         temp.write_all(&bytes)?;

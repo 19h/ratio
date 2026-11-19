@@ -13,7 +13,7 @@ use crate::{
     budget::Budget,
     config::{Config, Provider, ProviderApi},
     context::{clip, estimate},
-    events::{Generation, Kind, Reporter, clean},
+    events::{Generation, Kind, LiveGeneration, Reporter, clean},
 };
 
 mod responses;
@@ -226,6 +226,19 @@ impl Api {
         tools: &[Value],
         output_tokens: usize,
     ) -> Result<Completion, ApiError> {
+        self.complete_as(label, label, model, messages, tools, output_tokens)
+            .await
+    }
+
+    pub(crate) async fn complete_as(
+        &self,
+        actor: &str,
+        label: &str,
+        model: &str,
+        messages: &[&Message],
+        tools: &[Value],
+        output_tokens: usize,
+    ) -> Result<Completion, ApiError> {
         let reserved = estimate(messages, tools).saturating_add(output_tokens) as u64;
         let mut last_http = None;
         let mut attempt = 0;
@@ -240,7 +253,7 @@ impl Api {
             }
             let epoch = state.epoch;
             self.budget.reserve(reserved)?;
-            let mut preview = Preview::new(self, label);
+            let mut preview = Preview::new(self, actor, label);
             let cancelled = async {
                 match &mut control {
                     Some(control) => {
@@ -596,7 +609,7 @@ impl Api {
         })
     }
 
-    fn redact(&self, text: &str) -> String {
+    pub(crate) fn redact(&self, text: &str) -> String {
         self.secrets.iter().fold(text.to_owned(), |text, secret| {
             text.replace(secret, "[redacted]")
         })
@@ -646,26 +659,30 @@ fn ensure_response_size(received: usize) -> Result<()> {
 struct Preview<'a> {
     api: &'a Api,
     id: Option<usize>,
+    actor: &'a str,
     label: &'a str,
     last: Instant,
 }
 
 impl<'a> Preview<'a> {
-    fn new(api: &'a Api, label: &'a str) -> Self {
+    fn new(api: &'a Api, actor: &'a str, label: &'a str) -> Self {
+        api.reporter.request_started(actor, label);
         let id = api
             .reporter
-            .observes_network()
+            .observes_generation()
             .then(|| GENERATION_IDS.fetch_add(1, Ordering::Relaxed));
         if let Some(id) = id {
-            api.reporter.generation(Generation::Preview {
+            api.reporter.generation(Generation::Preview(LiveGeneration {
                 id,
+                actor: actor.into(),
                 label: clean(clip(label, 240)),
                 text: "Waiting for provider…".into(),
-            });
+            }));
         }
         Self {
             api,
             id,
+            actor,
             label,
             last: Instant::now(),
         }
@@ -695,11 +712,14 @@ impl<'a> Preview<'a> {
         while !text.is_char_boundary(start) {
             start += 1;
         }
-        self.api.reporter.generation(Generation::Preview {
-            id,
-            label: clean(clip(self.label, 240)),
-            text: clean(text[start..].to_owned()),
-        });
+        self.api
+            .reporter
+            .generation(Generation::Preview(LiveGeneration {
+                id,
+                actor: self.actor.into(),
+                label: clean(clip(self.label, 240)),
+                text: clean(text[start..].to_owned()),
+            }));
     }
 }
 

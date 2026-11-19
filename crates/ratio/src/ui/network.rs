@@ -192,11 +192,11 @@ impl Network {
             1
         };
         match key {
-            KeyCode::Tab => {
+            KeyCode::Char('t') if modified => {
                 self.matrix = !self.matrix;
                 self.detail_scroll = 0;
             }
-            KeyCode::F(4) => {
+            KeyCode::Char('f') if modified => {
                 self.filter = match self.filter {
                     Filter::All => Filter::Ipc,
                     Filter::Ipc => Filter::Handoffs,
@@ -523,6 +523,9 @@ impl Network {
             ),
             agent_line(self.node(item.from), " From "),
         ];
+        if let Some(request) = item.scope.worker_request {
+            lines.insert(2, Line::raw(format!(" Worker request {request}")));
+        }
         if let Some(requester) = item.reply_to {
             lines.push(agent_line(self.node(requester), " Reply to "));
         }
@@ -665,6 +668,7 @@ mod tests {
                     cycle: 1,
                     attempt: 1,
                     phase: "Worker",
+                    worker_request: None,
                 },
                 from: "stakeholder_1".into(),
                 to: to.iter().map(|id| (*id).into()).collect(),

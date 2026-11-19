@@ -38,6 +38,39 @@ pub(crate) struct MailboxState {
     peer_received: Vec<usize>,
     closed: Vec<bool>,
     inboxes: Vec<Vec<Envelope>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    delivered_links: Vec<(usize, usize)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    delivered_receipts: Vec<(usize, usize, usize)>,
+}
+
+impl MailboxState {
+    pub(crate) fn insert_worker(&mut self, at: usize) {
+        fn shift(index: &mut usize, at: usize) {
+            if *index >= at {
+                *index += 1;
+            }
+        }
+        self.sent.insert(at, 0);
+        self.peer_sent.insert(at, 0);
+        self.peer_received.insert(at, 0);
+        self.closed.insert(at, false);
+        self.inboxes.insert(at, Vec::new());
+        for mail in self.inboxes.iter_mut().flatten() {
+            shift(&mut mail.from, at);
+            if let Some(to) = &mut mail.reply_to {
+                shift(to, at);
+            }
+        }
+        for (from, to) in &mut self.delivered_links {
+            shift(from, at);
+            shift(to, at);
+        }
+        for (from, to, _) in &mut self.delivered_receipts {
+            shift(from, at);
+            shift(to, at);
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -46,6 +79,8 @@ struct Envelope {
     sequence: usize,
     body: String,
     reply_to: Option<usize>,
+    #[serde(default)]
+    reply_sequence: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +98,8 @@ impl Mailbox {
             peer_received: vec![0; len],
             closed: vec![false; len],
             inboxes: (0..len).map(|_| Vec::new()).collect(),
+            delivered_links: Vec::new(),
+            delivered_receipts: Vec::new(),
         };
         Self {
             members,
@@ -166,6 +203,12 @@ impl Mailbox {
         &self.members[index].id
     }
 
+    pub(crate) fn exchanged(&self, left: usize, right: usize) -> bool {
+        let state = self.state.borrow();
+        state.delivered_links.contains(&(left, right))
+            && state.delivered_links.contains(&(right, left))
+    }
+
     pub fn drain(&self, recipient: usize, reporter: &Reporter) -> Vec<String> {
         let mut state = self.state.borrow_mut();
         let mut queued = std::mem::take(&mut state.inboxes[recipient]);
@@ -174,6 +217,15 @@ impl Mailbox {
                 .iter()
                 .filter(|mail| self.is_worker(mail.from))
                 .count();
+        }
+        for mail in &queued {
+            let link = (mail.from, recipient);
+            state
+                .delivered_receipts
+                .push((mail.from, recipient, mail.sequence));
+            if !state.delivered_links.contains(&link) {
+                state.delivered_links.push(link);
+            }
         }
         drop(state);
         queued.sort_by_key(|mail| (mail.from, mail.sequence));
@@ -191,7 +243,15 @@ impl Mailbox {
                     format!("{attribution} -> {}", self.id(recipient)),
                     &mail.body,
                 );
-                format!("From {attribution}: {}", mail.body.replace('\n', "\n  "))
+                let body = mail.body.replace('\n', "\n  ");
+                if self.is_worker(recipient) {
+                    format!("From {attribution}: {body}")
+                } else {
+                    format!(
+                        "From {attribution}: {body}\n  IPC sequence {}",
+                        mail.sequence
+                    )
+                }
             })
             .collect()
     }
@@ -241,6 +301,7 @@ fn ipc_event(
         sequence: mail.sequence,
         body: clean(mail.body.clone()),
         reply_to: mail.reply_to.map(|index| mailbox.id(index).into()),
+        reply_sequence: mail.reply_sequence,
         delivery,
     }
 }
@@ -431,6 +492,25 @@ impl Route<'_> {
             sequence: state.sent[self.sender],
             body: input.message,
             reply_to: stakeholder.then_some(recipient),
+            reply_sequence: if stakeholder {
+                let mut received = state
+                    .delivered_receipts
+                    .iter()
+                    .filter(|&&(from, to, _)| from == recipient && to == self.sender)
+                    .map(|tuple| tuple.2);
+                if let Some(request) = input.reply_sequence {
+                    ensure!(
+                        received.any(|sequence| sequence == request),
+                        "reply_sequence must identify a delivered message from the addressed worker"
+                    );
+                    Some(request)
+                } else {
+                    let first = received.next();
+                    first.filter(|_| received.next().is_none())
+                }
+            } else {
+                None
+            },
         };
         for index in recipients.clone() {
             ensure!(!state.closed[index], "recipient is unavailable");
@@ -458,6 +538,7 @@ impl Route<'_> {
 struct Send {
     to: String,
     message: String,
+    reply_sequence: Option<usize>,
 }
 
 pub fn schema() -> Value {
@@ -470,7 +551,8 @@ pub fn schema() -> Value {
                 "type":"object",
                 "properties":{
                     "to":{"type":"string"},
-                    "message":{"type":"string","maxLength":MAX_BYTES}
+                    "message":{"type":"string","maxLength":MAX_BYTES},
+                    "reply_sequence":{"type":"integer"}
                 },
                 "required":["to","message"],
                 "additionalProperties":false

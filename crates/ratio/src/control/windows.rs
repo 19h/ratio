@@ -31,14 +31,14 @@ use windows_sys::Win32::{
 
 use super::workspace_key;
 
-pub(crate) struct Listener {
+pub struct Listener {
     server: NamedPipeServer,
     name: String,
     descriptor: SecurityDescriptor,
 }
 
 impl Listener {
-    pub(crate) fn bind(workspace: &Path) -> Result<Self> {
+    pub fn bind(workspace: &Path) -> Result<Self> {
         let name = endpoint(workspace);
         let descriptor = SecurityDescriptor::for_current_user()?;
         let server = descriptor

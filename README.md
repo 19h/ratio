@@ -106,7 +106,16 @@ ra -C /path/to/project \
   --goal 'Fix the parser regression and verify all supported inputs.'
 ```
 
-In a terminal, omit `--goal` to draft it in the TUI. Enter sends feedback to the setup agent, which can refine the goal, role descriptions, and consultation phases. F5 approves the current proposal and starts execution. For CI or scripts, use `--headless` and supply a goal via the CLI or TOML. Headless mode writes the final assessment to stdout and diagnostics to stderr.
+For repeat use, save your provider settings in `$XDG_CONFIG_HOME/ratio/config.toml` or `~/.config/ratio/config.toml`. On Windows, use `%APPDATA%\ratio\config.toml`. An explicit `--config` selects a different file. With a provider profile and no configured worker roster, Ratio proposes workers, reviewers, stakeholders, and acceptance criteria, then starts the run.
+
+```sh
+ra -C PROJECT 'Implement the solver and verify convergence'
+ra -C PROJECT --review-plan 'Implement the solver and verify convergence'
+ra -C PROJECT --plan-only 'Implement the solver and verify convergence'
+cat request.txt | ra -C PROJECT --headless --goal-stdin
+```
+
+In a terminal, start `ra` to enter a request. Use `--review-plan` to inspect and refine the proposal before starting with **Run proposal** or Ctrl+R. `--plan-only` prints the proposed team as JSON and exits before implementation. For CI or scripts, `--headless` writes progress to stderr and the final assessment to stdout. An explicit worker roster takes precedence. Use `--fixed-team` to select the built-in single worker when the profile has no worker roster.
 
 Use [`ratio.example.toml`](ratio.example.toml) as a starting point and pass `--config path/to/ratio.toml`. The [stakeholder example](examples/fullstack-stakeholders.toml) configures separate application and UX perspectives. The [estuary simulation example](examples/morph-dsv41flash-abliterated.toml) uses MorphLLM and a staged three-worker DAG. The numerical kernels and parallel solver can run concurrently. The integration and verification worker depends on both. Run it in an empty Git workspace with the credential available in `RATIO_API_KEY`.
 
@@ -144,8 +153,10 @@ Ratio sends a Bearer header when a key is configured. A custom `Authorization` h
 
 - **Panel.** Configure up to 64 combined `[[reviewers]]` and `[[stakeholders]]`, with names, personas, planning or review phases, and optional model overrides. The lead reviewer synthesizes their reports. `[orchestration].max_parallel_agents` defaults to 8. Set `parallel_stakeholders = false` for serial consultation.
 - **Workers.** Add `[[workers]]` with names, personas, and optional model overrides. With multiple workers, each must send and receive a peer coordination message. The lead reviewer freezes the plan with `submit_plan`, including workspace-relative write ownership. Every worker calls `ack_plan` with the same plan ID or uses `object_to_plan` to return the team to coordination. The default is three plan attempts per review cycle.
-- **Dependencies.** Set `[orchestration].require_task_graph = true` to require one typed task per worker, with a task ID, description, predecessor IDs, and acceptance criteria. Ratio validates references and acyclicity. Workers become runnable when their predecessors complete.
+- **Dependencies.** Generated teams use a typed task graph. To require it for a configured team, set `[orchestration].require_task_graph = true`. Each worker gets one task with an ID, description, predecessors, and acceptance criteria. Ratio validates references and acyclicity. Workers become runnable when their predecessors complete.
 - **Decision.** The lead reviewer issues `submit_verdict` as the sole tool call in its completion. The call carries a verdict and assessment. A `needs_revision` verdict also carries revision instructions.
+
+Plan repair identifies missing, duplicate, and unknown worker IDs. If bounded full-plan repairs fail, Ratio asks for one typed assignment per worker and validates the assembled plan before requesting acknowledgements.
 
 Agents use `send_message` with a recipient ID and a BWP body. Ratio validates syntax and bounds the payload before enqueueing it. BWP keeps exact tool names, paths, and IDs. Flat lists use spaces, clauses use `;`, and multi-word options use `|`. Braces, code fences, and prose parentheses are refused. Function names may use `fn()` notation.
 
@@ -216,20 +227,48 @@ Shell commands and local MCP subprocesses inherit the operator's host permission
 
 ## Terminal UI and run history
 
+### Web dashboard
+
+```sh
+ra -C PROJECT --web
+ra -C PROJECT --config ratio.toml --web --web-port 7350
+```
+
+Open the private URL printed by Ratio. The dashboard runs on loopback and uses the provider configuration and CLI overrides supplied at startup. Start, resume, or fork a run from the browser, or follow an existing terminal or detached run. Closing the dashboard leaves the runner active.
+
+| View | Use it to |
+| --- | --- |
+| Overview | Inspect the live roster, task dependencies, ownership, acknowledgements, verification, and verdict |
+| Timeline | Search recorded conversations, IPC, tools, phases, and operator actions |
+| Agents | Follow each agent's conversation, file operations, tools, and incoming or outgoing messages |
+| Communication | Follow BWP messages by sequence or agent lane, inspect each recipient's delivery, and search routes |
+| Tools & files | Browse MCP and native tools, expand arguments and captured output, and jump to the exact assistant turn |
+| Triage | Submit information for automatic routing, retry failed classification, or track a worker request |
+
+The journal preserves tool invocations and receipts independently of conversation compaction. Expand **Full result** for the captured audit payload and **Model-visible result** for what the model received. Payloads can contain source and command output. Per-tool limits apply within the 8 MiB per-payload ceiling, with omission markers for truncated captures. Older journals expose the messages and tool receipts their checkpoints retained.
+
+Automatic triage uses the lead reviewer to classify and route information within the existing run permissions. The inbox shows the decision, recipients, and delivery receipts. Pending items are marked deferred if the run finishes before delivery. **Add worker** requests a separate, read-only onboarding phase followed by unanimous acknowledgement of the amended plan.
+
+To exercise the dashboard with Playwright, build `target/debug/ra`, install Playwright in your test environment, and run `node --test crates/ratio/tests/web_dashboard.mjs`. Set `RATIO_PLAYWRIGHT` to the module path if it is installed outside this workspace.
+
+### Terminal UI
+
+**Activity** shows a grid of agent cards above the shared transcript. Each card shows its current generation, running tool, or latest observed result. Active agents appear first. Use Up/Down or the mouse wheel over the grid to see more agents. **Communication** shows the message sequence, route matrix, and inspector. **Workflow** shows acknowledgements, task state, acceptance criteria, compaction, and verification evidence.
+
 | Key | Action |
 | --- | --- |
 | Enter | Refine a proposal during setup or queue guidance during a run |
-| F5 | Approve the setup proposal and start |
-| F2 | Activity transcript and live generation preview for inline runs |
-| F3 | Communication sequence, routes matrix, and message inspector |
-| F4 | Filter Communication by all traffic, IPC, or handoffs |
-| F6 | Pause or resume new requests. Pausing cancels active generations. |
-| F7 | Switch between live generating agents in Activity |
-| F8 | Workflow with acknowledgements, task status, acceptance criteria, compaction, and verification evidence |
+| Ctrl+R or click Run proposal | Approve the setup proposal and start |
+| Tab, Shift+Tab, or click a tab | Switch between Activity, Communication, and Workflow |
+| PgUp / PgDn in Activity | Scroll the shared transcript |
+| Ctrl+T in Communication | Switch between Sequence and Routes |
+| Ctrl+F in Communication | Filter all traffic, IPC, or handoffs |
+| Ctrl+P or click Pause / Resume | Pause or resume model requests. Pausing cancels active generations. |
+| Ctrl+N, click Add worker, or type `/add-worker REQUEST` | Request an additional worker during execution |
 | Ctrl-C | During inline generation, cancel and pause. While paused or between generations, exit. |
 | Esc | Cancel a setup request or detach from an attached run |
 
-In Communication, use Tab for Sequence or Routes, arrows to navigate, and Ctrl+Up or Ctrl+Down to scroll the inspector. End follows new traffic in Sequence. An IPC delivery marker records context insertion. Handoff rows show briefs, reports, and verdicts. Inline views keep the latest 512 observed exchanges. Attached views restore recorded IPC and tool observations from the journal.
+In Communication, use arrows to navigate and Ctrl+Up or Ctrl+Down to scroll the inspector. End follows new traffic in Sequence. An IPC delivery marker records context insertion. Handoff rows show briefs, reports, and verdicts. Inline views keep the latest 512 observed exchanges. An attached live run displays generation previews over the private control endpoint. An attached historical run shows recorded IPC and tool observations from the journal.
 
 ```sh
 ra -C PROJECT --detached --config ratio.toml --goal 'Implement the solver'
@@ -238,6 +277,7 @@ ra -C PROJECT --events RUN_ID --after 0 --follow
 ra -C PROJECT --attach RUN_ID
 ra -C PROJECT --control status
 ra -C PROJECT --control guide --guidance 'Keep the reference solver available'
+ra -C PROJECT --control add-worker --worker-request 'Add a worker to own profiler fixtures'
 ra -C PROJECT --control pause
 ra -C PROJECT --control resume
 ra -C PROJECT --control cancel
@@ -245,7 +285,26 @@ ra -C PROJECT --config ratio.toml --resume --run-id RUN_ID
 ra -C PROJECT --config ratio.toml --fork RUN_ID --goal 'Evaluate a second approach'
 ```
 
-Detached runs expose control through a private Unix socket or a Windows named pipe restricted to the operator and SYSTEM. The launch response provides the log path and the run ID when the detached process is still active. `--events` emits checkpoint records as JSON Lines. `--resume` defaults to the latest run. A fork starts a new conversation and budget from the recorded roster and goal, using the current workspace as its baseline. Supply `--goal` to override the inherited goal.
+Foreground headless and detached runs expose control through a private Unix socket or a Windows named pipe restricted to the operator and SYSTEM. The detached launch response provides the combined progress and assessment log path and the run ID when the process is still active. `--events` emits checkpoint records as JSON Lines. `--resume` defaults to the latest run. A fork starts a new conversation and budget from the recorded roster and goal, using the current workspace as its baseline. Supply `--goal` to override the inherited goal.
+
+During execution under a frozen worker plan, Ratio can queue one additional-worker request at a time. It finishes pending tool batches, proposes disjoint write paths and a new assignment, and requires read-only BWP exchanges with an incumbent worker and a stakeholder or temporary adviser. Every worker then acknowledges the amended plan ID before execution resumes. A declined request returns the incumbent team to its existing plan. The Workflow pane records the result.
+
+```text
+  Work under plan A
+    |
+    +-- operator requests worker --> settle pending tool batches
+          |
+          v
+        Propose one assignment with disjoint write paths
+          |
+          v
+        Incumbent mentor <-- BWP --> New worker <-- BWP --> Stakeholder
+          |
+          v
+        Every worker acknowledges plan B
+          +-- unanimous --> Work under plan B with the expanded team
+          `-- declined ---> Work under plan A with the incumbent team
+```
 
 The SQLite WAL journal at `.ratio/runs.sqlite3` stores run state, IPC, tool outcomes, and budgets. An interrupted workspace tool is recorded as having an unknown outcome and requires inspection before relying on its effects. Interrupted IPC, memory, and acknowledgement operations can resume from their checkpoints. Ratio can import legacy format-2 JSON checkpoints and still maintains a format-2 mirror. Keep `.ratio/` private and outside version control because it contains transcripts and workspace data.
 
@@ -293,9 +352,30 @@ command = "/absolute/path/to/project-mcp"
 args = []
 tools = ["locate_symbol", "check_interface"]
 protocol = "2025-11-25"
+lifetime = "call"
 ```
 
-A configured skill directory contains `SKILL.md` and its relative references. The directory path is relative to the configuration file. Agents discover its contents through `read_skill`. MCP uses local stdio subprocesses with an operator-defined tool allowlist. Workers gain access after the write gate. Each invocation starts a fresh process. Ratio also supports the explicit MCP revision `2026-07-28`.
+A configured skill directory contains `SKILL.md` and its relative references. The directory path is relative to the configuration file. Agents discover its contents through `read_skill`.
+
+Choose one tool policy per stdio MCP server. The policy applies to both discovery and calls.
+
+| Setting | Tools available |
+| --- | --- |
+| `tools = ["locate_symbol", "check_interface"]` | Only the named tools |
+| `allow_all = true` | Every tool on the server |
+| `deny_tools = ["replace_interface"]` | Every tool except the named exclusions |
+
+Tool lists accept any number of entries. `ra --check-mcp project_tools` prints the full permitted catalog and verifies that explicitly allowed names exist. For large catalogs, `mcp_list` returns a page of tool names and a `next_offset` for the next call. Supply `name` to inspect a single tool's schema.
+
+Workers gain access after the write gate. The default `lifetime = "call"` starts a new server process per invocation. Set `lifetime = "worker"` to reuse a server for a worker during execution. A call with an unknown outcome is recorded without automatic replay. Ratio also supports the explicit MCP revision `2026-07-28`.
+
+The [MorphLLM + Assist example](examples/morph-assist.toml) uses DeepSeek V4.1 Flash Abliterated and starts the installed `assist --mcp` executable over stdio. Open a database in IDA and set `RATIO_API_KEY` to your MorphLLM credential before starting the run.
+
+```sh
+ra --config examples/morph-assist.toml --check-mcp assist
+ra -C PROJECT --config examples/morph-assist.toml --fixed-team \
+  'Use Assist to identify the open IDA database and summarize its segments and imports.'
+```
 
 ## Development
 

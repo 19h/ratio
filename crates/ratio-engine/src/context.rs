@@ -1,4 +1,7 @@
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::{Context, Result, ensure};
 use ratio_protocol::{Effect, EffectState};
@@ -6,11 +9,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::{Api, Message};
+use crate::audit::{Observation, Outbox, bounded};
 
 const INTERRUPTED: &str = "Tool was interrupted before its result was recorded. Inspect the workspace before deciding whether to retry; it may have changed.";
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Dialogue {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    audit_id: String,
+    #[serde(default)]
+    audit_turn: usize,
+    #[serde(default)]
+    audit_notes: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    brief_recorded: bool,
+    #[serde(skip)]
+    pub(crate) audit: Outbox,
     pub task: String,
     #[serde(default)]
     pub guidance: String,
@@ -36,6 +50,109 @@ pub(crate) struct CompactionReceipt {
 }
 
 impl Dialogue {
+    fn audit_identity(&mut self) {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        if self.audit_id.is_empty() {
+            self.audit_id = format!(
+                "{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            );
+        }
+    }
+
+    fn audit_key(&self, index: usize) -> String {
+        format!("{}-{}-{}", self.audit_id, self.audit_turn, index)
+    }
+
+    pub(crate) fn audit_completion(
+        &mut self,
+        actor: &str,
+        message: &Message,
+        redact: impl Fn(&str) -> String,
+    ) {
+        let Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } = message
+        else {
+            return;
+        };
+        self.audit_identity();
+        self.audit_turn += 1;
+        let turn = format!("{}-{}", self.audit_id, self.audit_turn);
+        self.audit.push(Observation {
+            key: turn.clone(), kind: "chat", actor: actor.into(),
+            data: serde_json::json!({"text": bounded(&redact(content.as_deref().unwrap_or_default())), "calls": tool_calls.iter().enumerate().map(|(index, call)| serde_json::json!({"key": self.audit_key(index), "tool": call.function.name})).collect::<Vec<_>>()}),
+        });
+        for (index, call) in tool_calls.iter().enumerate() {
+            let args =
+                crate::api::tool_arguments::<Value>(&call.function.arguments).unwrap_or_default();
+            let field = |key| args[key].as_str().map(&redact);
+            self.audit.push(Observation {
+                key: self.audit_key(index), kind: "tool", actor: actor.into(),
+                data: serde_json::json!({"turn":turn, "tool":call.function.name,"server":field("server"),"name":field("name"),"path":field("path"),
+                    "state":"queued", "arguments": bounded(&redact(&call.function.arguments))}),
+            });
+        }
+    }
+
+    pub(crate) fn audit_tool(
+        &self,
+        actor: &str,
+        call: &crate::api::ToolCall,
+        state: &str,
+        result: Option<(&str, &str)>,
+        elapsed_ms: Option<u64>,
+    ) {
+        if self.audit_id.is_empty() {
+            return;
+        }
+        let Some(group) = self.groups.back() else {
+            return;
+        };
+        let index = group.len().saturating_sub(1);
+        let key = self.audit_key(index);
+        self.audit.push(Observation {
+            key: format!("{key}-{state}"), kind:"tool_result", actor:actor.into(),
+            data: serde_json::json!({"call":key, "turn":format!("{}-{}",self.audit_id,self.audit_turn),"tool":call.function.name,
+                "state":state, "elapsed_ms":elapsed_ms,
+                "output":result.map(|(output,_)| bounded(output)), "full":result.map(|(_,full)| bounded(full))}),
+        });
+    }
+
+    pub(crate) fn audit_note(&mut self, actor: &str, kind: &'static str, text: &str) {
+        self.audit_identity();
+        self.audit_notes += 1;
+        self.audit.push(Observation {
+            key: format!("{}-note-{}", self.audit_id, self.audit_notes),
+            kind,
+            actor: actor.into(),
+            data: serde_json::json!({"text": bounded(text)}),
+        });
+    }
+
+    pub(crate) fn audit_brief(&mut self, actor: &str, redact: impl Fn(&str) -> String) {
+        if !self.brief_recorded {
+            self.brief_recorded = true;
+            self.audit_note(actor, "brief", &redact(&self.task));
+        }
+    }
+
+    pub(crate) fn audit_triage(&mut self, actor: &str, item: i64, text: &str) {
+        self.audit.push(Observation {
+            key: format!("triage-{item}-{actor}"),
+            kind: "triage_delivery",
+            actor: actor.into(),
+            data: serde_json::json!({"item":item,"text":bounded(text)}),
+        });
+    }
+
     pub(crate) fn result_for(&self, id: &str) -> Option<(&str, &str)> {
         for group in self.groups.iter().rev() {
             let Some(Message::Assistant { tool_calls, .. }) = group.first() else {
@@ -52,7 +169,10 @@ impl Dialogue {
                 Some(Message::Tool {
                     tool_call_id,
                     content,
-                }) if tool_call_id == id && content != INTERRUPTED => {
+                }) if tool_call_id == id
+                    && content != INTERRUPTED
+                    && !content.starts_with(crate::tools::mcp::UNKNOWN_CALL) =>
+                {
                     Some((&call.function.name, content))
                 }
                 _ => None,
@@ -75,6 +195,7 @@ impl Dialogue {
             self.in_flight = false;
             return Ok(true);
         }
+        self.audit_tool("", call, "unknown", Some((INTERRUPTED, INTERRUPTED)), None);
         self.record_tool(call.id.clone(), INTERRUPTED.into());
         Ok(true)
     }
@@ -88,7 +209,10 @@ impl Dialogue {
         };
         for (index, call) in tool_calls.iter().enumerate() {
             let state = match group.get(index + 1) {
-                Some(Message::Tool { content, .. }) if content == INTERRUPTED => {
+                Some(Message::Tool { content, .. })
+                    if content == INTERRUPTED
+                        || content.starts_with(crate::tools::mcp::UNKNOWN_CALL) =>
+                {
                     EffectState::Unknown
                 }
                 Some(Message::Tool { .. }) => EffectState::Recorded,
@@ -199,6 +323,7 @@ fn group_tokens(group: &[Message]) -> usize {
 
 pub struct Compact<'a> {
     pub api: &'a Api,
+    pub actor: &'a str,
     pub model: &'a str,
     pub system: &'a str,
     pub tools: &'a [Value],
@@ -382,7 +507,14 @@ impl Compact<'_> {
             if estimate(&messages, &[]) <= self.input_budget {
                 match self
                     .api
-                    .complete_for("Context compaction", self.model, &messages, &[], output)
+                    .complete_as(
+                        self.actor,
+                        "Context compaction",
+                        self.model,
+                        &messages,
+                        &[],
+                        output,
+                    )
                     .await
                 {
                     Ok(completion) => {

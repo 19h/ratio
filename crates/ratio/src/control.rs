@@ -1,7 +1,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::mpsc::{SyncSender, TrySendError},
     time::Duration,
 };
@@ -15,7 +15,8 @@ use tokio::{
     time::timeout,
 };
 
-use ratio_engine::events::GenerationControl;
+use ratio_engine::events::{GenerationControl, LiveGenerations};
+use ratio_engine::session::Store;
 
 #[cfg(unix)]
 mod unix;
@@ -26,12 +27,32 @@ mod windows;
 #[cfg(windows)]
 use windows as platform;
 
-const MESSAGE_CAP: usize = 16 * 1024;
+const REQUEST_CAP: usize = 16 * 1024;
+// A status response can include a redacted preview for each active request.
+const RESPONSE_CAP: usize = 512 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub(crate) use platform::Listener;
+pub use platform::Listener;
 
-pub(crate) async fn launch(workspace: &Path) -> Result<(Option<ControlReply>, PathBuf)> {
+pub async fn launch(
+    workspace: &Path,
+    request_text: Option<&str>,
+) -> Result<(Option<ControlReply>, PathBuf)> {
+    launch_with_args(
+        workspace,
+        std::env::args_os()
+            .skip(1)
+            .filter(|argument| argument != "--detached"),
+        request_text,
+    )
+    .await
+}
+
+pub async fn launch_with_args(
+    workspace: &Path,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    request_text: Option<&str>,
+) -> Result<(Option<ControlReply>, PathBuf)> {
     let directory = workspace.join(".ratio");
     std::fs::create_dir_all(&directory)?;
     let (log, log_path) = tempfile::Builder::new()
@@ -40,19 +61,27 @@ pub(crate) async fn launch(workspace: &Path) -> Result<(Option<ControlReply>, Pa
         .tempfile_in(directory)?
         .keep()?;
     let error_log = log.try_clone()?;
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = tokio::process::Command::new(std::env::current_exe()?);
     command
-        .args(
-            std::env::args_os()
-                .skip(1)
-                .filter(|argument| argument != "--detached"),
-        )
+        .args(args)
         .arg("--managed-run")
-        .stdin(Stdio::null())
+        .stdin(if request_text.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(error_log));
-    platform::detach(&mut command);
+    platform::detach(command.as_std_mut());
     let mut child = command.spawn().context("start detached Ratio run")?;
+    if let Some(request_text) = request_text {
+        child
+            .stdin
+            .take()
+            .context("open detached request pipe")?
+            .write_all(request_text.as_bytes())
+            .await?;
+    }
     let request = ControlRequest {
         action: ControlAction::Status,
         guidance: None,
@@ -61,7 +90,7 @@ pub(crate) async fn launch(workspace: &Path) -> Result<(Option<ControlReply>, Pa
     let startup = async {
         loop {
             if let Ok(reply) = request_control(workspace, &request).await {
-                if reply.pid == child.id() {
+                if Some(reply.pid) == child.id() {
                     return Ok(Some(reply));
                 }
             }
@@ -77,12 +106,19 @@ pub(crate) async fn launch(workspace: &Path) -> Result<(Option<ControlReply>, Pa
         }
     };
     match timeout(Duration::from_secs(10), startup).await {
-        Ok(result) => Ok((result?, log_path)),
+        Ok(result) => {
+            let result = result?;
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            Ok((result, log_path))
+        }
         Err(_) => {
             child
                 .kill()
+                .await
                 .context("terminate detached process that failed to start")?;
-            let _ = child.wait()?;
+            let _ = child.wait().await?;
             anyhow::bail!(
                 "detached process did not open its control endpoint. See {}",
                 log_path.display()
@@ -91,34 +127,33 @@ pub(crate) async fn launch(workspace: &Path) -> Result<(Option<ControlReply>, Pa
     }
 }
 
-pub(crate) async fn request_control(
-    workspace: &Path,
-    request: &ControlRequest,
-) -> Result<ControlReply> {
+pub async fn request_control(workspace: &Path, request: &ControlRequest) -> Result<ControlReply> {
     timeout(REQUEST_TIMEOUT, async {
         let mut connection = platform::connect(workspace)
             .await
-            .context("connect to detached Ratio run")?;
-        send_frame(&mut connection, &serde_json::to_vec(request)?).await?;
-        let bytes = read_frame(&mut connection).await?;
+            .context("connect to active Ratio run")?;
+        send_frame(&mut connection, &serde_json::to_vec(request)?, REQUEST_CAP).await?;
+        let bytes = read_frame(&mut connection, RESPONSE_CAP).await?;
         Ok(from_slice(&bytes)?)
     })
     .await
-    .context("detached control request timed out")?
+    .context("Ratio control request timed out")?
 }
 
-pub(crate) async fn serve(
+pub async fn serve(
     mut listener: Listener,
     run_id: &str,
     generation: watch::Sender<GenerationControl>,
     guidance: SyncSender<String>,
+    live: LiveGenerations,
+    store: &Store,
 ) -> Result<()> {
     loop {
         let mut connection = listener.accept().await?;
         // The endpoint is private to the operator. Bound each client so an
         // idle or malformed request cannot monopolize it.
         let cancelled = timeout(REQUEST_TIMEOUT, async {
-            let bytes = read_frame(&mut connection).await?;
+            let bytes = read_frame(&mut connection, REQUEST_CAP).await?;
             let request: ControlRequest = match from_slice(&bytes) {
                 Ok(request) => request,
                 Err(error) => {
@@ -128,7 +163,7 @@ pub(crate) async fn serve(
                         false,
                         &format!("invalid request: {error}"),
                     );
-                    send_frame(&mut connection, &serde_json::to_vec(&reply)?).await?;
+                    send_frame(&mut connection, &serde_json::to_vec(&reply)?, RESPONSE_CAP).await?;
                     return Ok::<_, anyhow::Error>(false);
                 }
             };
@@ -143,10 +178,87 @@ pub(crate) async fn serve(
                     false,
                     "requested run is no longer active",
                 );
-                send_frame(&mut connection, &serde_json::to_vec(&response)?).await?;
+                send_frame(
+                    &mut connection,
+                    &serde_json::to_vec(&response)?,
+                    RESPONSE_CAP,
+                )
+                .await?;
                 return Ok(false);
             }
             let (accepted, detail) = match (request.action, request.guidance) {
+                (ControlAction::Triage, Some(text)) => {
+                    let (accepted, detail) = match store.submit_triage(run_id, &text) {
+                        Ok(id) => (true, format!("Information {id} queued for triage")),
+                        Err(error) => (false, format!("{error:#}")),
+                    };
+                    if accepted {
+                        store.record_control(run_id, "Submit information", &detail)?;
+                    }
+                    let response = reply(run_id, generation.borrow().paused, accepted, &detail);
+                    send_frame(
+                        &mut connection,
+                        &serde_json::to_vec(&response)?,
+                        RESPONSE_CAP,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+                (ControlAction::RetryTriage, Some(id)) => {
+                    let result = id
+                        .parse::<i64>()
+                        .ok()
+                        .and_then(|id| store.retry_triage(run_id, id).ok())
+                        .unwrap_or(false);
+                    if result {
+                        store.record_control(
+                            run_id,
+                            "Retry information",
+                            "Information queued for retry",
+                        )?;
+                    }
+                    let response = reply(
+                        run_id,
+                        generation.borrow().paused,
+                        result,
+                        if result {
+                            "Information queued for retry"
+                        } else {
+                            "Item cannot be retried"
+                        },
+                    );
+                    send_frame(
+                        &mut connection,
+                        &serde_json::to_vec(&response)?,
+                        RESPONSE_CAP,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+                (ControlAction::Triage | ControlAction::RetryTriage, None) => {
+                    (false, "Triage requires information or an item ID")
+                }
+                (ControlAction::AddWorker, text) => {
+                    let result = text
+                        .as_deref()
+                        .context("add-worker requires a worker request")
+                        .and_then(|text| store.request_worker(run_id, text));
+                    let (accepted, detail) = match result {
+                        Ok(id) => (true, format!("Worker request {id} queued")),
+                        Err(error) => (false, format!("{error:#}")),
+                    };
+                    if accepted {
+                        store.record_control(run_id, "Add worker", &detail)?;
+                    }
+                    let response = reply(run_id, generation.borrow().paused, accepted, &detail);
+                    send_frame(
+                        &mut connection,
+                        &serde_json::to_vec(&response)?,
+                        RESPONSE_CAP,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
                 (ControlAction::Guide, Some(text))
                     if !text.trim().is_empty() && text.len() <= 4096 =>
                 {
@@ -174,8 +286,19 @@ pub(crate) async fn serve(
                 (ControlAction::Cancel, _) => (true, "run cancellation requested"),
                 (ControlAction::Status, _) => (true, "run is active"),
             };
-            let response = reply(run_id, generation.borrow().paused, accepted, detail);
-            let result = send_frame(&mut connection, &serde_json::to_vec(&response)?).await;
+            let mut response = reply(run_id, generation.borrow().paused, accepted, detail);
+            if accepted && request.action != ControlAction::Status {
+                store.record_control(run_id, &format!("{:?}", request.action), detail)?;
+            }
+            if accepted && request.action == ControlAction::Status && request.run_id.is_some() {
+                response.generations = live.snapshot();
+            }
+            let result = send_frame(
+                &mut connection,
+                &serde_json::to_vec(&response)?,
+                RESPONSE_CAP,
+            )
+            .await;
             if accepted && request.action == ControlAction::Cancel {
                 return Ok(true);
             }
@@ -196,6 +319,7 @@ fn reply(run_id: &str, paused: bool, accepted: bool, detail: &str) -> ControlRep
         paused,
         accepted,
         detail: detail.into(),
+        generations: Vec::new(),
     }
 }
 
@@ -210,9 +334,9 @@ fn workspace_key(workspace: &Path) -> String {
         .collect()
 }
 
-async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
+async fn read_frame(stream: &mut (impl AsyncRead + Unpin), cap: usize) -> io::Result<Vec<u8>> {
     let length = stream.read_u32().await? as usize;
-    if length > MESSAGE_CAP {
+    if length > cap {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "control frame too large",
@@ -223,8 +347,12 @@ async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>
     Ok(bytes)
 }
 
-async fn send_frame(stream: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> io::Result<()> {
-    if bytes.len() > MESSAGE_CAP {
+async fn send_frame(
+    stream: &mut (impl AsyncWrite + Unpin),
+    bytes: &[u8],
+    cap: usize,
+) -> io::Result<()> {
+    if bytes.len() > cap {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "control frame too large",

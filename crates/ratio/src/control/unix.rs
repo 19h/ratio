@@ -13,13 +13,13 @@ use tokio::net::{UnixListener, UnixStream};
 
 use super::workspace_key;
 
-pub(crate) struct Listener {
+pub struct Listener {
     listener: UnixListener,
     path: PathBuf,
 }
 
 impl Listener {
-    pub(crate) fn bind(workspace: &Path) -> Result<Self> {
+    pub fn bind(workspace: &Path) -> Result<Self> {
         let path = endpoint(workspace, true)?;
         match fs::remove_file(&path) {
             Ok(()) => {}

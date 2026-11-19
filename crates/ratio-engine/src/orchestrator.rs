@@ -1,6 +1,10 @@
 use std::{collections::HashSet, path::Path, sync::mpsc::Receiver, time::Duration};
 
 use anyhow::{Context, Result, ensure};
+
+mod contracts;
+mod onboarding;
+mod triage;
 use futures_util::{StreamExt, stream};
 use ratio_protocol::{RunStop, TaskGraph};
 use serde_json::{Value, json};
@@ -27,6 +31,7 @@ pub struct Orchestrator<'a> {
     store: &'a Store,
     reporter: Reporter,
     budget: Budget,
+    mcp: crate::tools::mcp::Connections,
 }
 
 impl<'a> Orchestrator<'a> {
@@ -36,17 +41,13 @@ impl<'a> Orchestrator<'a> {
         reporter: Reporter,
         budget: Budget,
     ) -> Result<Self> {
-        let debug = if config.headless && config.debug {
-            Reporter::Terminal
-        } else {
-            reporter.clone()
-        };
         Ok(Self {
             config,
-            api: Api::new(config, debug, budget.clone())?,
+            api: Api::new(config, reporter.clone(), budget.clone())?,
             store,
             reporter,
             budget,
+            mcp: Default::default(),
         })
     }
 
@@ -65,7 +66,7 @@ impl<'a> Orchestrator<'a> {
         let resume_staging = session.budget_started;
         session.stopped = None;
         if !session.budget_started {
-            session.require_task_graph = self.config.orchestration.require_task_graph;
+            session.require_task_graph |= self.config.orchestration.require_task_graph;
         }
         if !resume_staging && self.config.orchestration.stage_workspace {
             session.staging_commands =
@@ -108,6 +109,7 @@ impl<'a> Orchestrator<'a> {
                 _ = tick.tick() => self.budget.save_if_active()?,
             }
         };
+        self.mcp.clear();
         self.budget.save()?;
         if let (Err(_), Some(limit)) = (&outcome, self.budget.exhaustion()) {
             let mut saved = self.store.load_run(Some(&run_id))?;
@@ -118,10 +120,18 @@ impl<'a> Orchestrator<'a> {
             saved.phase = Phase::Exhausted;
             saved.assessment = format!("Run budget exhausted: {limit}");
             self.store.save(&saved)?;
+            self.store.journal.borrow().defer_triage(&run_id)?;
             return Ok(saved);
         }
-        if outcome.is_err() {
+        if let Err(error) = &outcome {
             self.store.mark_stopped(&run_id, RunStop::Failed)?;
+            self.store.journal.borrow_mut().record_signal(
+                &run_id,
+                "error",
+                "",
+                "Run failed",
+                &self.api.redact(&format!("{error:#}")),
+            )?;
         }
         outcome
     }
@@ -136,6 +146,44 @@ impl<'a> Orchestrator<'a> {
         let workspace = candidate.as_deref().unwrap_or(&self.config.cwd);
         if session.dialogue.recover_interrupted_tool()? {
             self.progress("[resume] Recovered an interrupted tool call");
+        }
+        if session.phase == Phase::ProposeTeam {
+            let mut draft = crate::setup::Draft::seed(self.config);
+            draft.goal.clone_from(&session.goal);
+            self.reporter
+                .emit(Kind::Phase, Phase::ProposeTeam.label(), "");
+            let proposal = crate::setup::refine(
+                self.config,
+                &self.api,
+                &draft,
+                "Propose the team and acceptance criteria for this request.",
+            )
+            .await?;
+            session.request = Some(session.goal.clone());
+            session.goal.clone_from(&proposal.goal);
+            session.require_task_graph = true;
+            session.workers = Some(proposal.workers.clone());
+            session.reviewers = Some(proposal.reviewers.clone());
+            session.stakeholders = Some(proposal.stakeholders.clone());
+            session.team_acceptance.clone_from(&proposal.acceptance);
+            let proposal_text = serde_json::to_string_pretty(&proposal)?;
+            session
+                .dialogue
+                .task
+                .push_str(&format!("\nStartup team proposal:\n{proposal_text}"));
+            session.dialogue.audit_note(
+                "lead_reviewer",
+                "proposal",
+                &self.api.redact(&proposal_text),
+            );
+            self.store.save(&session)?;
+            session.phase = Phase::Plan;
+            self.store.save(&session)?;
+            self.reporter.emit(
+                Kind::Agent,
+                format!("Proposed team / {} workers", proposal.workers.len()),
+                &proposal_text,
+            );
         }
         session
             .stakeholders
@@ -168,6 +216,11 @@ impl<'a> Orchestrator<'a> {
 
         while !session.phase.done() {
             let phase = session.phase;
+            if phase == Phase::OnboardWorker {
+                self.mcp.clear();
+                self.onboard_worker(&mut session, workspace).await?;
+                continue;
+            }
             if phase == Phase::Publish {
                 self.publish(&mut session, staging)?;
                 continue;
@@ -223,7 +276,7 @@ impl<'a> Orchestrator<'a> {
                             system.push_str("\nInclude one task per worker, explicit predecessor task IDs, and concrete acceptance criteria.");
                         }
                     }
-                    let mut repaired = false;
+                    let mut repairs = 0;
                     if phase == Phase::Work && self.reporter.observes_network() {
                         self.reporter.handoff(
                             traffic_scope(&session),
@@ -237,6 +290,22 @@ impl<'a> Orchestrator<'a> {
                         if session.dialogue.pending()?.is_none() {
                             self.api.wait_for_generation().await?;
                             self.receive_guidance(&mut session, guidance.as_ref())?;
+                            let actor = if phase == Phase::Work {
+                                "worker_1"
+                            } else {
+                                "lead_reviewer"
+                            };
+                            if let Some(note) = self
+                                .next_triage(
+                                    session.run_id(),
+                                    &[actor.into()],
+                                    actor == "lead_reviewer",
+                                )
+                                .await?
+                            {
+                                self.apply_triage(&mut session.dialogue, actor, &note);
+                                self.store.save(&session)?;
+                            }
                         }
                         match self
                             .step(
@@ -262,6 +331,7 @@ impl<'a> Orchestrator<'a> {
                                     ownership: None,
                                     workspace,
                                     require_task_graph: session.require_task_graph,
+                                    repairing: repairs > 0,
                                     allow_approval: staging.is_none()
                                         || session
                                             .verification
@@ -275,6 +345,7 @@ impl<'a> Orchestrator<'a> {
                             Step::Verdict(verdict, call_id) => {
                                 session.verdict = Some(verdict);
                                 session.verdict_tool_call_id = Some(call_id);
+                                self.store.save(&session)?;
                                 break session
                                     .verdict
                                     .as_ref()
@@ -296,6 +367,7 @@ impl<'a> Orchestrator<'a> {
                                 );
                                 session.worker_plan =
                                     Some(frozen.bind_graph(plan.graph, session.cycle, workers));
+                                self.store.save(&session)?;
                                 break session
                                     .worker_plan
                                     .as_ref()
@@ -304,8 +376,43 @@ impl<'a> Orchestrator<'a> {
                                     .clone();
                             }
                             Step::Repair(message) => {
-                                ensure!(!repaired, "decision protocol error: {message}");
-                                repaired = true;
+                                self.store.save(&session)?;
+                                if repairs == 2 && phase == Phase::FreezePlan {
+                                    let workers = session
+                                        .workers
+                                        .as_deref()
+                                        .context("missing worker roster")?;
+                                    self.progress(&format!("Plan contract: {message}. Recovering one assignment at a time."));
+                                    let plan = self
+                                        .recover_plan(&session, workspace, workers, &message)
+                                        .await?;
+                                    let frozen = WorkerPlan::freeze(
+                                        plan.text,
+                                        session.cycle,
+                                        session.plan_attempt,
+                                        workers,
+                                        plan.ownership,
+                                    )
+                                    .bind_graph(
+                                        plan.graph,
+                                        session.cycle,
+                                        workers,
+                                    );
+                                    let text = frozen.text.clone();
+                                    session.worker_plan = Some(frozen);
+                                    break text;
+                                }
+                                ensure!(
+                                    repairs < 2,
+                                    "decision protocol error during {}: {message}",
+                                    phase.label()
+                                );
+                                repairs += 1;
+                                self.reporter.emit(
+                                    Kind::Info,
+                                    format!("{} / Plan contract repair {repairs}/2", phase.label()),
+                                    &message,
+                                );
                                 self.append_guidance(
                                     &mut session.dialogue,
                                     &format!("Protocol correction: {message}"),
@@ -313,6 +420,7 @@ impl<'a> Orchestrator<'a> {
                                 self.store.save(&session)?;
                             }
                             Step::Finished(text) => {
+                                self.store.save(&session)?;
                                 if !self.receive_guidance(&mut session, guidance.as_ref())? {
                                     break text;
                                 }
@@ -321,6 +429,14 @@ impl<'a> Orchestrator<'a> {
                     }
                 }
             };
+            if session.phase == Phase::OnboardWorker {
+                continue;
+            }
+            if phase == Phase::Work {
+                self.mcp.clear();
+                session.work_intake_closed = true;
+                self.store.save(&session)?;
+            }
             let response = if phase == Phase::Work {
                 if let Some(staged) = staging {
                     let commands = session
@@ -349,10 +465,34 @@ impl<'a> Orchestrator<'a> {
                     &response,
                 );
             }
-            self.reporter.emit(Kind::Agent, phase.label(), &response);
+            let actor = match phase {
+                Phase::Work if session.worker_progress.is_empty() => Some("worker_1"),
+                Phase::Plan | Phase::PlanSynthesize | Phase::Review | Phase::ReviewSynthesize => {
+                    Some("lead_reviewer")
+                }
+                _ => None,
+            };
+            if let Some(actor) = actor {
+                self.reporter
+                    .agent(actor, Kind::Agent, phase.label(), &response);
+            } else {
+                self.reporter.emit(Kind::Agent, phase.label(), &response);
+            }
             let scope = traffic_scope(&session);
             session.panel = None;
             self.advance(&mut session, response);
+            if phase == Phase::Work {
+                if let Some(verification) = &session.verification {
+                    session.dialogue.audit_note(
+                        "verification",
+                        "verification",
+                        &self.api.redact(&format!(
+                            "Candidate SHA-256: {}\nPassed: {}\n{}",
+                            verification.digest, verification.passed, verification.report
+                        )),
+                    );
+                }
+            }
             self.store.save(&session)?;
             if session.phase.done() {
                 self.reporter.handoff(
@@ -368,6 +508,7 @@ impl<'a> Orchestrator<'a> {
                 );
             }
         }
+        self.store.journal.borrow().defer_triage(session.run_id())?;
         Ok(session)
     }
 
@@ -384,6 +525,9 @@ impl<'a> Orchestrator<'a> {
             return Ok(false);
         };
         self.append_guidance(&mut session.dialogue, &note);
+        session
+            .dialogue
+            .audit_note("user", "guidance", &self.api.redact(&note));
         self.store.save(session)?;
         self.progress("[steer] Added user guidance to the current phase");
         Ok(true)
@@ -483,6 +627,7 @@ impl<'a> Orchestrator<'a> {
         stage.publish(&receipt.digest)?;
         session.phase = Phase::Approved;
         self.store.save(session)?;
+        self.store.journal.borrow().defer_triage(session.run_id())?;
         self.reporter.handoff(
             scope,
             "lead_reviewer",
@@ -558,6 +703,7 @@ impl<'a> Orchestrator<'a> {
         scope: &str,
         peer: PeerTools<'_>,
     ) -> Result<Step> {
+        dialogue.audit_brief(peer.author, |text| self.api.redact(text));
         // Keep individual results bounded before they enter history.
         let tools = Tools {
             workspace: peer.workspace,
@@ -570,12 +716,21 @@ impl<'a> Orchestrator<'a> {
         if let Some(call) = dialogue.pending()?.cloned() {
             if peer.final_review && call.function.name == "submit_verdict" {
                 let verdict = parse_verdict(&call)?;
-                self.reporter.emit(
+                self.reporter.agent(
+                    peer.author,
                     Kind::Tool,
-                    format!("{scope} / submit_verdict"),
+                    "submit_verdict",
                     verdict.verdict.label(),
                 );
-                dialogue.record_tool(call.id.clone(), "Recorded final verdict.".into());
+                let receipt = "Recorded final verdict.";
+                dialogue.audit_tool(
+                    peer.author,
+                    &call,
+                    "completed",
+                    Some((receipt, receipt)),
+                    None,
+                );
+                dialogue.record_tool(call.id.clone(), receipt.into());
                 return Ok(Step::Verdict(verdict, call.id));
             }
             if let Some(workers) = peer
@@ -583,47 +738,64 @@ impl<'a> Orchestrator<'a> {
                 .filter(|_| call.function.name == "submit_plan")
             {
                 let plan = parse_plan(&call, workers, peer.workspace, peer.require_task_graph)?;
-                self.reporter
-                    .emit(Kind::Tool, format!("{scope} / submit_plan"), "");
-                dialogue.record_tool(call.id, "Recorded frozen worker plan.".into());
+                self.reporter.agent(
+                    peer.author,
+                    Kind::Tool,
+                    "submit_plan",
+                    "Recorded frozen worker plan.",
+                );
+                let receipt = "Recorded frozen worker plan.";
+                dialogue.audit_tool(
+                    peer.author,
+                    &call,
+                    "completed",
+                    Some((receipt, receipt)),
+                    None,
+                );
+                dialogue.record_tool(call.id, receipt.into());
                 return Ok(Step::Plan(plan));
             }
             if !dialogue.in_flight {
                 dialogue.in_flight = true;
+                dialogue.audit_tool(peer.author, &call, "running", None, None);
                 return Ok(Step::Continue);
             }
-            let title = format!("{scope} / {}", tools.label(&call));
-            self.reporter.emit(Kind::Tool, &title, "");
-            let output = match (call.function.name.as_str(), peer) {
+            let title = tools.label(&call);
+            self.reporter.agent(peer.author, Kind::Tool, &title, "");
+            let started = std::time::Instant::now();
+            let same = |output: String| (output.clone(), output);
+            let (output, full) = match (call.function.name.as_str(), peer) {
                 (
                     "send_message",
                     PeerTools {
                         route: Some(route), ..
                     },
-                ) => route.execute(&call, self.config.api_key.as_deref()),
+                ) => same(route.execute(&call, self.config.api_key.as_deref())),
                 (
                     "ack_plan",
                     PeerTools {
                         ack: Some((gate, worker)),
                         ..
                     },
-                ) => gate.execute(&call, worker),
+                ) => same(gate.execute(&call, worker)),
                 (
                     "object_to_plan",
                     PeerTools {
                         ack: Some((gate, worker)),
                         ..
                     },
-                ) => gate.object(&call, worker),
-                ("remember" | "recall", _) => peer.memory.execute(
+                ) => same(gate.object(&call, worker)),
+                ("remember" | "recall", _) => same(peer.memory.execute(
                     &call,
                     peer.author,
                     self.config.api_key.as_deref(),
                     tools.output_bytes,
                     dialogue,
-                ),
+                )),
                 ("mcp_list" | "mcp_call", _) if matches!(access, Access::Work) => {
                     crate::tools::mcp::dispatch(
+                        &self.mcp,
+                        peer.author,
                         &self.config.mcp_servers,
                         &call,
                         tools.workspace,
@@ -633,18 +805,44 @@ impl<'a> Orchestrator<'a> {
                     )
                     .await
                 }
-                ("read_skill", _) => {
+                ("read_skill", _) => same(
                     crate::tools::skills::dispatch(
                         &self.config.skills,
                         &call,
                         tools.output_bytes,
                         self.config.api_key.as_deref(),
                     )
-                    .await
-                }
-                _ => tools.execute(&call).await,
+                    .await,
+                ),
+                _ => tools.execute_audited(&call).await,
             };
-            self.reporter.emit(Kind::Output, &title, &output);
+            let mcp_error = full
+                .strip_prefix("Untrusted MCP tool output\n")
+                .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+                .is_some_and(|payload| payload["isError"] == true);
+            let state = if output.starts_with(crate::tools::mcp::UNKNOWN_CALL) {
+                "unknown"
+            } else if output.starts_with("REFUSED")
+                || (output.starts_with("Tool error: tool ") && output.contains("is unavailable"))
+            {
+                "refused"
+            } else if output.starts_with("Tool error:")
+                || full.starts_with("Succeeded: false\n")
+                || mcp_error
+            {
+                "failed"
+            } else {
+                "completed"
+            };
+            dialogue.audit_tool(
+                peer.author,
+                &call,
+                state,
+                Some((&self.api.redact(&output), &self.api.redact(&full))),
+                Some(started.elapsed().as_millis() as u64),
+            );
+            self.reporter
+                .agent(peer.author, Kind::Output, &title, &output);
             dialogue.record_tool(call.id, output);
             return Ok(Step::Continue);
         }
@@ -664,8 +862,16 @@ impl<'a> Orchestrator<'a> {
         if peer.final_review {
             schemas.push(verdict_schema());
         }
-        if peer.plan_workers.is_some() {
-            schemas.push(plan_schema(peer.require_task_graph));
+        if let Some(workers) = peer.plan_workers {
+            schemas.push(plan_schema(workers.len(), peer.require_task_graph));
+        }
+        if peer.repairing {
+            schemas.retain(|schema| {
+                matches!(
+                    schema["function"]["name"].as_str(),
+                    Some("submit_plan" | "submit_verdict")
+                )
+            });
         }
         let window_budget = self.config.context_window - self.config.output_tokens;
         let mut hard_limit = window_budget;
@@ -679,6 +885,7 @@ impl<'a> Orchestrator<'a> {
                 .min(hard_limit);
             let compact = Compact {
                 api: &self.api,
+                actor: peer.author,
                 model,
                 system,
                 tools: &schemas,
@@ -697,13 +904,28 @@ impl<'a> Orchestrator<'a> {
             };
             if compacted > 0 {
                 self.progress(&format!("[context] Compacted {compacted} tool exchanges"));
+                dialogue.audit_note(
+                    peer.author,
+                    "compaction",
+                    &self.api.redact(&format!(
+                        "Folded {compacted} historical exchanges.\n\n{}",
+                        dialogue.summary
+                    )),
+                );
             }
             let prefix = dialogue.prefix(system);
             let messages = dialogue.messages(&prefix);
             let projected = estimate(&messages, &schemas);
             let completion = match self
                 .api
-                .complete_for(scope, model, &messages, &schemas, self.config.output_tokens)
+                .complete_as(
+                    peer.author,
+                    scope,
+                    model,
+                    &messages,
+                    &schemas,
+                    self.config.output_tokens,
+                )
                 .await
             {
                 Ok(completion) => completion,
@@ -733,7 +955,23 @@ impl<'a> Orchestrator<'a> {
             else {
                 anyhow::bail!("provider returned a non-assistant message");
             };
+            let rejected = |dialogue: &mut Dialogue, reason: &str| {
+                let details = serde_json::json!({"text":content,"tool_calls":tool_calls});
+                dialogue.audit_note(
+                    peer.author,
+                    "contract_error",
+                    &self.api.redact(&format!("{reason}\n\n{details}")),
+                );
+            };
+            let repair = |dialogue: &mut Dialogue, reason: String| {
+                rejected(dialogue, &reason);
+                Step::Repair(reason)
+            };
             if completion.finish_reason.as_deref() == Some("length") && length_retries < 2 {
+                rejected(
+                    dialogue,
+                    "Completion reached the output limit and was discarded.",
+                );
                 length_retries += 1;
                 length_target = Some(length_target.unwrap_or(projected).min(projected) * 3 / 4);
                 if length_retries == 1 {
@@ -741,6 +979,15 @@ impl<'a> Orchestrator<'a> {
                 }
                 self.progress("[context] Completion hit the output limit. Retrying with a smaller prompt where possible.");
                 continue;
+            }
+            if completion.finish_reason.as_deref() == Some("length")
+                && (peer.plan_workers.is_some() || peer.final_review)
+            {
+                return Ok(repair(
+                    dialogue,
+                    "decision exceeded the output limit; return a concise, complete tool call"
+                        .into(),
+                ));
             }
             ensure!(
                 !matches!(
@@ -750,6 +997,16 @@ impl<'a> Orchestrator<'a> {
                 "provider ended completion with {}. Adjust the output budget or inspect provider settings",
                 completion.finish_reason.as_deref().unwrap_or_default()
             );
+            if peer.repairing {
+                let name = if peer.final_review {
+                    "submit_verdict"
+                } else {
+                    "submit_plan"
+                };
+                if !matches!(tool_calls.as_slice(), [call] if call.function.name == name) {
+                    return Ok(repair(dialogue, format!("call {name} alone during repair")));
+                }
+            }
             if peer.final_review
                 && (tool_calls.is_empty()
                     || tool_calls
@@ -762,18 +1019,20 @@ impl<'a> Orchestrator<'a> {
                             if matches!(verdict.verdict, VerdictKind::Approved)
                                 && !peer.allow_approval =>
                         {
-                            return Ok(Step::Repair(
+                            return Ok(repair(
+                                dialogue,
                                 "Candidate verification failed. Use needs_revision or rejected."
                                     .into(),
                             ));
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            return Ok(Step::Repair(format!("submit_verdict: {error:#}")));
+                            return Ok(repair(dialogue, format!("submit_verdict: {error:#}")));
                         }
                     }
                 } else {
-                    return Ok(Step::Repair(
+                    return Ok(repair(
+                        dialogue,
                         "Call submit_verdict alone to submit a decision.".into(),
                     ));
                 }
@@ -788,10 +1047,11 @@ impl<'a> Orchestrator<'a> {
                     if let Err(error) =
                         parse_plan(call, workers, peer.workspace, peer.require_task_graph)
                     {
-                        return Ok(Step::Repair(format!("submit_plan: {error:#}")));
+                        return Ok(repair(dialogue, format!("submit_plan: {error:#}")));
                     }
                 } else {
-                    return Ok(Step::Repair(
+                    return Ok(repair(
+                        dialogue,
                         "Call submit_plan alone to freeze the worker plan.".into(),
                     ));
                 }
@@ -801,6 +1061,9 @@ impl<'a> Orchestrator<'a> {
                     completion.finish_reason.as_deref() != Some("tool_calls"),
                     "provider signaled tool calls without sending any"
                 );
+                dialogue.audit_completion(peer.author, &completion.message, |text| {
+                    self.api.redact(text)
+                });
                 return Ok(Step::Finished(
                     content
                         .clone()
@@ -821,9 +1084,12 @@ impl<'a> Orchestrator<'a> {
             );
             if let Some(text) = content.as_deref().filter(|text| !text.trim().is_empty()) {
                 self.reporter
-                    .emit(Kind::Agent, scope, clip(text, 24 * 1024));
+                    .agent(peer.author, Kind::Info, "Message", clip(text, 24 * 1024));
             }
             dialogue.tool_rounds += 1;
+            dialogue.audit_completion(peer.author, &completion.message, |text| {
+                self.api.redact(text)
+            });
             let mixed_plan_decision = peer.ack.is_some()
                 && tool_calls.len() > 1
                 && tool_calls.iter().any(|call| {
@@ -836,6 +1102,16 @@ impl<'a> Orchestrator<'a> {
                     .collect::<Vec<_>>();
                 dialogue.groups.push_back(vec![completion.message]);
                 for id in ids {
+                    let call = dialogue.pending()?.context("missing refused tool")?.clone();
+                    let receipt =
+                        "REFUSED: submit an acknowledgement or objection as the sole tool call.";
+                    dialogue.audit_tool(
+                        peer.author,
+                        &call,
+                        "refused",
+                        Some((receipt, receipt)),
+                        None,
+                    );
                     dialogue.record_tool(
                         id,
                         "REFUSED: submit an acknowledgement or objection as the sole tool call."
@@ -929,6 +1205,8 @@ impl<'a> Orchestrator<'a> {
                 dependencies: None,
                 workspace,
                 staging: None,
+                admission_run: None,
+                triage_run: None,
             },
             |panel| self.checkpoint_panel(session, panel, &mailbox, None),
         )
@@ -958,6 +1236,34 @@ impl<'a> Orchestrator<'a> {
                 self.progress("[steer] Added user guidance to the worker team");
                 checkpoint(&panel.iter().map(PanelAgent::snapshot).collect::<Vec<_>>())?;
             }
+            if let Some(run) = options.triage_run.filter(|_| {
+                panel.iter().all(|agent| {
+                    agent
+                        .dialogue
+                        .pending()
+                        .is_ok_and(|pending| pending.is_none())
+                })
+            }) {
+                let eligible = panel
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, agent)| agent.assessment.is_none() && !agent.failed)
+                    .map(|(index, _)| mailbox.id(index).to_owned())
+                    .collect::<Vec<_>>();
+                if let Some(note) = self.next_triage(run, &eligible, false).await? {
+                    let mut changed = false;
+                    for (index, agent) in panel.iter_mut().enumerate() {
+                        let id = mailbox.id(index);
+                        if note.recipients.iter().any(|recipient| recipient == id) {
+                            self.apply_triage(&mut agent.dialogue, id, &note);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        checkpoint(&panel.iter().map(PanelAgent::snapshot).collect::<Vec<_>>())?;
+                    }
+                }
+            }
             for (index, agent) in panel.iter_mut().enumerate() {
                 if !agent.failed && agent.dialogue.pending()?.is_none() {
                     if options.ipc {
@@ -974,9 +1280,10 @@ impl<'a> Orchestrator<'a> {
                             }
                             .into(),
                         );
-                        self.reporter.emit(
+                        self.reporter.agent(
+                            mailbox.id(index),
                             Kind::Agent,
-                            &agent.scope,
+                            "Plan response",
                             agent.assessment.as_deref().unwrap_or_default(),
                         );
                     }
@@ -987,6 +1294,7 @@ impl<'a> Orchestrator<'a> {
                 let mut integrated = false;
                 for (index, agent) in panel[..workers].iter_mut().enumerate() {
                     if agent.assessment.is_some() && agent.artifact_sha256.is_none() {
+                        self.mcp.close_worker(mailbox.id(index));
                         let stage = staging.clone();
                         let ownership = options
                             .ownership
@@ -1012,11 +1320,22 @@ impl<'a> Orchestrator<'a> {
                 // Commit drained mail together with the receiving dialogue.
                 checkpoint(&saved)?;
             }
+            let admitting = self.worker_admission_pending(options.admission_run)?;
+            if admitting {
+                let mut outstanding = false;
+                for agent in panel.iter() {
+                    outstanding |= agent.dialogue.pending()?.is_some();
+                }
+                if !outstanding {
+                    break;
+                }
+            }
             let ready: Vec<_> = panel
                 .iter()
                 .enumerate()
                 .map(|(index, agent)| {
-                    agent.assessment.is_none()
+                    (!admitting || agent.dialogue.pending().is_ok_and(|call| call.is_some()))
+                        && agent.assessment.is_none()
                         && options
                             .dependencies
                             .and_then(|all| all.get(index))
@@ -1065,6 +1384,15 @@ impl<'a> Orchestrator<'a> {
                             Err(error) => return (sender, agent.snapshot(), Err(error.into())),
                         }
                     }
+                    let defer = (|| -> Result<bool> {
+                        Ok(agent.dialogue.pending()?.is_none()
+                            && self.worker_admission_pending(options.admission_run)?)
+                    })();
+                    match defer {
+                        Ok(false) => {}
+                        Ok(true) => return (sender, agent.snapshot(), Ok(())),
+                        Err(error) => return (sender, agent.snapshot(), Err(error)),
+                    }
                     let peer = PeerTools {
                         route: options.ipc.then_some(Route { mailbox, sender }),
                         ack: options.gate.map(|gate| (gate, sender)),
@@ -1078,6 +1406,7 @@ impl<'a> Orchestrator<'a> {
                         workspace: private_workspace.as_deref().unwrap_or(options.workspace),
                         allow_approval: false,
                         require_task_graph: false,
+                        repairing: false,
                     };
                     let result = match self
                         .step(
@@ -1095,13 +1424,15 @@ impl<'a> Orchestrator<'a> {
                             unreachable!("panel has no decision tool")
                         }
                         Ok(Step::Finished(result)) => {
-                            self.reporter.emit(Kind::Agent, &agent.scope, &result);
+                            self.reporter
+                                .agent(peer.author, Kind::Agent, "Report", &result);
                             agent.assessment = Some(result);
                             Ok(())
                         }
                         Err(error) if options.tolerate_failures || stakeholder => {
                             let detail = format!("Consultation unavailable: {error:#}");
-                            self.reporter.emit(Kind::Info, &agent.scope, &detail);
+                            self.reporter
+                                .agent(peer.author, Kind::Info, "Consultation", &detail);
                             agent.assessment = Some(detail);
                             agent.failed = true;
                             mailbox.close(sender);
@@ -1125,6 +1456,13 @@ impl<'a> Orchestrator<'a> {
             }
         }
         Ok(())
+    }
+
+    fn worker_admission_pending(&self, run: Option<&str>) -> Result<bool> {
+        match run {
+            Some(run) => Ok(self.store.pending_worker(run)?.is_some()),
+            None => Ok(false),
+        }
     }
 
     fn panel_reports(&self, panel: Vec<PanelAgent<'_>>) -> String {
@@ -1402,6 +1740,14 @@ impl<'a> Orchestrator<'a> {
         }
 
         let memory = session.memory.clone();
+        let admission_run = session.run_id().to_owned();
+        if enabling_work {
+            if let Some((id, _)) = self.store.pending_worker(&admission_run)? {
+                if session.last_worker_request == Some(id) {
+                    self.store.finish_worker_request(id)?;
+                }
+            }
+        }
         let options = PanelOptions {
             access: if enabling_work {
                 Access::Work
@@ -1423,6 +1769,8 @@ impl<'a> Orchestrator<'a> {
             staging: staging
                 .filter(|_| enabling_work)
                 .map(|stage| (stage, session.cycle)),
+            admission_run: (enabling_work && !implicit).then_some(admission_run.as_str()),
+            triage_run: enabling_work.then_some(admission_run.as_str()),
         };
         if enabling_work {
             self.checkpoint_workers(
@@ -1440,6 +1788,13 @@ impl<'a> Orchestrator<'a> {
                 )
             })
             .await?;
+            if let Some((id, _)) = self.store.pending_worker(&admission_run)? {
+                session.phase = Phase::OnboardWorker;
+                session.active_worker_request = Some(id);
+                session.worker_addition_status = Some(format!("Worker request {id} / onboarding"));
+                self.store.save(session)?;
+                return Ok(String::new());
+            }
         } else {
             self.drive_panel(&mut panel, &mailbox, options, |panel| {
                 self.checkpoint_panel(session, panel, &mailbox, gate.as_ref())
@@ -1536,6 +1891,9 @@ impl<'a> Orchestrator<'a> {
             mailbox: mailbox.snapshot(),
             gate: gate.map(PlanGate::snapshot),
             agents: panel.to_vec(),
+            actor_ids: (0..panel.len())
+                .map(|index| mailbox.id(index).into())
+                .collect(),
         });
         self.store
             .save_with_traffic(session, mailbox.take_traffic())
@@ -1579,6 +1937,8 @@ impl<'a> Orchestrator<'a> {
             .as_deref()
             .filter(|workers| !workers.is_empty());
         let (phase, task) = match session.phase {
+            Phase::ProposeTeam => unreachable!("startup team proposal handled before phase loop"),
+            Phase::OnboardWorker => unreachable!("worker admission handled before phase loop"),
             Phase::Plan
                 if self
                     .participants(session, ConsultationPhase::Planning)
@@ -1674,6 +2034,7 @@ impl<'a> Orchestrator<'a> {
                     }
                     VerdictKind::NeedsRevision => {
                         session.verification = None;
+                        session.work_intake_closed = false;
                         session.cycle += 1;
                         session.plan_attempt = 1;
                         session.worker_plan = None;
@@ -1759,6 +2120,7 @@ fn traffic_scope(session: &Session) -> TrafficScope {
         cycle: session.cycle,
         attempt: session.plan_attempt,
         phase: session.phase.label(),
+        worker_request: session.active_worker_request,
     }
 }
 
@@ -1784,6 +2146,7 @@ struct PeerTools<'a> {
     workspace: &'a Path,
     allow_approval: bool,
     require_task_graph: bool,
+    repairing: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1800,6 +2163,8 @@ struct PanelOptions<'a> {
     dependencies: Option<&'a [Vec<usize>]>,
     workspace: &'a Path,
     staging: Option<(&'a Staging, usize)>,
+    admission_run: Option<&'a str>,
+    triage_run: Option<&'a str>,
 }
 
 impl PanelAgent<'_> {
@@ -1877,20 +2242,28 @@ struct FrozenSubmission {
     graph: Option<TaskGraph>,
 }
 
-fn plan_schema(require_graph: bool) -> Value {
+fn plan_schema(worker_count: usize, require_graph: bool) -> Value {
+    let ids: Vec<_> = (1..=worker_count)
+        .map(|index| format!("worker_{index}"))
+        .collect();
+    let path_list = json!({"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"directory":{"type":"boolean"}},"required":["path","directory"],"additionalProperties":false}});
+    let ownership: serde_json::Map<_, _> = ids
+        .iter()
+        .map(|id| (id.clone(), path_list.clone()))
+        .collect();
     let mut schema = json!({"type":"function","function":{"name":"submit_plan",
         "description":"Freeze the plan. Include each assignment in plan; ownership maps every worker_N to its exclusive paths. Use [] for read-only workers.",
         "parameters":{"type":"object","properties":{"plan":{"type":"string"},
-          "ownership":{"type":"object","additionalProperties":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"directory":{"type":"boolean"}},"required":["path","directory"],"additionalProperties":false}}}
+          "ownership":{"type":"object","properties":ownership,"required":ids,"additionalProperties":false}
         },"required":["plan","ownership"],"additionalProperties":false}}});
     if require_graph {
         let parameters = &mut schema["function"]["parameters"];
         parameters["properties"]["tasks"] = json!({
-            "type":"array","minItems":1,"maxItems":64,"items":{
+            "type":"array","minItems":worker_count,"maxItems":worker_count,"items":{
                 "type":"object","additionalProperties":false,
                 "properties":{
                     "id":{"type":"string","maxLength":64},
-                    "worker":{"type":"string"},
+                    "worker":{"type":"string","enum":ids},
                     "description":{"type":"string"},
                     "depends_on":{"type":"array","items":{"type":"string"}},
                     "acceptance":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"}}
@@ -1931,14 +2304,56 @@ fn parse_plan(
         "submit_plan requires a task graph"
     );
     if let Some(graph) = &input.tasks {
+        let mut counts = BTreeMap::new();
+        for task in &graph.0 {
+            *counts.entry(task.worker.as_str()).or_insert(0) += 1;
+        }
+        let mut problems = Vec::new();
+        for index in 1..=workers.len() {
+            let id = format!("worker_{index}");
+            match counts.remove(id.as_str()).unwrap_or_default() {
+                0 => problems.push(format!("missing task for {id}")),
+                1 => {}
+                count => problems.push(format!("{id} has {count} tasks")),
+            }
+        }
+        problems.extend(counts.keys().map(|id| format!("unknown task owner {id}")));
+        ensure!(
+            problems.is_empty(),
+            "require exactly one task per worker: {}",
+            problems.join(", ")
+        );
         graph
             .dependencies(workers.len())
             .map_err(anyhow::Error::msg)?;
     }
     ensure!(
-        !input.plan.trim().is_empty() && input.ownership.len() == workers.len(),
-        "plan and an ownership entry for every worker are required"
+        !input.plan.trim().is_empty(),
+        "submit_plan requires nonempty plan text"
     );
+    let roster = (1..=workers.len())
+        .map(|index| format!("worker_{index}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let ownership_ids = input
+        .ownership
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if roster != ownership_ids {
+        let errors = roster
+            .difference(&ownership_ids)
+            .map(|id| format!("missing ownership for {id}"))
+            .chain(
+                ownership_ids
+                    .difference(&roster)
+                    .map(|id| format!("unknown ownership entry {id}")),
+            )
+            .collect::<Vec<_>>();
+        anyhow::bail!(
+            "require one ownership entry per worker: {}",
+            errors.join(", ")
+        );
+    }
     let mut ownership: Vec<Vec<WritePath>> = Vec::new();
     for index in 0..workers.len() {
         let id = format!("worker_{}", index + 1);

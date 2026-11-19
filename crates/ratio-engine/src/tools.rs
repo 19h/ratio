@@ -18,7 +18,7 @@ use tokio::{
 
 use crate::{api::ToolCall, context::clip, line_tags};
 
-pub(crate) mod mcp;
+pub mod mcp;
 pub(crate) mod skills;
 #[cfg(windows)]
 mod windows_job;
@@ -119,11 +119,18 @@ impl Tools<'_> {
     }
 
     pub async fn execute(&self, call: &ToolCall) -> String {
-        let result = match self.dispatch(call).await {
+        self.execute_audited(call).await.0
+    }
+
+    pub(crate) async fn execute_audited(&self, call: &ToolCall) -> (String, String) {
+        let mut audit = None;
+        let result = match self.dispatch(call, &mut audit).await {
             Ok(result) => result,
             Err(error) => format!("Tool error: {error:#}"),
         };
-        clip(&self.redact(result), self.output_bytes)
+        let result = self.redact(result);
+        let full = audit.map_or_else(|| result.clone(), |audit| self.redact(audit));
+        (clip(&result, self.output_bytes), full)
     }
 
     fn redact(&self, text: String) -> String {
@@ -133,23 +140,24 @@ impl Tools<'_> {
         }
     }
 
-    async fn dispatch(&self, call: &ToolCall) -> Result<String> {
+    async fn dispatch(&self, call: &ToolCall, audit: &mut Option<String>) -> Result<String> {
         ensure!(call.kind == "function", "unsupported tool call type");
         let arguments = &call.function.arguments;
         match call.function.name.as_str() {
             "read_file" => {
                 let args: ReadFile = crate::api::tool_arguments(arguments)?;
-                self.read(&args).await
+                self.read(&args, audit).await
             }
             "list_directory" => {
                 let args: PathArg = crate::api::tool_arguments(arguments)?;
-                let output = self.list(&args.path).await?;
+                let (output, full) = self.list(&args.path).await?;
+                *audit = Some(format!("Untrusted directory listing\n{full}"));
                 Ok(format!("Untrusted directory listing\n{output}"))
             }
             "git_status" => {
                 let _: Empty = crate::api::tool_arguments(arguments)?;
-                let output = self
-                    .run(git().args([
+                let (_, output, full) = self
+                    .command_result(git().args([
                         "status",
                         "--short",
                         "--untracked-files=normal",
@@ -159,6 +167,7 @@ impl Tools<'_> {
                         ":(exclude).ratio",
                     ]))
                     .await?;
+                *audit = Some(full);
                 Ok(format!("Untrusted Git status\n{output}"))
             }
             "git_diff" => {
@@ -173,21 +182,24 @@ impl Tools<'_> {
                 if args.staged {
                     command.arg("--cached");
                 }
-                let output = self
-                    .run(command.args(["--", ".", ":(exclude).ratio"]))
+                let (_, output, full) = self
+                    .command_result(command.args(["--", ".", ":(exclude).ratio"]))
                     .await?;
+                *audit = Some(full);
                 Ok(format!("Untrusted Git diff\n{output}"))
             }
             "create_file" if matches!(self.access, Access::Work) => {
                 let args: CreateFile = crate::api::tool_arguments(arguments)?;
                 let path = self.edit_path(&args.path).await?;
                 let content_len = args.content.len();
-                tokio::task::spawn_blocking(move || create_file(&path, &args.content)).await??;
-                Ok(format!(
-                    "Created {} ({} bytes).",
-                    args.path.display(),
-                    content_len
-                ))
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    create_file(&path, &args.content)?;
+                    Ok::<_, anyhow::Error>(snapshot_id(&args.content))
+                })
+                .await??;
+                let result = format!("Created {} ({} bytes).", args.path.display(), content_len);
+                *audit = Some(format!("{result}\nSnapshot ID: {snapshot}"));
+                Ok(result)
             }
             "edit_file" if matches!(self.access, Access::Work) => {
                 let args: EditFile = crate::api::tool_arguments(arguments)?;
@@ -196,8 +208,9 @@ impl Tools<'_> {
                     (Some(edits), None, None) => {
                         let changed_path = path.clone();
                         let count = edits.len();
-                        let (updated, first) = tokio::task::spawn_blocking(move || {
-                            change_file(&changed_path, |original| {
+                        let (updated, first, patch) = tokio::task::spawn_blocking(move || {
+                            let mut patch = String::new();
+                            let (updated,first) = change_file(&changed_path, |original| {
                                 if edits.keys().any(|tag| tag.contains("..")) || args.snapshot_id.is_some() {
                                     let current = snapshot_id(original);
                                     if args.snapshot_id.as_deref() != Some(&current) {
@@ -210,8 +223,11 @@ impl Tools<'_> {
                                         anyhow::bail!("range edit requires a current snapshot_id from read_file. Current snapshot ID: {current}\nUntrusted current file excerpt:\n{excerpt}");
                                     }
                                 }
-                                line_tags::apply(&changed_path.to_string_lossy(), original, &edits, &args.line_hints)
-                            })
+                                let (updated,first) = line_tags::apply(&changed_path.to_string_lossy(), original, &edits, &args.line_hints)?;
+                                patch = edit_receipt(original,&updated);
+                                Ok((updated,first))
+                            })?;
+                            Ok::<_,anyhow::Error>((updated,first,patch))
                         })
                         .await??;
                         let mut result =
@@ -230,6 +246,7 @@ impl Tools<'_> {
                             result.push('\n');
                             result.push_str(&excerpt);
                         }
+                        *audit = Some(format!("{result}\n\n{patch}"));
                         Ok(result)
                     }
                     (None, Some(old), Some(new)) => {
@@ -238,7 +255,9 @@ impl Tools<'_> {
                             "snapshot_id applies to tagged edits"
                         );
                         let lengths = (old.len(), new.len());
+                        let receipt = edit_receipt(&old, &new);
                         tokio::task::spawn_blocking(move || edit_file(&path, &old, &new)).await??;
+                        *audit = Some(receipt);
                         Ok(format!(
                             "Edited {} ({} bytes replaced with {} bytes).",
                             args.path.display(),
@@ -252,7 +271,8 @@ impl Tools<'_> {
             "shell" if matches!(self.access, Access::Work) => {
                 let args: Shell = crate::api::tool_arguments(arguments)?;
                 ensure!(!args.command.trim().is_empty(), "shell command is empty");
-                let output = self.run(&mut shell(&args.command)).await?;
+                let (_, output, full) = self.command_result(&mut shell(&args.command)).await?;
+                *audit = Some(full);
                 Ok(format!("Untrusted command output\n{output}"))
             }
             name => anyhow::bail!("tool {name} is unavailable in this role"),
@@ -303,7 +323,7 @@ impl Tools<'_> {
         Ok(target)
     }
 
-    async fn read(&self, args: &ReadFile) -> Result<String> {
+    async fn read(&self, args: &ReadFile, audit: &mut Option<String>) -> Result<String> {
         use std::io::SeekFrom;
         use tokio::io::AsyncSeekExt;
 
@@ -319,7 +339,8 @@ impl Tools<'_> {
             let start = args.start_line.unwrap_or(1);
             let end = args.end_line;
             let output_limit = self.output_bytes;
-            return tokio::task::spawn_blocking(move || {
+            let audit_limit = args.max_bytes.unwrap_or(AUDIT_LIMIT).min(AUDIT_LIMIT);
+            let (visible, full) = tokio::task::spawn_blocking(move || {
                 let text = read_edit_file(&path)?;
                 let header = format!(
                     "Untrusted workspace file\nSnapshot ID: {}\n",
@@ -332,9 +353,18 @@ impl Tools<'_> {
                     end,
                     limit.min(output_limit.saturating_sub(header.len())),
                 )?;
-                Ok(header + &excerpt)
+                let full = line_tags::excerpt(
+                    &path.to_string_lossy(),
+                    &text,
+                    start,
+                    end,
+                    audit_limit.saturating_sub(header.len()),
+                )?;
+                Ok::<_, anyhow::Error>((header.clone() + &excerpt, header + &full))
             })
-            .await?;
+            .await??;
+            *audit = Some(full);
+            return Ok(visible);
         };
         ensure!(
             args.start_line.is_none() && args.end_line.is_none(),
@@ -344,21 +374,37 @@ impl Tools<'_> {
         let mut file = fs::File::open(path).await?;
         file.seek(SeekFrom::Start(offset)).await?;
         let mut bytes = Vec::new();
-        file.take((limit.saturating_sub(128) / 3).max(4) as u64)
+        let visible_limit = (limit.saturating_sub(128) / 3).max(4);
+        let audit_limit = args
+            .max_bytes
+            .unwrap_or(AUDIT_LIMIT)
+            .min(AUDIT_LIMIT)
+            .max(visible_limit);
+        file.take(audit_limit as u64)
             .read_to_end(&mut bytes)
             .await?;
-        let text = match std::str::from_utf8(&bytes) {
+        let visible = &bytes[..bytes.len().min(visible_limit)];
+        let text = match std::str::from_utf8(visible) {
             Ok(text) => text,
             Err(error)
                 if error.error_len().is_none()
-                    && offset + (bytes.len() as u64) < metadata.len() =>
+                    && offset + (visible.len() as u64) < metadata.len() =>
             {
                 // Carry an incomplete trailing code point into the next range.
-                std::str::from_utf8(&bytes[..error.valid_up_to()])?
+                std::str::from_utf8(&visible[..error.valid_up_to()])?
             }
             Err(error) => return Err(error).context("read UTF-8 text at the requested offset"),
         };
         let next = offset + text.len() as u64;
+        let full = std::str::from_utf8(&bytes).map_or_else(
+            |error| std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default(),
+            |text| text,
+        );
+        *audit = Some(format!(
+            "Untrusted workspace file. Bytes {offset}..{} of {}.\n{full}",
+            offset + full.len() as u64,
+            metadata.len()
+        ));
         Ok(format!(
             "Untrusted workspace file. Bytes {}..{next} of {}.\n{text}",
             offset,
@@ -366,10 +412,14 @@ impl Tools<'_> {
         ))
     }
 
-    async fn list(&self, path: &Path) -> Result<String> {
+    async fn list(&self, path: &Path) -> Result<(String, String)> {
+        const OMITTED: &str = "[... additional entries omitted ...]";
+        const AUDIT_DIRECTORY_BYTES: usize = 1024 * 1024;
         let mut dir = fs::read_dir(self.resolve(path).await?).await?;
         let mut lines = Vec::new();
         let mut size = 0;
+        let mut visible_count = None;
+        let mut omitted = false;
         while let Some(entry) = dir.next_entry().await? {
             let name = entry.file_name();
             let mut name = name.to_string_lossy().escape_debug().to_string();
@@ -377,27 +427,38 @@ impl Tools<'_> {
                 name.push('/');
             }
             size += name.len() + 1;
-            if size > self.output_bytes.saturating_sub(64) {
-                lines.sort();
-                lines.push("[... additional entries omitted ...]".into());
+            if size > self.output_bytes.saturating_sub(64) && visible_count.is_none() {
+                visible_count = Some(lines.len());
+            }
+            if size > AUDIT_DIRECTORY_BYTES {
+                omitted = true;
                 break;
             }
             lines.push(name);
         }
+        let mut visible = lines[..visible_count.unwrap_or(lines.len())].to_vec();
+        if visible_count.is_some() || omitted {
+            visible.push(OMITTED.into());
+        }
+        visible.sort_unstable();
+        if omitted {
+            lines.push(OMITTED.into());
+        }
         lines.sort_unstable();
-        Ok(lines.join("\n"))
+        Ok((visible.join("\n"), lines.join("\n")))
     }
 
+    #[cfg(all(test, windows))]
     async fn run(&self, command: &mut Command) -> Result<String> {
         Ok(self.command_result(command).await?.1)
     }
 
     pub(crate) async fn verify(&self, script: &str) -> Result<(bool, String)> {
-        let (passed, output) = self.command_result(&mut shell(script)).await?;
+        let (passed, output, _) = self.command_result(&mut shell(script)).await?;
         Ok((passed, self.redact(output)))
     }
 
-    async fn command_result(&self, command: &mut Command) -> Result<(bool, String)> {
+    async fn command_result(&self, command: &mut Command) -> Result<(bool, String, String)> {
         command
             .current_dir(self.workspace)
             .env_remove("OPENAI_API_KEY")
@@ -431,14 +492,64 @@ impl Tools<'_> {
         #[cfg(windows)]
         job.disarm()?;
 
+        let output = |limit| {
+            format!(
+                "Status: {status}\nstdout:\n{}\nstderr:\n{}",
+                stdout.render(limit),
+                stderr.render(limit)
+            )
+        };
         Ok((
             status.success(),
-            format!("Status: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"),
+            output(cap),
+            format!(
+                "Succeeded: {}\n{}",
+                status.success(),
+                output(AUDIT_LIMIT / 2 - 256)
+            ),
         ))
     }
 }
 
 const MAX_EDIT_BYTES: usize = 4 * 1024 * 1024;
+const AUDIT_LIMIT: usize = 8 * 1024 * 1024;
+
+fn edit_receipt(before: &str, after: &str) -> String {
+    let before = before.lines().collect::<Vec<_>>();
+    let after = after.lines().collect::<Vec<_>>();
+    let start = before
+        .iter()
+        .zip(&after)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let end = before[start..]
+        .iter()
+        .rev()
+        .zip(after[start..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let removed = &before[start..before.len() - end];
+    let added = &after[start..after.len() - end];
+    let mut receipt = format!(
+        "@@ -{},{} +{},{} @@\n",
+        start + 1,
+        removed.len(),
+        start + 1,
+        added.len()
+    );
+    for (prefix, lines) in [('-', removed), ('+', added)] {
+        for line in lines {
+            if receipt.len() + line.len() >= AUDIT_LIMIT.saturating_sub(128) {
+                receipt.push_str("[... additional edit lines omitted ...]");
+                return receipt;
+            }
+            receipt.push(prefix);
+            receipt.push_str(line);
+            receipt.push('\n');
+        }
+    }
+    receipt
+}
 type WriteLock = std::sync::Mutex<()>;
 static NATIVE_WRITES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<WriteLock>>>,
@@ -607,24 +718,42 @@ impl Drop for ProcessGroup {
     }
 }
 
-async fn capture(mut stream: impl AsyncRead + Unpin, cap: usize) -> std::io::Result<String> {
+struct CapturedStream {
+    bytes: Vec<u8>,
+    total: usize,
+}
+
+impl CapturedStream {
+    fn render(&self, cap: usize) -> String {
+        let keep = self.bytes.len().min(cap);
+        let mut result = String::from_utf8_lossy(&self.bytes[..keep]).into_owned();
+        if self.total > keep {
+            result.push_str(&format!("\n[{} bytes omitted]", self.total - keep));
+        }
+        result
+    }
+}
+
+async fn capture(
+    mut stream: impl AsyncRead + Unpin,
+    _cap: usize,
+) -> std::io::Result<CapturedStream> {
     let mut buffer = [0; 8192];
     let mut result = Vec::new();
-    let mut omitted = 0;
+    let mut total = 0usize;
     loop {
         let count = stream.read(&mut buffer).await?;
         if count == 0 {
             break;
         }
-        let keep = count.min(cap - result.len());
+        let keep = count.min(AUDIT_LIMIT / 2 - result.len());
         result.extend_from_slice(&buffer[..keep]);
-        omitted += count - keep;
+        total = total.saturating_add(count);
     }
-    let mut result = String::from_utf8_lossy(&result).into_owned();
-    if omitted > 0 {
-        result.push_str(&format!("\n[{omitted} bytes omitted]"));
-    }
-    Ok(result)
+    Ok(CapturedStream {
+        bytes: result,
+        total,
+    })
 }
 
 fn schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
@@ -739,9 +868,21 @@ mod tests {
             end_line: None,
             max_bytes: None,
         };
-        assert!(tools.read(&args).await.unwrap().contains("Bytes 0..127 of"));
+        assert!(
+            tools
+                .read(&args, &mut None)
+                .await
+                .unwrap()
+                .contains("Bytes 0..127 of")
+        );
         args.offset = Some(127);
-        assert!(tools.read(&args).await.unwrap().ends_with("é data"));
+        assert!(
+            tools
+                .read(&args, &mut None)
+                .await
+                .unwrap()
+                .ends_with("é data")
+        );
     }
 
     #[tokio::test]

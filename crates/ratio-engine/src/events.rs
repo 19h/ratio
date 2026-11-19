@@ -1,4 +1,9 @@
-pub use ratio_protocol::Delivery;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
+pub use ratio_protocol::{Delivery, LiveGeneration};
 use tokio::sync::{mpsc::UnboundedSender, watch};
 
 use crate::context::clip;
@@ -15,6 +20,7 @@ pub enum Kind {
 
 pub struct Event {
     pub kind: Kind,
+    pub actor: Option<String>,
     pub title: String,
     pub body: String,
     pub network: Option<NetworkEvent>,
@@ -22,12 +28,34 @@ pub struct Event {
 }
 
 pub enum Generation {
-    Preview {
-        id: usize,
-        label: String,
-        text: String,
-    },
+    Preview(LiveGeneration),
     End(usize),
+}
+
+#[derive(Clone, Default)]
+pub struct LiveGenerations(Arc<Mutex<BTreeMap<usize, LiveGeneration>>>);
+
+impl LiveGenerations {
+    fn observe(&self, event: &Generation) {
+        let mut generations = self.0.lock().expect("live generations lock poisoned");
+        match event {
+            Generation::Preview(preview) => {
+                generations.insert(preview.id, preview.clone());
+            }
+            Generation::End(id) => {
+                generations.remove(id);
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<LiveGeneration> {
+        self.0
+            .lock()
+            .expect("live generations lock poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -46,6 +74,7 @@ pub struct TrafficScope {
     pub cycle: usize,
     pub attempt: usize,
     pub phase: &'static str,
+    pub worker_request: Option<i64>,
 }
 
 pub struct Traffic {
@@ -76,25 +105,53 @@ pub enum NetworkEvent {
 pub enum Reporter {
     Silent,
     Terminal,
-    Tui(UnboundedSender<Event>, watch::Receiver<GenerationControl>),
-    Managed(watch::Receiver<GenerationControl>),
+    Tui(
+        UnboundedSender<Event>,
+        watch::Receiver<GenerationControl>,
+        LiveGenerations,
+    ),
+    Managed(watch::Receiver<GenerationControl>, LiveGenerations),
 }
 
 impl Reporter {
     pub fn emit(&self, kind: Kind, title: impl Into<String>, body: impl Into<String>) {
-        if matches!(self, Self::Silent | Self::Managed(_)) {
+        self.emit_for(None, kind, title.into(), body.into());
+    }
+
+    pub fn agent(
+        &self,
+        actor: &str,
+        kind: Kind,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) {
+        self.emit_for(Some(actor), kind, title.into(), body.into());
+    }
+
+    fn emit_for(&self, actor: Option<&str>, kind: Kind, title: String, body: String) {
+        if matches!(self, Self::Silent) {
             return;
         }
-        let title = clean(title.into());
-        let body = clean(body.into());
+        let title = clean(title);
+        let body = clean(body);
         match self {
-            Self::Silent | Self::Managed(_) => {}
-            Self::Terminal => {
-                eprintln!("{title}\n{}", clip(&body, 24 * 1024));
+            Self::Silent => {}
+            Self::Terminal | Self::Managed(..) => {
+                let title = if let Some(actor) = actor {
+                    format!("{actor} / {title}")
+                } else {
+                    title
+                };
+                if body.is_empty() {
+                    eprintln!("{title}");
+                } else {
+                    eprintln!("{title}\n{}", clip(&body, 24 * 1024));
+                }
             }
-            Self::Tui(sender, _) => {
+            Self::Tui(sender, ..) => {
                 let _ = sender.send(Event {
                     kind,
+                    actor: actor.map(str::to_owned),
                     title,
                     body,
                     network: None,
@@ -108,10 +165,15 @@ impl Reporter {
         matches!(self, Self::Tui(..))
     }
 
+    pub fn observes_generation(&self) -> bool {
+        matches!(self, Self::Tui(..) | Self::Managed(..))
+    }
+
     pub fn network(&self, event: NetworkEvent) {
-        if let Self::Tui(sender, _) = self {
+        if let Self::Tui(sender, ..) = self {
             let _ = sender.send(Event {
                 kind: Kind::Ipc,
+                actor: None,
                 title: String::new(),
                 body: String::new(),
                 network: Some(event),
@@ -122,20 +184,38 @@ impl Reporter {
 
     pub fn generation_control(&self) -> Option<watch::Receiver<GenerationControl>> {
         match self {
-            Self::Tui(_, control) | Self::Managed(control) => Some(control.clone()),
+            Self::Tui(_, control, _) | Self::Managed(control, _) => Some(control.clone()),
             _ => None,
         }
     }
 
     pub fn generation(&self, event: Generation) {
-        if let Self::Tui(sender, _) = self {
-            let _ = sender.send(Event {
-                kind: Kind::Info,
-                title: String::new(),
-                body: String::new(),
-                network: None,
-                generation: Some(event),
-            });
+        match self {
+            Self::Tui(sender, _, live) => {
+                live.observe(&event);
+                let _ = sender.send(Event {
+                    kind: Kind::Info,
+                    actor: None,
+                    title: String::new(),
+                    body: String::new(),
+                    network: None,
+                    generation: Some(event),
+                });
+            }
+            Self::Managed(_, live) => live.observe(&event),
+            _ => {}
+        }
+    }
+
+    pub fn request_started(&self, actor: &str, label: &str) {
+        if matches!(self, Self::Terminal | Self::Managed(..)) {
+            let actor = (actor != label && !label.starts_with(actor)).then_some(actor);
+            self.emit_for(
+                actor,
+                Kind::Info,
+                format!("{label} / Requesting model"),
+                String::new(),
+            );
         }
     }
 

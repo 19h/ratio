@@ -31,6 +31,8 @@ pub struct IpcEvent {
     pub to: Vec<String>,
     pub sequence: usize,
     pub reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_sequence: Option<usize>,
     pub delivery: Delivery,
     pub body: String,
 }
@@ -44,9 +46,15 @@ pub struct Workflow {
     pub tasks: Vec<TaskView>,
     pub verification: Option<VerificationView>,
     pub agents: Vec<AgentView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panel_actors: Vec<String>,
     pub context: Vec<ContextReceipt>,
     pub verdict: Option<String>,
     pub stopped: Option<RunStop>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_addition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_worker_request: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +174,9 @@ pub enum ControlAction {
     Resume,
     Cancel,
     Guide,
+    AddWorker,
+    Triage,
+    RetryTriage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,4 +195,14 @@ pub struct ControlReply {
     pub paused: bool,
     pub accepted: bool,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generations: Vec<LiveGeneration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveGeneration {
+    pub id: usize,
+    pub actor: String,
+    pub label: String,
+    pub text: String,
 }

@@ -1,0 +1,12 @@
+# Set RATIO_API_KEY to your MorphLLM credential before starting a run.
+endpoint = "https://api.morphllm.com/v1"
+model = "morph-dsv41flash-abliterated"
+context_window = 1048576
+output_tokens = 8192
+
+[mcp_servers.assist]
+command = "/Users/int/.idapro/plugins/assist/bin/assist"
+args = ["--mcp"]
+protocol = "2025-11-25"
+lifetime = "worker"
+allow_all = true

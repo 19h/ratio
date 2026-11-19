@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, env, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
@@ -10,10 +14,34 @@ use serde::{Deserialize, Serialize};
     about = "Plan, implement and review a coding goal with local tools"
 )]
 pub struct Cli {
-    #[arg(short, long)]
+    /// Serve the workspace's live and historical runs in a local browser.
+    #[arg(long, conflicts_with_all = ["request", "goal", "goal_stdin", "attach", "resume", "fork", "detached", "control", "plan_only", "review_plan", "check_mcp", "list_runs", "events", "metrics", "otlp_trace", "evaluate"])]
+    pub web: bool,
+    /// Loopback port for --web. Zero selects a free port.
+    #[arg(long, requires = "web", default_value_t = 0)]
+    pub web_port: u16,
+    /// Request to plan and implement.
+    #[arg(short, long, conflicts_with_all = ["request", "goal_stdin"])]
     pub goal: Option<String>,
+    #[arg(value_name = "REQUEST", conflicts_with_all = ["goal", "goal_stdin", "resume", "attach", "control", "events", "list_runs"])]
+    pub request: Option<String>,
+    /// Read the request from standard input.
+    #[arg(long, conflicts_with_all = ["goal", "request", "resume", "attach", "control", "events", "list_runs"])]
+    pub goal_stdin: bool,
+    /// Print the team proposal as JSON and exit.
+    #[arg(long, conflicts_with_all = ["resume", "detached", "review_plan", "fixed_team"])]
+    pub plan_only: bool,
+    /// Review and refine the team proposal in the TUI before starting.
+    #[arg(long, conflicts_with_all = ["headless", "detached", "resume"])]
+    pub review_plan: bool,
+    /// Use the configured roster or the built-in worker without team generation.
+    #[arg(long)]
+    pub fixed_team: bool,
+    /// List permitted tools from a configured stdio server without starting a run.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["request", "goal", "goal_stdin", "resume", "detached", "plan_only"])]
+    pub check_mcp: Option<String>,
     #[arg(short, long)]
-    config: Option<PathBuf>,
+    pub config: Option<PathBuf>,
     #[arg(short = 'C', long)]
     cwd: Option<PathBuf>,
     #[arg(long, visible_alias = "base-url", env = "RATIO_ENDPOINT")]
@@ -55,7 +83,7 @@ pub struct Cli {
     max_total_tokens: Option<u64>,
     #[arg(long)]
     max_run_secs: Option<u64>,
-    /// Print only the final assessment to stdout and diagnostics to stderr.
+    /// Run without the TUI. Progress goes to stderr and the assessment to stdout.
     #[arg(long)]
     pub headless: bool,
     /// Report request sizes and model usage to stderr.
@@ -84,12 +112,15 @@ pub struct Cli {
     pub detached: bool,
     #[arg(long, hide = true, conflicts_with = "detached")]
     pub managed_run: bool,
-    /// Control the active detached run.
+    /// Control the active foreground headless or detached run.
     #[arg(long, value_enum, conflicts_with_all = ["events", "list_runs", "resume", "goal"])]
     pub control: Option<ControlOperation>,
     /// Text to send with --control guide.
     #[arg(long, requires = "control")]
     pub guidance: Option<String>,
+    /// Describe the new worker's role and proposed scope.
+    #[arg(long, requires = "control")]
+    pub worker_request: Option<String>,
     /// Start a fresh run from a recorded run's goal and roster.
     #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["resume", "list_runs", "events", "control"])]
     pub fork: Option<String>,
@@ -117,6 +148,7 @@ pub enum ControlOperation {
     Resume,
     Cancel,
     Guide,
+    AddWorker,
 }
 
 #[derive(Default, Deserialize)]
@@ -155,9 +187,87 @@ pub struct McpServer {
     pub command: PathBuf,
     #[serde(default)]
     pub args: Vec<String>,
-    pub tools: Vec<String>,
+    pub tools: Option<BTreeSet<String>>,
+    #[serde(default)]
+    pub allow_all: bool,
+    pub deny_tools: Option<BTreeSet<String>>,
     #[serde(default = "default_mcp_protocol")]
     pub protocol: String,
+    #[serde(default)]
+    pub lifetime: McpLifetime,
+}
+
+impl McpServer {
+    fn validate_policy(&self) -> Result<()> {
+        let names = match (&self.tools, self.allow_all, &self.deny_tools) {
+            (None, true, None) => return Ok(()),
+            (Some(names), false, None) => {
+                ensure!(
+                    !names.is_empty(),
+                    "tools must name at least one permitted tool"
+                );
+                names
+            }
+            (None, false, Some(names)) => names,
+            _ => anyhow::bail!("choose exactly one of tools, allow_all = true, or deny_tools"),
+        };
+        ensure!(
+            names
+                .iter()
+                .all(|name| !name.trim().is_empty() && name.len() <= 128),
+            "tool lists must contain names of 1 to 128 bytes"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn permits(&self, name: &str) -> bool {
+        match (&self.tools, self.allow_all, &self.deny_tools) {
+            (None, true, None) => true,
+            (Some(names), false, None) => names.contains(name),
+            (None, false, Some(names)) => !names.contains(name),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_policy_tests {
+    use super::McpServer;
+
+    #[test]
+    fn tool_policy_requires_one_explicit_mode_without_limiting_list_size() {
+        let load = |mode: &str| {
+            let server: McpServer =
+                toml::from_str(&format!("command = \"fixture\"\n{mode}")).unwrap();
+            server.validate_policy()
+        };
+        let names = (0..161)
+            .map(|index| format!("\"inspect_{index}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(load(&format!("tools = [{names}]")).is_ok());
+        assert!(load(&format!("deny_tools = [{names}]")).is_ok());
+        assert!(load("deny_tools = []").is_ok());
+        assert!(load("allow_all = true").is_ok());
+        for invalid in [
+            "",
+            "tools = []",
+            "allow_all = false",
+            "allow_all = true\ntools = [\"inspect\"]",
+            "allow_all = true\ndeny_tools = [\"inspect\"]",
+            "tools = [\"inspect\"]\ndeny_tools = [\"change\"]",
+        ] {
+            assert!(load(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpLifetime {
+    #[default]
+    Call,
+    Worker,
 }
 
 fn default_mcp_protocol() -> String {
@@ -343,9 +453,27 @@ pub struct Config {
     pub headless: bool,
     pub debug: bool,
     pub resume: bool,
+    pub fixed_team: bool,
+    pub review_plan: bool,
 }
 
 impl Config {
+    fn profile(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
+        if let Some(path) = explicit {
+            return Some(path.to_owned());
+        }
+        let base = if cfg!(windows) {
+            env::var_os("APPDATA").map(PathBuf::from)
+        } else {
+            env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        }?;
+        let path = base.join("ratio").join("config.toml");
+        path.try_exists().unwrap_or(true).then_some(path)
+    }
+
     fn read_file(path: Option<&std::path::Path>) -> Result<FileConfig> {
         Ok(match path {
             Some(path) => {
@@ -360,7 +488,8 @@ impl Config {
     }
 
     pub fn history_workspace(cli: &Cli) -> Result<PathBuf> {
-        let file = Self::read_file(cli.config.as_deref())?;
+        let profile = Self::profile(cli.config.as_deref());
+        let file = Self::read_file(profile.as_deref())?;
         Self::workspace(cli.cwd.clone().or(file.cwd))
     }
 
@@ -373,7 +502,8 @@ impl Config {
         Ok(cwd)
     }
 
-    pub fn load(cli: Cli) -> Result<Self> {
+    pub fn load(mut cli: Cli) -> Result<Self> {
+        cli.config = Self::profile(cli.config.as_deref());
         let mut file = Self::read_file(cli.config.as_deref())?;
         ensure!(
             file.mcp_servers.len() <= 16,
@@ -387,27 +517,28 @@ impl Config {
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
                     && !server.command.as_os_str().is_empty()
-                    && (1..=64).contains(&server.tools.len())
-                    && server
-                        .tools
-                        .iter()
-                        .all(|tool| !tool.is_empty() && tool.len() <= 128)
                     && matches!(server.protocol.as_str(), "2025-11-25" | "2026-07-28"),
-                "invalid MCP server {name}: require a command, allowed tools and a supported protocol"
+                "invalid MCP server {name}: require a command and a supported protocol"
             );
+            server
+                .validate_policy()
+                .with_context(|| format!("invalid MCP server {name}"))?;
         }
         let model = cli.model.or(file.model);
         let worker_model = cli.worker_model.or(file.worker.model).or(model.clone());
         let reviewer_model = cli.reviewer_model.or(file.reviewer.model).or(model);
         let worker_model = worker_model
             .filter(|m| !m.trim().is_empty())
+            .or_else(|| cli.check_mcp.as_ref().map(|_| String::new()))
             .context("set --model or --worker-model")?;
         let reviewer_model = reviewer_model
             .filter(|m| !m.trim().is_empty())
+            .or_else(|| cli.check_mcp.as_ref().map(|_| String::new()))
             .context("set --model or --reviewer-model")?;
         let context_window = cli
             .context_window
             .or(file.context_window)
+            .or_else(|| cli.check_mcp.as_ref().map(|_| 2))
             .context("set --context-window to the model's token limit")?;
         ensure!(
             context_window >= 2,
@@ -560,6 +691,8 @@ impl Config {
             headless: cli.headless,
             debug: cli.debug,
             resume: cli.resume,
+            fixed_team: cli.fixed_team,
+            review_plan: cli.review_plan,
         })
     }
 }

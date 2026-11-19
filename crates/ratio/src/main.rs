@@ -1,5 +1,5 @@
 use std::{
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     process::ExitCode,
     sync::mpsc,
     time::Duration,
@@ -10,14 +10,15 @@ use clap::Parser;
 use ra::{
     budget::Budget,
     config::{Cli, Config, ControlOperation},
-    events::{GenerationControl, Reporter},
+    control,
+    events::{GenerationControl, LiveGenerations, Reporter},
     orchestrator::Orchestrator,
     session::{Phase, Session, Store},
     ui,
 };
 use ratio_protocol::{ControlAction, ControlRequest, Evaluation, RunStop};
 
-mod control;
+mod web;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -31,7 +32,21 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<u8> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if cli.web {
+        return web::serve(Config::history_workspace(&cli)?, cli.web_port).await;
+    }
+    if cli.goal_stdin {
+        let mut request = String::new();
+        io::stdin().take(65537).read_to_string(&mut request)?;
+        ensure!(
+            request.len() <= 65536 && !request.trim().is_empty(),
+            "stdin requires a nonempty UTF-8 request up to 65536 bytes"
+        );
+        cli.goal = Some(request.trim().to_owned());
+    } else if let Some(request) = cli.request.take() {
+        cli.goal = Some(request);
+    }
     if let Some(run_id) = &cli.metrics {
         let reader = Store::reader(&Config::history_workspace(&cli)?)?;
         println!("{}", serde_json::to_string(&reader.metrics(run_id)?)?);
@@ -66,6 +81,10 @@ async fn run() -> Result<u8> {
         .await;
     }
     if let Some(operation) = cli.control {
+        ensure!(
+            cli.worker_request.is_none() || matches!(operation, ControlOperation::AddWorker),
+            "--worker-request requires --control add-worker"
+        );
         let workspace = Config::history_workspace(&cli)?;
         let action = match operation {
             ControlOperation::Status => ControlAction::Status,
@@ -73,12 +92,17 @@ async fn run() -> Result<u8> {
             ControlOperation::Resume => ControlAction::Resume,
             ControlOperation::Cancel => ControlAction::Cancel,
             ControlOperation::Guide => ControlAction::Guide,
+            ControlOperation::AddWorker => ControlAction::AddWorker,
         };
         let reply = control::request_control(
             &workspace,
             &ControlRequest {
                 action,
-                guidance: cli.guidance,
+                guidance: if action == ControlAction::AddWorker {
+                    cli.worker_request
+                } else {
+                    cli.guidance
+                },
                 run_id: None,
             },
         )
@@ -88,7 +112,8 @@ async fn run() -> Result<u8> {
     }
     if cli.detached {
         let workspace = Config::history_workspace(&cli)?;
-        let (run, log) = control::launch(&workspace).await?;
+        let (run, log) =
+            control::launch(&workspace, cli.goal.as_deref().filter(|_| cli.goal_stdin)).await?;
         println!("{}", serde_json::json!({"run": run, "log": log}));
         return Ok(0);
     }
@@ -132,14 +157,32 @@ async fn run() -> Result<u8> {
     let run_id = cli.run_id.clone();
     let fork = cli.fork.clone();
     let managed = cli.managed_run;
+    let plan_only = cli.plan_only;
+    let check_mcp = cli.check_mcp.clone();
     let config = Config::load(cli)?;
-    let store = Store::open(&config.cwd)?;
+    if let Some(server) = check_mcp {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ra::tools::mcp::check(&config, &server).await?)?
+        );
+        return Ok(0);
+    }
     let budget = Budget::new(&config);
+    if plan_only {
+        let draft = ra::setup::Draft::seed(&config);
+        ensure!(!draft.goal.trim().is_empty(), "--plan-only needs a request");
+        let api = ra::api::Api::new(&config, Reporter::Terminal, budget)?;
+        let proposal =
+            ra::setup::refine(&config, &api, &draft, "Propose the team for this request.").await?;
+        println!("{}", serde_json::to_string_pretty(&proposal)?);
+        return Ok(0);
+    }
+    let store = Store::open(&config.cwd)?;
     let resumed = if config.resume {
         let session = store.load_run(run_id.as_deref())?;
         if let Some(goal) = &explicit_goal {
             ensure!(
-                *goal == session.goal,
+                *goal == session.goal || session.request.as_ref() == Some(goal),
                 "--resume requires the same goal as the checkpoint"
             );
         }
@@ -151,9 +194,14 @@ async fn run() -> Result<u8> {
     };
     let interactive =
         !managed && !config.headless && io::stdin().is_terminal() && io::stderr().is_terminal();
+    ensure!(
+        !config.review_plan || interactive,
+        "--review-plan requires a terminal"
+    );
     let (generation, control_state) = tokio::sync::watch::channel(GenerationControl::default());
+    let live_generations = LiveGenerations::default();
     let (guide, guidance) = mpsc::sync_channel(16);
-    let listener = managed
+    let listener = (!interactive)
         .then(|| control::Listener::bind(&config.cwd))
         .transpose()?;
     let mut session = if interactive {
@@ -167,7 +215,11 @@ async fn run() -> Result<u8> {
                     .as_ref()
                     .filter(|text| !text.trim().is_empty())
                     .context("supply --goal or set goal in the config file")?;
-                Session::new(goal.clone())
+                let mut session = Session::new(goal.clone());
+                if !config.fixed_team && config.workers.is_empty() {
+                    session.phase = Phase::ProposeTeam;
+                }
+                session
             }
         })
     };
@@ -175,7 +227,7 @@ async fn run() -> Result<u8> {
         .as_ref()
         .map(|session| session.run_id().to_owned())
         .unwrap_or_default();
-    if managed {
+    if !interactive {
         if !config.resume {
             store.archive_old_checkpoint()?;
         }
@@ -186,22 +238,22 @@ async fn run() -> Result<u8> {
             return ui::run(&config, &store, session.take(), budget.clone()).await;
         }
         let session = session.take().expect("headless session initialized");
-        let reporter = if managed {
-            Reporter::Managed(control_state)
-        } else if config.headless {
-            Reporter::Silent
-        } else {
-            Reporter::Terminal
-        };
+        let reporter = Reporter::Managed(control_state, live_generations.clone());
         let orchestrator = Orchestrator::new(&config, &store, reporter, budget.clone())?;
-        let session = orchestrator
-            .run(session, managed.then_some(guidance))
-            .await?;
+        let session = orchestrator.run(session, Some(guidance)).await?;
         Ok(ui::Outcome::Finished(Box::new(session)))
     };
     let controls = async {
         if let Some(listener) = listener {
-            control::serve(listener, &active_run, generation, guide).await
+            control::serve(
+                listener,
+                &active_run,
+                generation,
+                guide,
+                live_generations.clone(),
+                &store,
+            )
+            .await
         } else {
             std::future::pending::<Result<()>>().await
         }

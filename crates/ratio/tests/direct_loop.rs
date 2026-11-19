@@ -188,6 +188,7 @@ fn cli_command(cwd: &Path, endpoint: &str, window: &str, args: &[&str]) -> Comma
             "--endpoint",
             endpoint,
             "--headless",
+            "--fixed-team",
             "--max-cycles",
             "2",
         ])
@@ -438,6 +439,399 @@ fn active_time_budget_still_interrupts_a_stalled_request() {
 }
 
 #[test]
+fn headless_reports_progress_before_the_first_response() {
+    use std::{process::Stdio, sync::mpsc};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (release, first_response) = mpsc::channel();
+    let (endpoint, server) = mock(move |index, _| match index {
+        0 => {
+            first_response.recv_timeout(Duration::from_secs(8)).unwrap();
+            text("Inspect the fixture.")
+        }
+        1 => text("Fixture inspected."),
+        2 => decision("approved", "Verified the fixture."),
+        _ => panic!("unexpected request {index}"),
+    });
+    let mut child = cli_command(temp.path(), &endpoint, "8192", &["--goal", "Inspect"])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (progress, live) = mpsc::channel();
+    let read = thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            if progress.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut saw_phase = false;
+    loop {
+        let line = live.recv_timeout(Duration::from_secs(5)).unwrap();
+        saw_phase |= line.starts_with("Cycle 1 /");
+        if line.contains("Requesting model") {
+            break;
+        }
+    }
+    assert!(saw_phase);
+    assert!(child.try_wait().unwrap().is_none());
+    release.send(()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    succeeded(&output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("VERDICT: APPROVED"));
+    assert!(!stdout.contains("Requesting model"));
+    server.join().unwrap();
+    read.join().unwrap();
+}
+
+#[test]
+fn provider_profile_and_piped_request_produce_a_typed_team_preview() {
+    use std::process::Stdio;
+    let temp = tempfile::tempdir().unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        assert_eq!(index, 0);
+        assert!(
+            request["messages"]
+                .to_string()
+                .contains("Check flux conservation")
+        );
+        assert!(request["tools"].to_string().contains("submit_team"));
+        let (status, mut response) = calls(&[tool(
+            "team",
+            "submit_team",
+            json!({
+                "goal":"Check flux conservation", "message":"One implementation worker",
+                "reviewers":[], "stakeholders":[],
+                "workers":[{"name":"Numerics","persona":"Verify the flux calculation"}],
+                "acceptance":["Conservation test passes"]
+            }),
+        )]);
+        response["test_terminal"] = json!(true);
+        (status, response)
+    });
+    let profile = temp.path().join("profile");
+    std::fs::create_dir_all(profile.join("ratio")).unwrap();
+    std::fs::write(
+        profile.join("ratio/config.toml"),
+        format!("endpoint = {endpoint:?}\nmodel = 'test-model'\ncontext_window = 8192\n"),
+    )
+    .unwrap();
+    let mut process = Command::new(ratio_binary())
+        .env("XDG_CONFIG_HOME", &profile)
+        .env("APPDATA", &profile)
+        .env_remove("RATIO_ENDPOINT")
+        .env_remove("RATIO_MODEL")
+        .env_remove("RATIO_CONTEXT_WINDOW")
+        .args([
+            "--api-key",
+            "test-key",
+            "--goal-stdin",
+            "--plan-only",
+            "-C",
+            temp.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    process
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"Check flux conservation\n")
+        .unwrap();
+    let output = process.wait_with_output().unwrap();
+    succeeded(&output);
+    let proposal: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(proposal["workers"][0]["name"], "Numerics");
+    assert!(!temp.path().join(".ratio").exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn positional_request_runs_with_the_generated_roster_and_persists_the_original() {
+    use ra::session::Store;
+    let temp = tempfile::tempdir().unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        let tools = request["tools"].to_string();
+        let messages = request["messages"].to_string();
+        match index {
+            0 => {
+                assert!(messages.contains("Check flux"));
+                calls(&[tool(
+                    "team",
+                    "submit_team",
+                    json!({
+                        "goal":"Verify conservation across cell interfaces","message":"Plan ready",
+                        "reviewers":[],"stakeholders":[],
+                        "workers":[{"name":"Numerics","persona":"Inspect the flux calculation"}],
+                        "acceptance":["Check the conservation identity"]
+                    }),
+                )])
+            }
+            1 => {
+                assert!(messages.contains("Check the conservation identity"));
+                text("Check the conservation identity.")
+            }
+            2 => {
+                assert!(messages.contains("Phase: coordinate"));
+                assert!(!tools.contains("create_file"));
+                text("The numerics worker owns this inspection.")
+            }
+            3 => {
+                assert!(tools.contains("submit_plan"));
+                assert!(tools.contains("depends_on"));
+                calls(&[tool(
+                    "plan",
+                    "submit_plan",
+                    json!({
+                        "plan":"Inspect the flux calculation", "ownership":{"worker_1":[]},
+                        "tasks":[{"id":"flux","worker":"worker_1","description":"Check flux","depends_on":[],"acceptance":["Conservation identity checked"]}]
+                    }),
+                )])
+            }
+            4 => {
+                assert!(!tools.contains("create_file"));
+                let schema = request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["function"]["name"] == "ack_plan")
+                    .unwrap();
+                let id = &schema["function"]["parameters"]["properties"]["plan_id"]["enum"][0];
+                calls(&[tool("ack", "ack_plan", json!({"plan_id":id}))])
+            }
+            5 => {
+                assert!(messages.contains("Phase: execute"));
+                text("Conservation identity checked.")
+            }
+            6 => {
+                assert!(messages.contains("Conservation identity checked"));
+                decision("approved", "Conservation verified.")
+            }
+            _ => panic!("unexpected request {index}"),
+        }
+    });
+    let output = Command::new(ratio_binary())
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("APPDATA", temp.path())
+        .args([
+            "-C",
+            temp.path().to_str().unwrap(),
+            "--headless",
+            "--endpoint",
+            &endpoint,
+            "--api-key",
+            "test-key",
+            "--model",
+            "test-model",
+            "--context-window",
+            "8192",
+            "Check flux",
+        ])
+        .output()
+        .unwrap();
+    succeeded(&output);
+    let run = Store::open(temp.path()).unwrap().load().unwrap();
+    assert_eq!(run.request.as_deref(), Some("Check flux"));
+    assert_eq!(run.goal, "Verify conservation across cell interfaces");
+    assert_eq!(run.workers.as_ref().unwrap()[0].name, "Numerics");
+    assert!(run.worker_plan.unwrap().graph.is_some());
+    server.join().unwrap();
+}
+
+#[test]
+fn live_worker_joins_only_after_both_mentors_and_amended_acknowledgements() {
+    exercise_live_worker_addition(false);
+}
+
+#[test]
+fn worker_objection_preserves_the_incumbent_plan_and_report() {
+    exercise_live_worker_addition(true);
+}
+
+fn exercise_live_worker_addition(object: bool) {
+    use ra::{
+        config::Worker,
+        session::{Phase, Session, Store, WorkerPlan, WritePath},
+    };
+    use std::{process::Stdio, sync::mpsc};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let original = Worker {
+        name: "Original implementer".into(),
+        persona: "Preserve existing work.".into(),
+        model: None,
+    };
+    let original_plan_id = {
+        let store = Store::open(root).unwrap();
+        let mut session = Session::new("Extend the simulator".into());
+        session.phase = Phase::Work;
+        session.workers = Some(vec![original.clone()]);
+        let mut plan = WorkerPlan::freeze(
+            "worker_1 owns original.txt".into(),
+            1,
+            1,
+            &[original],
+            vec![vec![WritePath {
+                path: "original.txt".into(),
+                directory: false,
+            }]],
+        );
+        plan.acknowledgements = vec![0];
+        let id = plan.id.clone();
+        session.worker_plan = Some(plan);
+        store.save(&session).unwrap();
+        id
+    };
+    let (arrived, incoming) = mpsc::channel();
+    let (release, unblock) = mpsc::channel();
+    let mut acks = std::collections::BTreeSet::new();
+    let (endpoint, server) = mock(move |index, request| {
+        let system = request["messages"][0]["content"].as_str().unwrap();
+        let tools = &request["tools"];
+        let history = request["messages"].to_string();
+        if index == 0 {
+            assert!(system.contains("Original implementer"));
+            arrived.send(()).unwrap();
+            unblock.recv_timeout(Duration::from_secs(8)).unwrap();
+            return text("Incumbent report preserved.");
+        }
+        if tools.to_string().contains("submit_worker_extension") {
+            return calls(&[tool(
+                "extension",
+                "submit_worker_extension",
+                json!({
+                    "name":"Diagnostics","persona":"Write diagnostic evidence","mentor":"worker_1","stakeholder":null,
+                    "paths":[{"path":"diagnostics.txt","directory":false}],
+                    "task":{"id":"diagnostics","worker":"worker_2","description":"Write diagnostic evidence","depends_on":[],"acceptance":["diagnostics.txt exists"]}
+                }),
+            )]);
+        }
+        if system.contains("Read-only onboarding") {
+            assert!(!tools.to_string().contains("create_file"));
+            if history.contains("Queued") {
+                return text("Onboarding briefing delivered.");
+            }
+            let message = |id, to| {
+                tool(
+                    id,
+                    "send_message",
+                    json!({"to":to,"message":"contract: diagnostics required"}),
+                )
+            };
+            return if system.contains("incoming worker") {
+                calls(&[
+                    message("peer", "worker_1"),
+                    message("requirement", "stakeholder_1"),
+                ])
+            } else {
+                calls(&[message("brief", "worker_2")])
+            };
+        }
+        if system.contains("Review this amended plan") {
+            assert!(!tools.to_string().contains("create_file"));
+            let newcomer = system.contains("Diagnostics");
+            acks.insert(newcomer);
+            let ack = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|schema| schema["function"]["name"] == "ack_plan")
+                .unwrap();
+            let id = &ack["function"]["parameters"]["properties"]["plan_id"]["enum"][0];
+            return if object && !newcomer {
+                calls(&[tool(
+                    "objection",
+                    "object_to_plan",
+                    json!({"plan_id":id,"reason":"Integration contract is incomplete"}),
+                )])
+            } else {
+                calls(&[tool("ack", "ack_plan", json!({"plan_id":id}))])
+            };
+        }
+        if system.contains("You are parallel worker worker_2") {
+            assert!(!object, "declined worker received execution tools");
+            assert_eq!(acks.len(), 2);
+            assert!(history.contains("Onboarding handoff"));
+            return if history.contains("Created diagnostics.txt") {
+                text("Diagnostics written.")
+            } else {
+                calls(&[tool(
+                    "create",
+                    "create_file",
+                    json!({"path":"diagnostics.txt","content":"verified"}),
+                )])
+            };
+        }
+        assert!(history.contains("Incumbent report preserved"));
+        decision("approved", "Both reports verified.")
+    });
+    let child = cli_command(root, &endpoint, "8192", &["--resume"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    incoming.recv_timeout(Duration::from_secs(8)).unwrap();
+    let request = Command::new(ratio_binary())
+        .args([
+            "-C",
+            root.to_str().unwrap(),
+            "--control",
+            "add-worker",
+            "--worker-request",
+            "Add diagnostics",
+        ])
+        .output()
+        .unwrap();
+    succeeded(&request);
+    assert!(String::from_utf8_lossy(&request.stdout).contains("queued"));
+    release.send(()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    succeeded(&output);
+    let session = Store::open(root).unwrap().load().unwrap();
+    let reader = Store::reader(root).unwrap();
+    let admissions = reader.worker_admissions(session.run_id()).unwrap();
+    assert_eq!(admissions.len(), 1);
+    assert_eq!(
+        admissions[0]["state"],
+        if object { "declined" } else { "admitted" }
+    );
+    let routes = reader
+        .ipc_routes(
+            session.run_id(),
+            None,
+            Some("OnboardWorker"),
+            admissions[0]["id"].as_i64(),
+        )
+        .unwrap();
+    assert!(routes.iter().any(|route| route["from"] == "worker_2"
+        && route["to"] == "stakeholder_1"
+        && route["state"] == "delivered"));
+    let plan = session.worker_plan.unwrap();
+    if object {
+        assert!(!root.join("diagnostics.txt").exists());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("declined"));
+        assert_eq!(session.workers.as_ref().unwrap().len(), 1);
+        assert_eq!(plan.id, original_plan_id);
+        assert_eq!(plan.acknowledgements, vec![0]);
+    } else {
+        assert_eq!(
+            std::fs::read_to_string(root.join("diagnostics.txt")).unwrap(),
+            "verified"
+        );
+        assert_eq!(session.workers.as_ref().unwrap().len(), 2);
+        assert_ne!(plan.id, original_plan_id);
+        assert_eq!(plan.acknowledgements, vec![0, 1]);
+    }
+    server.join().unwrap();
+}
+
+#[test]
 fn truncated_output_retries_with_less_input_and_discards_partial_tools() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("large.txt"), "A".repeat(4500)).unwrap();
@@ -526,7 +920,7 @@ fn prose_verdict_requests_repair_and_cannot_approve() {
 }
 
 #[test]
-fn invalid_mixed_verdict_batch_fails_closed_after_one_repair() {
+fn invalid_mixed_verdict_batch_fails_closed_after_bounded_repair() {
     let temp = tempfile::tempdir().unwrap();
     let (endpoint, server) = mock(|index, _| match index {
         0 => text("Inspect."),
@@ -539,13 +933,13 @@ fn invalid_mixed_verdict_batch_fails_closed_after_one_repair() {
                 json!({"verdict":"approved","assessment":"Done"}),
             ),
         ]),
-        3 => {
+        3 | 4 => {
             let (status, mut response) = calls(&[tool(
                 "verdict",
                 "submit_verdict",
                 json!({"verdict":"needs_revision","assessment":"Missing instructions"}),
             )]);
-            response["test_terminal"] = json!(true);
+            response["test_terminal"] = json!(index == 4);
             (status, response)
         }
         _ => panic!("invalid verdict exceeded repair allowance"),
@@ -559,6 +953,29 @@ fn invalid_mixed_verdict_batch_fails_closed_after_one_repair() {
         .unwrap();
     assert_eq!(session.phase, ra::session::Phase::Review);
     assert!(session.verdict.is_none());
+    let reader = ra::session::Store::reader(temp.path()).unwrap();
+    let history = reader
+        .audit(session.run_id(), Default::default(), 100)
+        .unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| event.kind == "contract_error")
+            .count(),
+        3
+    );
+    assert!(history.iter().any(|event| {
+        event.kind == "error"
+            && event.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("revision_instructions")
+    }));
+    assert!(
+        !history
+            .iter()
+            .any(|event| event.kind == "tool" && event.data["tool"] == "read_file")
+    );
     server.join().unwrap();
 }
 
@@ -697,6 +1114,10 @@ fn parallel_result_survives_interrupt_while_another_tool_is_in_flight() {
 
 #[test]
 fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let _tui = TUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -718,7 +1139,18 @@ fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
             }
         };
         read_mock_request(&mut socket);
+        let delta = stream_event(json!({"content":"DETACHED-LIVE-MARKER"}), None);
+        let chunk = format!("data: {delta}\n\n");
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{chunk}\r\n",
+            chunk.len()
+        )
+        .unwrap();
         connected.send(()).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
         let mut byte = [0];
         let result = std::io::Read::read(&mut socket, &mut byte);
         assert!(matches!(result, Ok(0)) || result.is_err());
@@ -732,6 +1164,15 @@ fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
     let launch: Value = serde_json::from_slice(&launch.stdout).unwrap();
     let run_id = launch["run"]["run_id"].as_str().unwrap();
     connection.recv_timeout(Duration::from_secs(8)).unwrap();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let (mut terminal, attached) = launch_tui(workspace, &endpoint, &["--attach", run_id]);
+        let mut display = Vec::new();
+        wait_for_screen(&mut terminal, &mut display, "DETACHED-LIVE-MARKER");
+        terminal.write_all(b"\x1b").unwrap();
+        wait_for_screen(&mut terminal, &mut display, "\x1b[?1049l");
+        succeeded(&attached.finish(terminal));
+    }
     let control = |action: &str, extra: &[&str]| {
         let output = Command::new(ratio_binary())
             .arg("-C")
@@ -752,6 +1193,11 @@ fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
     assert_eq!(control("cancel", &[])["accepted"], true);
     server.join().unwrap();
     let log = PathBuf::from(launch["log"].as_str().unwrap());
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("Requesting model")
+    );
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if std::fs::read_to_string(&log)
@@ -1533,7 +1979,7 @@ fn graph_runs_independent_workers_before_their_dependent() {
 }
 
 #[test]
-fn staged_graph_integrates_predecessors_before_the_dependent_starts() {
+fn staged_graph_recovers_truncated_and_incomplete_plans_before_execution() {
     exercise_worker_gate(true, false, true, true);
 }
 
@@ -1728,8 +2174,19 @@ persona = "Own worker_3.txt."
     let mut plan_id: Option<String> = None;
     let mut first_id: Option<String> = None;
     let mut replanning = false;
+    let mut freeze_attempts = 0;
     let plan =
         "worker_1 owns worker_1.txt. worker_2 owns worker_2.txt. worker_3 owns worker_3.txt.";
+    let frozen_plan = if staged {
+        concat!(
+            "worker_1: Build artifact 1\nAcceptance: file exists\n\n",
+            "worker_2: Build artifact 2\nAcceptance: file exists\n\n",
+            "worker_3: Build artifact 3\nAcceptance: file exists"
+        )
+    } else {
+        plan
+    };
+    let mut recovered = 0;
     let (endpoint, server) = mock_deferred(move |_, request| {
         let messages = request["messages"].as_array().unwrap();
         let system = messages[0]["content"].as_str().unwrap();
@@ -1780,7 +2237,7 @@ persona = "Own worker_3.txt."
                     .strip_prefix("Frozen plan ID: ")
                     .unwrap();
                 assert_eq!(id.len(), 64);
-                assert!(user_task.ends_with(plan));
+                assert!(user_task.ends_with(frozen_plan));
                 assert_eq!(plan_id.get_or_insert_with(|| id.to_owned()), id);
                 if objects && worker == 1 && !replanning {
                     first_id = Some(id.to_owned());
@@ -1849,7 +2306,12 @@ persona = "Own worker_3.txt."
                 assert!(unanimous);
                 assert!(system.contains("Phase: execute"));
                 assert!(mutators.iter().all(|tool| tools.contains(tool)));
-                assert!(messages[1]["content"].as_str().unwrap().ends_with(plan));
+                assert!(
+                    messages[1]["content"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with(frozen_plan)
+                );
                 let checkpoint: Value = serde_json::from_slice(
                     &std::fs::read(workspace.join(".ratio/session.json")).unwrap(),
                 )
@@ -1910,8 +2372,17 @@ persona = "Own worker_3.txt."
                 }
             }
         } else if task.starts_with("Write the final execution plan") {
+            freeze_attempts += 1;
             assert!(coordinated.iter().all(|&active| active));
             assert!(task.contains("Assignment agreed for worker_3.txt."));
+            if staged && graph && freeze_attempts == 1 {
+                let (status, stream) = stream_response(
+                    &[stream_event(json!({"content":"partial"}), Some("length"))],
+                    true,
+                    false,
+                );
+                return (status, stream, false);
+            }
             let mut submission = json!({"plan":plan,"ownership":{
                 "worker_1":[{"path":"./worker_1.txt","directory":false}],
                 "worker_2":[{"path":"worker_2.txt","directory":false}],
@@ -1925,11 +2396,39 @@ persona = "Own worker_3.txt."
                     "depends_on": if worker == 3 { vec!["task_1","task_2"] } else { Vec::new() },
                     "acceptance":["file exists"]
                 })).collect::<Vec<_>>());
+                if staged {
+                    submission["tasks"].as_array_mut().unwrap().pop();
+                }
+                if staged && freeze_attempts == 3 {
+                    assert!(all_messages.contains("worker_3"));
+                    assert!(all_messages.contains("missing"));
+                }
             }
             (calls(&[tool("plan", "submit_plan", submission)]), false)
+        } else if system.starts_with("Recover a multi-worker plan") {
+            assert!(staged);
+            assert_eq!(freeze_attempts, 4);
+            recovered += 1;
+            let id = format!("worker_{recovered}");
+            assert!(system.contains(&format!("Submit only {id}")));
+            let assignment = json!({
+                "task": {
+                    "id":id, "worker":id, "description":format!("Build artifact {recovered}"),
+                    "depends_on": if recovered == 3 { vec!["worker_1","worker_2"] } else { Vec::new() },
+                    "acceptance":["file exists"]
+                },
+                "paths":[{"path":format!("{id}.txt"),"directory":false}]
+            });
+            (
+                calls(&[tool("recovered", "submit_worker_assignment", assignment)]),
+                false,
+            )
         } else if task.starts_with("Inspect the resulting workspace") {
             assert!(unanimous);
             assert!(started.iter().all(|&active| active));
+            if staged {
+                assert_eq!(recovered, 3);
+            }
             (decision("approved", "Verified."), false)
         } else {
             (text("Coordinate assignments for all three workers."), false)
@@ -2111,7 +2610,7 @@ fn tui_previews_pauses_and_restarts_a_generation() {
     wait_for_screen(&mut terminal, &mut display, "Stakeholders");
     terminal.write_all(b"Inspect fixture\r").unwrap();
     wait_for_screen(&mut terminal, &mut display, "plan-ready-marker");
-    terminal.write_all(b"\x1b[15~").unwrap();
+    terminal.write_all(b"\x12").unwrap(); // Ctrl+R
     wait_for_screen(&mut terminal, &mut display, "LIVE-FIRST-PACKET");
     terminal.write_all(b"\x03").unwrap();
     wait_for_screen(&mut terminal, &mut display, "paused.");
@@ -2125,11 +2624,11 @@ fn tui_previews_pauses_and_restarts_a_generation() {
         });
     thread::sleep(Duration::from_millis(3250));
     terminal.write_all(b"use-a-new-check\r").unwrap();
-    terminal.write_all(b"\x1b[17~").unwrap();
+    terminal.write_all(b"\x10").unwrap(); // Ctrl+P
     wait_for_screen(&mut terminal, &mut display, "Approved");
     terminal.write_all(b"q").unwrap();
     wait_for_screen(&mut terminal, &mut display, "\x1b[?1049l");
-    let run = process.finish();
+    let run = process.finish(terminal);
     succeeded(&run);
     assert!(String::from_utf8_lossy(&run.stdout).contains("Verified after cancellation."));
     server.join().unwrap();
@@ -2275,20 +2774,22 @@ fn tui_refines_and_approves_a_goal_then_displays_file_tools() {
     wait_for_screen(&mut terminal, &mut display, "Refined");
     assert!(!temp.path().join(".ratio/session.json").exists());
     approved.store(true, Ordering::SeqCst);
-    terminal.write_all(b"\x1b[15~").unwrap();
+    terminal.write_all(b"\x1b[<0;110;1M\x1b[<0;110;1m").unwrap();
     wait_for_screen(&mut terminal, &mut display, "Approved");
-    terminal.write_all(b"\x1bOR").unwrap();
+    terminal.write_all(b"\t").unwrap();
     wait_for_screen(&mut terminal, &mut display, "Communication / Sequence");
     wait_for_screen(&mut terminal, &mut display, "Final verdict");
-    terminal.write_all(b"\x1bOS").unwrap();
+    terminal.write_all(b"\x06").unwrap(); // Ctrl+F
     wait_for_screen(&mut terminal, &mut display, "Stakeholder broadcast");
-    wait_for_screen(&mut terminal, &mut display, "trailing newline !required");
-    terminal.write_all(b"\t").unwrap();
+    wait_for_screen(&mut terminal, &mut display, "!required");
+    terminal.write_all(b"\x14").unwrap(); // Ctrl+T
     wait_for_screen(&mut terminal, &mut display, "Outbound routes");
-    terminal.write_all(b"\x1bOQ").unwrap();
+    terminal.write_all(b"\x1b[<0;3;2M\x1b[<0;3;2m").unwrap();
+    terminal.write_all(b"\x1b[5~").unwrap(); // Page Up
+    wait_for_screen(&mut terminal, &mut display, "tagged");
     terminal.write_all(b"q").unwrap();
     wait_for_screen(&mut terminal, &mut display, "\x1b[?1049l");
-    let run = process.finish();
+    let run = process.finish(terminal);
     succeeded(&run);
     assert!(String::from_utf8_lossy(&run.stdout).contains("VERDICT: APPROVED"));
     let display = String::from_utf8_lossy(&display);
@@ -2350,6 +2851,7 @@ fn launch_tui(cwd: &Path, endpoint: &str, args: &[&str]) -> (std::fs::File, Term
             "8192",
             "--output-tokens",
             "512",
+            "--fixed-team",
             "--endpoint",
             endpoint,
         ])
@@ -2363,6 +2865,9 @@ fn launch_tui(cwd: &Path, endpoint: &str, args: &[&str]) -> (std::fs::File, Term
             if libc::setsid() < 0 || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            if libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -2374,7 +2879,10 @@ struct TerminalChild(Option<std::process::Child>);
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl TerminalChild {
-    fn finish(mut self) -> Output {
+    fn finish(mut self, terminal: std::fs::File) -> Output {
+        // macOS can block in child reaping while the PTY master stays open.
+        // The child ignores the test's hangup so stdout can finish separately.
+        drop(terminal);
         self.0.take().unwrap().wait_with_output().unwrap()
     }
 }
