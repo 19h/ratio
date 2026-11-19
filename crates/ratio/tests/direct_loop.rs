@@ -802,16 +802,21 @@ fn exercise_live_worker_addition(object: bool) {
         if object { "declined" } else { "admitted" }
     );
     let routes = reader
-        .ipc_routes(
+        .ipc_routes_filtered(
             session.run_id(),
-            None,
-            Some("OnboardWorker"),
-            admissions[0]["id"].as_i64(),
+            ratio_engine::audit::AuditFilter {
+                phase: Some("OnboardWorker"),
+                worker_request: admissions[0]["id"].as_i64(),
+                from: Some("worker_2"),
+                to: Some("stakeholder_1"),
+                ..Default::default()
+            },
         )
         .unwrap();
-    assert!(routes.iter().any(|route| route["from"] == "worker_2"
-        && route["to"] == "stakeholder_1"
-        && route["state"] == "delivered"));
+    assert_eq!(
+        routes,
+        [json!({"from":"worker_2","to":"stakeholder_1","state":"delivered","count":1})]
+    );
     let plan = session.worker_plan.unwrap();
     if object {
         assert!(!root.join("diagnostics.txt").exists());

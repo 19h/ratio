@@ -339,9 +339,22 @@ fn select(reader: &RunReader, run: &str, view: &str, query: &Query) -> Result<Va
             json!({"rows":reader.inbox(run,param("before").and_then(|value| value.parse().ok()))?}),
         ),
         "admissions" => Ok(json!({"rows":reader.worker_admissions(run)?})),
-        "routes" => Ok(
-            json!({"rows":reader.ipc_routes(run,param("cycle").and_then(|value| value.parse().ok()),param("phase"),param("worker_request").and_then(|value| value.parse().ok()))?}),
-        ),
+        "routes" => {
+            let rows = reader.ipc_routes_filtered(
+                run,
+                AuditFilter {
+                    cycle: param("cycle").and_then(|value| value.parse().ok()),
+                    phase: param("phase"),
+                    worker_request: param("worker_request").and_then(|value| value.parse().ok()),
+                    actor: param("actor"),
+                    query: param("q"),
+                    from: param("from"),
+                    to: param("to"),
+                    ..AuditFilter::default()
+                },
+            )?;
+            Ok(json!({"rows":rows}))
+        }
         "checkpoint" => {
             let sequence = param("sequence").and_then(|value| value.parse().ok());
             let snapshot = reader

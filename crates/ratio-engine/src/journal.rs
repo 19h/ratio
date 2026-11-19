@@ -458,6 +458,12 @@ fn encode_json<T: serde::Serialize>(value: &T) -> Result<String> {
         .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
 }
 
+fn search_phrase(query: Option<&str>) -> Option<String> {
+    query
+        .filter(|query| !query.trim().is_empty())
+        .map(|query| format!("\"{}\"", query.replace('"', "\"\"")))
+}
+
 fn decode_column<T: serde::de::DeserializeOwned>(
     row: &rusqlite::Row<'_>,
     index: usize,
@@ -549,10 +555,7 @@ impl RunReader {
         if !self.has_audit()? {
             return Ok(Vec::new());
         }
-        let query = filter
-            .query
-            .filter(|query| !query.trim().is_empty())
-            .map(|query| format!("\"{}\"", query.replace('"', "\"\"")));
+        let query = search_phrase(filter.query);
         let order = if filter.after.is_some() {
             "ASC"
         } else {
@@ -607,16 +610,44 @@ impl RunReader {
         run: &str,
         cycle: Option<usize>,
         phase: Option<&str>,
-        request: Option<i64>,
+        worker_request: Option<i64>,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.ipc_routes_filtered(
+            run,
+            AuditFilter {
+                cycle,
+                phase,
+                worker_request,
+                ..AuditFilter::default()
+            },
+        )
+    }
+
+    pub fn ipc_routes_filtered(
+        &self,
+        run: &str,
+        filter: AuditFilter<'_>,
     ) -> Result<Vec<serde_json::Value>> {
         if !self.has_audit()? {
             return Ok(Vec::new());
         }
-        let mut statement = self.0.prepare("SELECT a.actor,d.value,json_extract(a.data,'$.delivery'),count(*)
+        let mut statement = self.0.prepare("WITH deliveries AS (
+            SELECT a.actor AS sender,d.value AS recipient,json_extract(a.data,'$.delivery') AS state,
+                row_number() OVER (message ORDER BY json_extract(a.data,'$.delivery')='queued', a.sequence DESC) AS latest,
+                max(CASE WHEN ?8 IS NULL THEN 1 ELSE a.sequence IN (
+                    SELECT rowid FROM audit_search WHERE audit_search MATCH ?8
+                ) END) OVER message AS matches_search
             FROM audit_events a,json_each(a.data,'$.to') d WHERE a.run_id=?1 AND a.kind='ipc'
-            AND (?2 IS NULL OR a.cycle=?2) AND (?3 IS NULL OR a.phase=?3) AND (?4 IS NULL OR json_extract(a.data,'$.worker_request')=?4)
-            GROUP BY a.actor,d.value,json_extract(a.data,'$.delivery')")?;
-        statement.query_map(params![run,cycle,phase,request], |row| {
+            AND (?2 IS NULL OR a.cycle=?2) AND (?3 IS NULL OR a.phase=?3)
+            AND (?4 IS NULL OR json_extract(a.data,'$.worker_request')=?4)
+            AND (?5 IS NULL OR a.actor=?5 OR d.value=?5)
+            AND (?6 IS NULL OR a.actor=?6) AND (?7 IS NULL OR d.value=?7)
+            WINDOW message AS (PARTITION BY a.phase,a.cycle,a.actor,d.value,
+                json_extract(a.data,'$.sequence'),json_extract(a.data,'$.attempt'),json_extract(a.data,'$.worker_request'))
+            ) SELECT sender,recipient,state,count(*) FROM deliveries WHERE latest=1 AND matches_search
+            GROUP BY sender,recipient,state")?;
+        let query = search_phrase(filter.query);
+        statement.query_map(params![run,filter.cycle,filter.phase,filter.worker_request,filter.actor,filter.from,filter.to,query], |row| {
             Ok(serde_json::json!({"from":row.get::<_,String>(0)?,"to":row.get::<_,String>(1)?,"state":row.get::<_,String>(2)?,"count":row.get::<_,usize>(3)?}))
         })?.collect()
     }

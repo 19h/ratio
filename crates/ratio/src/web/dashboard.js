@@ -87,7 +87,7 @@ function table(columns, rows, className = "") {
   return node("div", { class: "table-wrap" }, node("table", { class: className },
     node("thead", {}, node("tr", {}, columns.map(text => node("th", { scope: "col" }, text)))),
     node("tbody", {}, rows.map(cells => node("tr", { class: cells.selected ? "selected" : undefined }, cells.map(value =>
-      value?.cell === undefined ? node("td", {}, value) : node("td", { class: value.class }, value.cell)))))));
+      value?.cell === undefined ? node("td", {}, value) : node(value.scope ? "th" : "td", { class: value.class, scope: value.scope }, value.cell)))))));
 }
 
 function runUrl(page = "overview", query = {}, id = state.route.run) {
@@ -238,9 +238,13 @@ function renderStatus() {
   ] : [cell(`${state.runs.length} runs`), spacer()]);
 }
 
+function tokenCount(count) {
+  return count?.tokens != null ? `${count.estimated ? "~" : ""}${number.format(count.tokens)}${count.partial ? "+" : ""}` : "—";
+}
+
 function tokenFlow(kind, arrow, label, count) {
   const known = count?.tokens != null;
-  const text = known ? `${count.estimated ? "~" : ""}${number.format(count.tokens)}${count.partial ? "+" : ""}` : "—";
+  const text = tokenCount(count);
   const value = known ? `${count.estimated ? "approximately " : ""}${number.format(count.tokens)}${count.partial ? " with some requests missing data" : ""}` : "unavailable";
   const description = `${label} · ${value}`;
   return node("span", { class: "token-flow", "data-token-flow": kind, "data-token-count": count?.tokens, title: description, "aria-label": description },
@@ -310,7 +314,7 @@ function overview() {
           : empty("The roster appears once a team is proposed.")),
         section({ label: "Execution plan", meta: flow.plan_id ? code(flow.plan_id) : null, flush: true },
           tasks.length ? table(["Task", "Worker", "State", "Depends on"], tasks.map(({ task, state: status }) =>
-            [task.description, actorLink(task.worker), pill(status), task.depends_on.length ? code(task.depends_on.join(", ")) : "—"]))
+            [task.description, actorLink(task.worker), pill(status), task.depends_on.length ? code(task.depends_on.join(", ")) : "—"]), "plan")
             : empty("Waiting for a frozen plan."),
           (data.acceptance ?? []).length ? node("details", {}, node("summary", {}, "Acceptance criteria"), node("ul", {}, data.acceptance.map(text => node("li", {}, text)))) : null,
           data.plan?.ownership ? node("details", {}, node("summary", {}, "Write ownership"),
@@ -324,7 +328,9 @@ function overview() {
           ["Assessment", data.assessment ? pre(data.assessment) : null],
           ["Failure", data.latest_error ? [pre(data.latest_error.data.text), go("Open failure in timeline", entryUrl(data.latest_error.key))] : null],
         ])),
-        section("Usage", facts(Object.entries(metrics).map(([name, value]) => [title(name), number.format(value)])) ?? muted("Nothing metered yet.")))),
+        section("Usage", facts(Object.entries(metrics).flatMap(([name, value]) => name === "token_breakdown"
+          ? Object.entries(value).map(([flow, count]) => [title(flow) + " tokens", tokenCount(count)])
+          : [[title(name), number.format(value)]])) ?? muted("Nothing metered yet.")))),
   ]);
 }
 
@@ -556,25 +562,41 @@ function messageInspector(detail) {
     [...recipients.values()].map(item => row(mark(item.state), who(item.recipient), spacer(), time(item.timestamp_ms))))];
 }
 
-function communication(rows, route, routes, focus) {
-  const query = route.query;
-  if (query.tab === "matrix") {
-    const ids = [...new Set(routes.flatMap(entry => [entry.from, entry.to]))];
-    const counts = new Map();
-    for (const entry of routes) {
-      const key = entry.from + ">" + entry.to;
-      const tally = counts.get(key) ?? { queued: 0, delivered: 0, dropped: 0 };
-      tally[entry.state] = entry.count;
-      counts.set(key, tally);
-    }
-    const peak = Math.max(1, ...[...counts.values()].map(tally => tally.delivered));
-    return section({ label: "Route matrix", meta: "delivered / queued / dropped", flush: true }, table(["From / To", ...ids.map(actorName)], ids.map(from =>
-      [actorLink(from), ...ids.map(to => {
-        const tally = counts.get(from + ">" + to);
-        return tally ? { class: `h${Math.ceil(tally.delivered / peak * 5)}`, cell: link(`${tally.delivered}/${tally.queued}/${tally.dropped}`,
-          runUrl("ipc", { ...query, tab: undefined, from, to }), { title: "Delivered / queued / dropped" }) } : "—";
-      })]), "matrix"));
+function routeMatrix(routes, query) {
+  const head = { label: "Route matrix", meta: "delivered / pending / dropped", flush: true };
+  if (!routes.length) return section(head, empty("No matching routes."));
+  const participants = new Set(routes.flatMap(entry => [entry.from, entry.to]));
+  const ids = [...new Set([...roster().map(agent => agent.id), ...participants])].filter(id => participants.has(id));
+  const badge = id => node("abbr", { class: "alias", "data-role": role(id), title: actorName(id) }, alias(id) === "Agent" ? id : alias(id));
+  const counts = new Map();
+  for (const entry of routes) {
+    const key = entry.from + ">" + entry.to;
+    const tally = counts.get(key) ?? { queued: 0, delivered: 0, dropped: 0 };
+    tally[entry.state] = entry.count;
+    counts.set(key, tally);
   }
+  const total = tally => tally.delivered + tally.queued + tally.dropped;
+  const peak = Math.max(1, ...[...counts.values()].map(total));
+  const grid = table(["From / To", ...ids.map(badge)], ids.map(from => [
+    { scope: "row", cell: node("span", { class: "route-source" }, badge(from), actorLink(from)) },
+    ...ids.map(to => {
+      const tally = counts.get(from + ">" + to);
+      if (!tally) return "—";
+      const description = `${actorName(from)} to ${actorName(to)}: ${tally.delivered} delivered, ${tally.queued} pending, ${tally.dropped} dropped`;
+      return { class: `h${Math.ceil(total(tally) / peak * 5)}`, cell: link(`${tally.delivered}/${tally.queued}/${tally.dropped}`,
+        runUrl("ipc", { ...query, tab: undefined, before: undefined, entry: undefined, from, to }), { title: description, "aria-label": description }) };
+    }),
+  ]), "matrix route-matrix");
+  $("table", grid).style.setProperty("--recipient-count", ids.length);
+  grid.dataset.scroll = "route-matrix";
+  grid.tabIndex = 0;
+  grid.setAttribute("role", "region");
+  grid.setAttribute("aria-label", "Route matrix");
+  return section(head, grid);
+}
+
+function communication(rows, route, focus) {
+  const query = route.query;
   const selected = rows.filter(event => (!query.from || event.actor === query.from) && (!query.to || event.data.to?.includes(query.to)));
   if (query.tab === "lanes") {
     const agents = [...new Set(selected.flatMap(event => [event.actor, ...(event.data.to ?? [])]))];
@@ -635,11 +657,12 @@ async function historyView(route) {
   if (page === "triage") return triageView(route);
   const local = page === "agent" ? "agent/" + encodeURIComponent(actor) : page;
   const tab = query.tab ?? "all";
+  const matrix = page === "ipc" && tab === "matrix";
   const kind = page === "ipc" || (page === "agent" && tab === "ipc") ? "ipc" :
     page === "tools" ? tab === "mcp" ? "mcp" : "tool" :
       page === "agent" && tab === "tools" ? "tool" : query.kind;
   const [historyData, chosen] = await Promise.all([
-    api(apiRun("history", { ...query, actor: actor ?? query.actor, kind,
+    matrix ? api(apiRun("routes", query)) : api(apiRun("history", { ...query, actor: actor ?? query.actor, kind,
       from: actor && tab === "ipc" && query.direction === "outgoing" ? actor : query.from,
       to: actor && tab === "ipc" && query.direction === "incoming" ? actor : query.to,
       path: tab === "files" ? query.path ?? "*" : query.path })),
@@ -658,12 +681,12 @@ async function historyView(route) {
     const match = /^(worker|reviewer|stakeholder)_(\d+)$/.exec(actor ?? "");
     const persona = match ? state.summary[match[1] + "s"]?.[Number(match[2]) - 1]?.persona : null;
     const active = generation(actor);
-    head.push(node("section", { class: "band" },
+    const field = (label, body) => body ? node("div", { class: "hero-field wide" }, caption(label),
+      pre(body, { class: "agent-field-text", tabindex: 0, "aria-label": label, "data-scroll": `agent-${label.toLowerCase()}` })) : null;
+    head.push(node("section", { class: "band agent-band", "data-scroll": "agent-band" },
       node("div", { class: "hero" }, caption("Agent"), node("h1", { class: "hero-title" }, agent.name),
         node("span", { class: "hero-sub" }, node("span", { class: `dot${active ? " live" : ""}`, "data-agent-dot": actor }), code(actor), task ? pill(task.state) : null)),
-      task?.task ? node("div", { class: "hero-field wide" }, caption("Task"), node("p", {}, task.task.description)) : null,
-      persona ? node("div", { class: "hero-field wide" }, caption("Persona"),
-        pre(persona, { class: "persona", tabindex: 0, "aria-label": "Persona" })) : null,
+      field("Task", task?.task?.description), field("Persona", persona),
       pre(active?.text || "", { class: "preview", hidden: !active, "data-preview-actor": actor })),
     tabs(local, [["all", "Conversation"], ["ipc", "Incoming & outgoing IPC"], ["tools", "Tools"]], tab, query));
     if (tab === "ipc") head.push(node("nav", { class: "tabs sub", "aria-label": "Message direction" },
@@ -690,7 +713,7 @@ async function historyView(route) {
   head.push(filters(route, { actor: page !== "agent", kind: page === "history" }));
   if (detail && page === "history" && !rows.some(entry => entry.key === detail.event.key)) rows = [detail.event, ...rows];
   let content;
-  if (page === "ipc") content = communication(rows, route, query.tab === "matrix" ? (await api(apiRun("routes", query))).rows : [], focus);
+  if (page === "ipc") content = matrix ? routeMatrix(rows, query) : communication(rows, route, focus);
   else if (page === "tools" || tab === "tools") content = section({ label: tab === "mcp" ? "MCP calls" : "Tool calls", meta: rows.length || null, flush: true }, toolTable(rows, route, local));
   else content = node("section", { class: "timeline", "aria-label": "Recorded timeline" }, rows.length
     ? rows.map(event => historyCard(event, query.entry, query.call))
@@ -703,7 +726,7 @@ async function historyView(route) {
     : pagination("History pagination",
       query.before ? link("Latest", runUrl(local, { ...query, before: undefined, entry: undefined })) : null,
       historyData.rows.length >= 60 ? link("Older entries", runUrl(local, { ...query, before: oldest, entry: undefined })) : null);
-  return view(head, diagram ? [pages, content] : [content, pages], {
+  return view(head, matrix ? content : diagram ? [pages, content] : [content, pages], {
     aside: inspector(detail, query.entry ? runUrl(local, { ...query, entry: undefined }) : null), flush: true, follow: diagram,
   });
 }

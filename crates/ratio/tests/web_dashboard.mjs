@@ -79,7 +79,7 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
       }));
       else if (tools.has("submit_worker_extension")) output = completion(null,call("submit_worker_extension",{
         name:"Evidence auditor",persona:"Check integration evidence",mentor:"worker_1",stakeholder:null,paths:[],
-        task:{id:"audit",worker:"worker_2",description:"Check integration evidence",depends_on:[],acceptance:["Evidence checked"]},
+        task:{id:"audit",worker:"worker_2",description:"Check integration evidence.\n".repeat(35)+"Last checkpoint.",depends_on:[],acceptance:["Evidence checked"]},
       }));
       else if (system.includes("Read-only onboarding")) {
         assert.ok(!tools.has("create_file"));
@@ -239,9 +239,23 @@ tools = ["inspect"]
     await page.getByRole("link",{name:"Agent lanes",exact:true}).click();
     await page.getByRole("heading",{name:"Agent lanes"}).waitFor();
     await shot("lanes");
+    await page.getByRole("link",{name:"Route matrix",exact:true}).click();
+    const grid = page.getByRole("region",{name:"Route matrix"});
+    await grid.getByRole("link",{name:/Evidence auditor to .*1 delivered, 0 pending, 0 dropped/}).first().waitFor();
+    assert.ok(await grid.evaluate(element => element.scrollWidth <= element.clientWidth));
+    await page.getByRole("searchbox",{name:"Search entries"}).fill("request acceptance");
+    await page.getByRole("button",{name:"Apply",exact:true}).click();
+    await page.waitForURL(url => url.searchParams.get("q") === "request acceptance");
+    await page.waitForFunction(() => document.querySelectorAll(".route-matrix td a").length === 1);
+    await grid.getByRole("link",{name:/Evidence auditor to .*1 delivered, 0 pending, 0 dropped/}).first().waitFor();
     await page.locator("#agent-nav").getByRole("link",{name:"Evidence auditor"}).click();
     const persona = page.locator('pre[aria-label="Persona"]').filter({hasText:"Check integration evidence"});
     await persona.waitFor({state:"visible"});
+    const task = page.locator('pre[aria-label="Task"]');
+    assert.ok(await task.evaluate(element => element.scrollHeight > element.clientHeight));
+    assert.equal(await task.evaluate(element => getComputedStyle(element).maxHeight),
+      await persona.evaluate(element => getComputedStyle(element).maxHeight));
+    assert.ok(await page.locator('.view-scroll[data-scroll="body"]').evaluate(element => element.clientHeight > 200));
     await page.getByRole("link",{name:"Incoming & outgoing IPC"}).click();
     await page.getByRole("link",{name:"Incoming",exact:true}).click();
     await page.getByText("acceptance: verify evidence",{exact:true}).first().waitFor();
