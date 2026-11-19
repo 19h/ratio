@@ -1,10 +1,13 @@
 use std::collections::VecDeque;
 
 use anyhow::{Context, Result, ensure};
+use ratio_protocol::{Effect, EffectState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::{Api, Message};
+
+const INTERRUPTED: &str = "Tool was interrupted before its result was recorded. Inspect the workspace before deciding whether to retry; it may have changed.";
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Dialogue {
@@ -21,9 +24,43 @@ pub struct Dialogue {
     pub in_flight: bool,
     /// Hint for the compaction target. The request's input ceiling is set separately.
     pub estimated_budget: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_compaction: Option<CompactionReceipt>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct CompactionReceipt {
+    pub folded_groups: usize,
+    pub before_tokens: usize,
+    pub after_tokens: usize,
 }
 
 impl Dialogue {
+    pub(crate) fn result_for(&self, id: &str) -> Option<(&str, &str)> {
+        for group in self.groups.iter().rev() {
+            let Some(Message::Assistant { tool_calls, .. }) = group.first() else {
+                continue;
+            };
+            let Some((index, call)) = tool_calls
+                .iter()
+                .enumerate()
+                .find(|(_, call)| call.id == id)
+            else {
+                continue;
+            };
+            return match group.get(index + 1) {
+                Some(Message::Tool {
+                    tool_call_id,
+                    content,
+                }) if tool_call_id == id && content != INTERRUPTED => {
+                    Some((&call.function.name, content))
+                }
+                _ => None,
+            };
+        }
+        None
+    }
+
     pub fn recover_interrupted_tool(&mut self) -> Result<bool> {
         if !self.in_flight {
             return Ok(false);
@@ -31,16 +68,42 @@ impl Dialogue {
         let call = self.pending()?.context("missing interrupted call")?;
         if matches!(
             call.function.name.as_str(),
-            "send_message" | "remember" | "recall"
+            "send_message" | "remember" | "recall" | "ack_plan" | "object_to_plan"
         ) {
             // The IPC queue and shared memory commit in the same checkpoint as
             // their tool results. A pending call can safely run again.
             self.in_flight = false;
             return Ok(true);
         }
-        let message = "Tool was interrupted before its result was recorded. Inspect the workspace before deciding whether to retry; it may have changed.";
-        self.record_tool(call.id.clone(), message.into());
+        self.record_tool(call.id.clone(), INTERRUPTED.into());
         Ok(true)
+    }
+
+    pub(crate) fn effects(&self, actor: &str, attempt: usize, effects: &mut Vec<Effect>) {
+        let Some(group) = self.groups.back() else {
+            return;
+        };
+        let Some(Message::Assistant { tool_calls, .. }) = group.first() else {
+            return;
+        };
+        for (index, call) in tool_calls.iter().enumerate() {
+            let state = match group.get(index + 1) {
+                Some(Message::Tool { content, .. }) if content == INTERRUPTED => {
+                    EffectState::Unknown
+                }
+                Some(Message::Tool { .. }) => EffectState::Recorded,
+                None if self.in_flight && index == group.len() - 1 => EffectState::Intended,
+                _ => continue,
+            };
+            effects.push(Effect {
+                actor: actor.into(),
+                attempt,
+                round: self.tool_rounds,
+                index,
+                tool: call.function.name.chars().take(128).collect(),
+                state,
+            });
+        }
     }
 
     pub fn start(task: String) -> Self {
@@ -228,8 +291,18 @@ impl Compact<'_> {
                 .saturating_sub(64)
                 .min(self.output_tokens)
                 .min((self.input_budget / 8).max(1));
-            let excerpt =
-                serde_json::to_string(&dialogue.groups.iter().take(selected).collect::<Vec<_>>())?;
+            let history = dialogue
+                .groups
+                .iter()
+                .take(selected)
+                .map(|group| {
+                    group
+                        .iter()
+                        .map(crate::api::chat_message)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let excerpt = serde_json::to_string(&history)?;
             let summary = self
                 .summarize(&dialogue.summary, &excerpt, output_budget)
                 .await?;
@@ -247,6 +320,11 @@ impl Compact<'_> {
                 anyhow::bail!("compaction could not reduce the projected context");
             }
             dialogue.groups.drain(..selected);
+            dialogue.last_compaction = Some(CompactionReceipt {
+                folded_groups: selected,
+                before_tokens: total,
+                after_tokens: new_total,
+            });
             compacted += selected;
         }
     }

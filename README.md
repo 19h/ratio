@@ -1,6 +1,6 @@
 # Ratio
 
-Ratio runs a reviewer-driven coding loop in a local workspace. The `ra` binary manages conversations, executes tools, compacts context and checkpoints progress. A Chat Completions endpoint supplies the model.
+Ratio runs a reviewer-driven coding loop in a local workspace. `ratio-engine` owns execution, tool dispatch, compaction and checkpoints. `ratio-protocol` contains the task graph, run events and local control messages. `ra` provides the CLI and terminal UI.
 
 ```text
 goal -> reviewer plan -> worker tools -> reviewer verdict
@@ -23,7 +23,7 @@ export RATIO_API_KEY='<provider key>'
   --goal 'Fix the parser regression and verify all supported inputs.'
 ```
 
-Pass either a base URL or a full URL ending in `/chat/completions`. The endpoint must support function tools and Chat Completions message roles. Ratio sends a Bearer header when configured. For a keyless local endpoint, omit the key or pass an empty value. Providers that require `max_tokens` accept `--legacy-max-tokens`. Ratio normally sends `max_completion_tokens`. [Chat Completions API reference](https://developers.openai.com/api/reference/resources/chat)
+Chat Completions is the default. Pass a base URL or a full `/chat/completions` URL. Use `--provider-api responses` or `[provider].api = "responses"` for a base URL or a full `/responses` URL. Both transports support streaming and function tools. Responses uses `store: false` and carries returned reasoning items with the corresponding tool results. Chat Completions sends `max_completion_tokens` by default and accepts `--legacy-max-tokens` for gateways that require `max_tokens`. Ratio sends a Bearer header when configured. [Chat Completions reference](https://developers.openai.com/api/reference/resources/chat), [Responses reference](https://developers.openai.com/api/reference/resources/responses/methods/create)
 
 | Setting | CLI | Environment | TOML |
 | --- | --- | --- | --- |
@@ -33,6 +33,7 @@ Pass either a base URL or a full URL ending in `/chat/completions`. The endpoint
 | Context window in tokens | `--context-window` | `RATIO_CONTEXT_WINDOW` | `context_window` |
 | Output limit in tokens | `--output-tokens` | | `output_tokens` |
 | Stream responses | `--stream true\|false` | | `[provider].stream` |
+| Provider API | `--provider-api chat-completions\|responses` | | `[provider].api` |
 | Sampling temperature | `--temperature` | | `[provider].temperature` |
 | Nucleus sampling | `--top-p` | | `[provider].top_p` |
 | Provider seed | `--seed` | | `[provider].seed` |
@@ -71,6 +72,8 @@ Press **F3** during or after a run to open Communication. The sequence diagram u
 
 The view retains the latest 512 exchanges observed by the current TUI session. Resuming also shows IPC still queued in the checkpoint. An IPC delivery marker means Ratio added the message to the recipient's context. Handoffs show the context Ratio prepared for the next phase.
 
+Press **F8** for Workflow. It shows plan acknowledgement, task dependencies and status, acceptance criteria, compaction counts and the verification receipt. For a detached or historical run, `--attach RUN_ID` restores recorded IPC and tool effect observations. In an attached live run, F6 controls requests and Enter queues guidance. Esc detaches.
+
 ## Tools and constraints
 
 The lead reviewer submits the final decision through `submit_verdict` with `verdict` and `assessment`. A `needs_revision` decision also requires `revision_instructions`. The tool must be the only call in its completion. Ratio renders the CLI verdict from the recorded decision.
@@ -89,7 +92,7 @@ A range edit requires the current `snapshot_id` from a tagged read. Any interven
 
 Configure any number up to 64 of `[[reviewers]]` and `[[stakeholders]]` combined. Each entry supports a name, persona, phases, and optional model override. Ratio runs the active panel in parallel, bounded by `orchestration.max_parallel_agents` (default 8). Set `parallel_stakeholders = false` to make requests serial. The lead reviewer synthesizes the panel's reports and delivers the final verdict.
 
-Panel members receive explicit peer IDs, such as `reviewer_1` and `stakeholder_1`. They can call `send_message` with `to` and `message`. Message bodies use BWP and are delivered as attributed context at the next safe model request. New mail can reactivate a member that already submitted an assessment. Ratio bounds messages and mailbox sizes, rejects malformed messages, and shows deliveries in the TUI. Mail is scoped to the current consultation and held in memory. Resuming an interrupted consultation reruns the panel with the checkpointed configuration.
+Panel members receive explicit peer IDs, such as `reviewer_1` and `stakeholder_1`. They can call `send_message` with `to` and `message`. Message bodies use BWP and enter the recipient's context at a request boundary. New mail can reactivate a member that already submitted an assessment. Ratio commits mail and recipient context alongside panel progress. Resume restores the consultation, coordination or acknowledgement phase in progress.
 
 ## Parallel workers
 
@@ -99,16 +102,33 @@ The lead reviewer freezes a plan with `submit_plan`, passing the plan text and a
 
 After unanimous approval, workers run concurrently up to `orchestration.max_parallel_agents`. Ratio commits each tool result as it completes and marks interrupted workspace tools as unknown. A revision starts a fresh coordination and approval cycle.
 
+Set `[orchestration].require_task_graph = true` to require one typed task per worker. Each task has an ID, its owner, a description, predecessor IDs and acceptance criteria. Ratio rejects unknown predecessors, duplicate assignments and cycles. The ACK digest covers the graph. A worker becomes runnable after its predecessors complete. Independent workers share the configured concurrency limit.
+
 During coordination and implementation, a worker can use `send_message` to ask any configured `stakeholder_N` for clarification. The stakeholder wakes on receipt and answers with a BWP `send_message` addressed to the requester. Ratio broadcasts the answer to every worker, including workers who already submitted a report. Stakeholders can inspect the workspace while answering and share the worker concurrency limit. If a reply changes an assignment or shared contract, the workers report it for replanning. The implementation checkpoint preserves queued mail and delivered context for `--resume`.
 
-Agents can use `remember` with a `topic` and `note` to record evidence, decisions, or open questions. `recall` returns recent notes shared by all agents, with their authors. Use a case-insensitive `query` to search and `before_id` to page through older matches. Ratio saves up to 128 notes in the run checkpoint, across compaction, review cycles, and `--resume`. A fresh run starts with an empty memory.
+Agents can use `remember` with a `topic` and `note` to record evidence, decisions, or open questions. The optional `evidence` list names up to eight recorded tool call IDs from the current context. Ratio validates each reference and hashes the result. `recall` returns author-attributed notes and their references to all agents. Use a case-insensitive `query` to search and `before_id` to page through older matches. Ratio saves up to 128 notes per run.
 
 The [MorphLLM estuary flood example](examples/morph-dsv41flash-abliterated.toml) assigns the numerical kernels, parallel solver, and verification and CLI to separate workers. Its review panel covers coastal hydraulics, numerical validation, Rust architecture, flood mapping, and reproducible performance. Run it in a fresh workspace with `RATIO_API_KEY` set.
 
 ```sh
-cargo run -- --headless --config examples/morph-dsv41flash-abliterated.toml \
-  -C "$(mktemp -d)"
+workspace="$(mktemp -d)"
+git -C "$workspace" init
+cargo run -- --headless --config examples/morph-dsv41flash-abliterated.toml -C "$workspace"
 ```
+
+## Staged execution
+
+Use staged mode from the root of a Git working tree.
+
+```toml
+[orchestration]
+stage_workspace = true
+verification_commands = ["cargo test --locked --workspace"]
+```
+
+Ratio snapshots tracked and unignored working files, including tracked edits and untracked files. Each worker starts from a private copy containing completed predecessor changes. Ratio integrates the worker's delta in worker order at each completion wave and checks it against frozen ownership. Verification runs on a separate copy. A passing receipt binds the reviewed file manifest to its SHA-256 digest. The approved delta is applied to the live worktree with a recoverable publication intent. Ratio compares each affected path against the baseline, preserves unrelated edits, and leaves the Git index and refs alone.
+
+This mode requires regular files and UTF-8 paths. Publication detects dirty-path conflicts and preserves the candidate for inspection and resume. File operations are individually atomic where the filesystem supports replacement. A concurrent external writer can still race the final check. Shell and verification commands retain the operator's host permissions. Keep build artifacts ignored so they stay outside the candidate manifest.
 
 ## Context and resume
 
@@ -116,7 +136,50 @@ Ratio reserves the configured output budget and estimates the input cost of mess
 
 If a phase completion hits the output limit, Ratio discards the partial reply and retries up to twice, asking for a concise completion and shrinking retained input where possible. The configured output cap and run budgets still apply.
 
-A workspace holds one active checkpoint at `.ratio/session.json`. Use `--resume` with the provider settings to continue with the checkpoint's refined goal and remaining budgets. Time between invocations is excluded. Ratio saves a marker before running a tool. It retries an unfinished IPC or memory tool from the saved state. For an interrupted workspace tool, it reports the outcome as unknown so the model can inspect the workspace before deciding whether to retry. Incompatible checkpoints require a fresh run, which archives the previous format before replacement.
+The workspace journal is `.ratio/runs.sqlite3` in WAL mode. It commits run state, IPC and effect observations together, and saves the budget ledger there. Use `--resume` for the most recent checkpoint, or add `--run-id RUN_ID` to select a run. Format-2 JSON checkpoints import when resumed in a workspace with no journaled run. The JSON checkpoint is also maintained for format-2 readers. Time between invocations is excluded. An interrupted shell or workspace tool is recorded as an unknown result and stays available for inspection. Unfinished IPC, shared memory and acknowledgement tools can be retried from the saved state.
+
+```text
+ra -C PROJECT --detached --config ratio.toml --goal "Implement the solver"
+ra -C PROJECT --list-runs
+ra -C PROJECT --events RUN_ID --after 0 --follow
+ra -C PROJECT --attach RUN_ID
+ra -C PROJECT --control guide --guidance "Keep the reference solver available"
+ra -C PROJECT --control pause
+ra -C PROJECT --control resume
+ra -C PROJECT --control cancel
+ra -C PROJECT --fork RUN_ID --config ratio.toml --goal "Evaluate a second approach"
+```
+
+Detached runs use a private Unix socket or a Windows named pipe restricted to the operator and SYSTEM. The launch response includes the run ID when the process is active and the path to its output log. `--events` streams JSON Lines by checkpoint sequence. Rust consumers can use `ratio_engine::RunReader` and the types in `ratio-protocol`. Forks use the recorded roster and goal with a fresh worktree baseline, budget and conversation. Keep `.ratio/` private and out of version control because it contains transcripts and workspace snapshots.
+
+## Extensions and evaluation
+
+```toml
+[skills.numerics]
+directory = "skills/numerics"
+description = "Read before changing numerical kernels or reference fixtures."
+
+[mcp_servers.project_tools]
+command = "/absolute/path/to/project-mcp"
+args = []
+tools = ["locate_symbol", "check_interface"]
+protocol = "2025-11-25"
+```
+
+A skill directory contains `SKILL.md` and any relative references. Paths in a skill configuration resolve relative to the configuration file. Agents discover and read these files through `read_skill`. MCP servers are local stdio subprocesses. Workers can list and call only the names the operator allowlists, after the plan gate opens. Ratio also supports explicit MCP revision `2026-07-28`. Each invocation opens its own process, so a server that requires connection-local state across tool calls needs another integration. [MCP stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports), [MCP versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)
+
+`--metrics RUN_ID` reports provider attempts, metered tokens, active milliseconds, tool outcomes and IPC deliveries. `--otlp-trace RUN_ID` writes an OTLP/HTTP JSON trace derived from checkpoint timestamps. It includes phase changes and tool spans and omits prompts, arguments, results and message bodies. Ratio writes the export to stdout. [OTLP JSON encoding](https://opentelemetry.io/docs/specs/otlp/)
+
+`--evaluate RUN_ID` checks for an approved run with no unknown tool outcomes. Pass `--evaluation rules.json` to check a candidate verification receipt, minimum IPC deliveries, a different final phase, or ceilings on provider attempts, metered tokens and active milliseconds. The command returns 4 when a rule fails. For example, a staged run can use:
+
+```json
+{
+  "phase": "Approved",
+  "require_verified_candidate": true,
+  "max_provider_attempts": 200,
+  "max_active_ms": 600000
+}
+```
 
 When redirected, Ratio reports progress on stderr and writes the final assessment to stdout. `--headless` suppresses progress. `--debug` displays request sizes and reported token usage.
 

@@ -1,3 +1,4 @@
+pub use ratio_protocol::Delivery;
 use tokio::sync::{mpsc::UnboundedSender, watch};
 
 use crate::context::clip;
@@ -43,14 +44,8 @@ pub struct AgentNode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrafficScope {
     pub cycle: usize,
+    pub attempt: usize,
     pub phase: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Delivery {
-    Queued,
-    Delivered,
-    Dropped,
 }
 
 pub struct Traffic {
@@ -82,17 +77,18 @@ pub enum Reporter {
     Silent,
     Terminal,
     Tui(UnboundedSender<Event>, watch::Receiver<GenerationControl>),
+    Managed(watch::Receiver<GenerationControl>),
 }
 
 impl Reporter {
     pub fn emit(&self, kind: Kind, title: impl Into<String>, body: impl Into<String>) {
-        if matches!(self, Self::Silent) {
+        if matches!(self, Self::Silent | Self::Managed(_)) {
             return;
         }
         let title = clean(title.into());
         let body = clean(body.into());
         match self {
-            Self::Silent => {}
+            Self::Silent | Self::Managed(_) => {}
             Self::Terminal => {
                 eprintln!("{title}\n{}", clip(&body, 24 * 1024));
             }
@@ -126,7 +122,7 @@ impl Reporter {
 
     pub fn generation_control(&self) -> Option<watch::Receiver<GenerationControl>> {
         match self {
-            Self::Tui(_, control) => Some(control.clone()),
+            Self::Tui(_, control) | Self::Managed(control) => Some(control.clone()),
             _ => None,
         }
     }
@@ -163,7 +159,7 @@ impl Reporter {
     }
 }
 
-pub(crate) fn clean(text: String) -> String {
+pub fn clean(text: String) -> String {
     text.chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
         .collect()

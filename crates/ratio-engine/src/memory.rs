@@ -4,7 +4,10 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{api::ToolCall, context::clip};
+use crate::{
+    api::ToolCall,
+    context::{Dialogue, clip},
+};
 
 const MAX_ENTRIES: usize = 128;
 const MAX_TOPIC: usize = 80;
@@ -20,6 +23,15 @@ struct Entry {
     author: String,
     topic: String,
     note: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    evidence: Vec<Evidence>,
+}
+
+#[derive(PartialEq, Eq, Deserialize, Serialize)]
+struct Evidence {
+    call_id: String,
+    tool: String,
+    digest: String,
 }
 
 impl SharedMemory {
@@ -33,8 +45,9 @@ impl SharedMemory {
         author: &str,
         key: Option<&str>,
         limit: usize,
+        dialogue: &Dialogue,
     ) -> String {
-        match self.dispatch(call, author, key, limit) {
+        match self.dispatch(call, author, key, limit, dialogue) {
             Ok(result) => result,
             Err(error) => {
                 let message = format!("REFUSED: {error:#}");
@@ -53,6 +66,7 @@ impl SharedMemory {
         author: &str,
         key: Option<&str>,
         limit: usize,
+        dialogue: &Dialogue,
     ) -> Result<String> {
         ensure!(call.kind == "function", "expected a function tool call");
         if call.function.name == "remember" {
@@ -68,9 +82,39 @@ impl SharedMemory {
                 key.is_none_or(|key| !topic.contains(key) && !note.contains(key)),
                 "memory contains the API key"
             );
+            ensure!(
+                input.evidence.len() <= 8,
+                "a note can reference at most eight tool results"
+            );
+            let mut evidence = Vec::new();
+            for id in input.evidence {
+                ensure!(
+                    valid(&id, 128, false) && key.is_none_or(|key| !id.contains(key)),
+                    "invalid tool result ID"
+                );
+                let (tool, output) = dialogue.result_for(&id).with_context(|| {
+                    format!("no recorded result for tool call {id:?} in current context")
+                })?;
+                let digest = ring::digest::digest(&ring::digest::SHA256, output.as_bytes())
+                    .as_ref()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                let entry = Evidence {
+                    call_id: id,
+                    tool: tool.into(),
+                    digest,
+                };
+                if !evidence.contains(&entry) {
+                    evidence.push(entry);
+                }
+            }
             let mut entries = self.0.borrow_mut();
             if let Some(index) = entries.iter().position(|entry| {
-                entry.author == author && entry.topic == topic && entry.note == note
+                entry.author == author
+                    && entry.topic == topic
+                    && entry.note == note
+                    && entry.evidence == evidence
             }) {
                 return Ok(format!("Already saved shared memory {}.", index + 1));
             }
@@ -79,6 +123,7 @@ impl SharedMemory {
                 author: author.into(),
                 topic: topic.into(),
                 note: note.into(),
+                evidence,
             });
             Ok(format!("Saved shared memory {}.", entries.len()))
         } else {
@@ -114,11 +159,17 @@ impl SharedMemory {
                     || entry.topic.clone(),
                     |key| entry.topic.replace(key, "[REDACTED]"),
                 );
-                let row = format!(
+                let mut row = format!(
                     "{id} from {} / {topic}\n  {}\n",
                     entry.author,
                     note.replace('\n', "\n  ")
                 );
+                for evidence in &entry.evidence {
+                    row.push_str(&format!(
+                        "  Evidence: {} {} SHA-256 {}\n",
+                        evidence.tool, evidence.call_id, evidence.digest
+                    ));
+                }
                 let room = limit.saturating_sub(result.len() + 60);
                 if shown > 0 && (shown == PAGE_SIZE || row.len() > room) {
                     result.push_str(&format!("More matches. Call recall with before_id={last}."));
@@ -148,6 +199,8 @@ fn valid(text: &str, max: usize, multiline: bool) -> bool {
 struct Remember {
     topic: String,
     note: String,
+    #[serde(default)]
+    evidence: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -161,7 +214,7 @@ pub(crate) fn schemas() -> [Value; 2] {
     [
         json!({"type":"function","function":{
             "name":"remember", "description":"Save an attributed note for all agents in this run. Include evidence or uncertainty.",
-            "parameters":{"type":"object", "properties":{"topic":{"type":"string","maxLength":MAX_TOPIC},"note":{"type":"string","maxLength":MAX_NOTE}},"required":["topic","note"],"additionalProperties":false}
+            "parameters":{"type":"object", "properties":{"topic":{"type":"string","maxLength":MAX_TOPIC},"note":{"type":"string","maxLength":MAX_NOTE},"evidence":{"type":"array","maxItems":8,"items":{"type":"string"},"description":"Recorded tool call IDs in your current context"}},"required":["topic","note"],"additionalProperties":false}
         }}),
         json!({"type":"function","function":{
             "name":"recall", "description":"Read recent shared notes. Query matches all words in topic or note. Use before_id to continue.",

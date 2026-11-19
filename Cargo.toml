@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ratio"]
+members = ["crates/ratio", "crates/ratio-engine", "crates/ratio-protocol"]
 resolver = "3"
 
 [workspace.package]

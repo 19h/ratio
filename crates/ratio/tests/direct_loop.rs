@@ -79,7 +79,8 @@ fn read_mock_request(socket: &mut TcpStream) -> (Value, BTreeMap<String, String>
     let mut reader = BufReader::new(socket);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
-    assert_eq!(line, "POST /v1/chat/completions HTTP/1.1\r\n");
+    let responses = line == "POST /v1/responses HTTP/1.1\r\n";
+    assert!(responses || line == "POST /v1/chat/completions HTTP/1.1\r\n");
     let mut headers = BTreeMap::new();
     loop {
         line.clear();
@@ -98,8 +99,15 @@ fn read_mock_request(socket: &mut TcpStream) -> (Value, BTreeMap<String, String>
     let request: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(request["model"], "test-model");
     assert!(request["stream"].is_boolean());
-    assert!(request["max_completion_tokens"].is_number());
-    assert_history(&request);
+    if responses {
+        assert!(request["max_output_tokens"].is_number());
+        assert!(request["input"].is_array());
+        assert_eq!(request["store"], false);
+        assert!(request.get("stream_options").is_none());
+    } else {
+        assert!(request["max_completion_tokens"].is_number());
+        assert_history(&request);
+    }
     (request, headers)
 }
 
@@ -688,6 +696,299 @@ fn parallel_result_survives_interrupt_while_another_tool_is_in_flight() {
 }
 
 #[test]
+fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (connected, connection) = std::sync::mpsc::sync_channel(1);
+    let server = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept detached request: {error}"),
+            }
+        };
+        read_mock_request(&mut socket);
+        connected.send(()).unwrap();
+        let mut byte = [0];
+        let result = std::io::Read::read(&mut socket, &mut byte);
+        assert!(matches!(result, Ok(0)) || result.is_err());
+    });
+    let launch = cli(
+        workspace,
+        &endpoint,
+        &["--detached", "--goal", "Managed task"],
+    );
+    succeeded(&launch);
+    let launch: Value = serde_json::from_slice(&launch.stdout).unwrap();
+    let run_id = launch["run"]["run_id"].as_str().unwrap();
+    connection.recv_timeout(Duration::from_secs(8)).unwrap();
+    let control = |action: &str, extra: &[&str]| {
+        let output = Command::new(ratio_binary())
+            .arg("-C")
+            .arg(workspace)
+            .args(["--control", action])
+            .args(extra)
+            .output()
+            .unwrap();
+        succeeded(&output);
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(control("status", &[])["run_id"], run_id);
+    assert_eq!(control("pause", &[])["paused"], true);
+    assert_eq!(
+        control("guide", &["--guidance", "User note"])["accepted"],
+        true
+    );
+    assert_eq!(control("cancel", &[])["accepted"], true);
+    server.join().unwrap();
+    let log = PathBuf::from(launch["log"].as_str().unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("ra: interrupted.")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached process did not exit"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (endpoint, server) = mock(|index, _| match index {
+        0 => text("Plan."),
+        1 => text("Work."),
+        2 => decision("approved", "Resume verified."),
+        _ => panic!("unexpected request"),
+    });
+    let resume = || cli(workspace, &endpoint, &["--resume", "--run-id", run_id]);
+    let output = loop {
+        let output = resume();
+        if !String::from_utf8_lossy(&output.stderr).contains("lock Ratio session") {
+            break output;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached workspace lock did not release"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    succeeded(&output);
+    server.join().unwrap();
+}
+
+#[test]
+fn responses_transport_streams_tool_calls_and_round_trips_reasoning_items() {
+    let root = tempfile::tempdir().unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        use serde_json::Value;
+        let message = |text: &str| {
+            json!({
+                "type":"message","role":"assistant","status":"completed","id":"msg_mock",
+                "content":[{"type":"output_text","text":text}]
+            })
+        };
+        let call = |id: &str, name: &str, arguments: Value| {
+            json!({
+                "type":"function_call","status":"completed","id":format!("fc_{id}"),
+                "call_id":id,"name":name,"arguments":arguments.to_string()
+            })
+        };
+        let reasoning =
+            json!({"type":"reasoning","id":"rs_mock","summary":[],"encrypted_content":"opaque"});
+        let items = match index {
+            0 => vec![message("Create the fixture.")],
+            1 => {
+                assert!(
+                    request["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool["name"] == "create_file")
+                );
+                vec![
+                    reasoning.clone(),
+                    call(
+                        "call_write",
+                        "create_file",
+                        json!({
+                            "path":"responses.txt","content":"tool result"
+                        }),
+                    ),
+                ]
+            }
+            2 => {
+                let input = request["input"].as_array().unwrap();
+                assert_eq!(input[input.len() - 3], reasoning);
+                assert_eq!(input[input.len() - 2]["call_id"], "call_write");
+                assert_eq!(input[input.len() - 1]["type"], "function_call_output");
+                assert_eq!(input[input.len() - 1]["call_id"], "call_write");
+                assert!(
+                    input.last().unwrap()["output"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Created")
+                );
+                vec![message("Fixture created.")]
+            }
+            3 => vec![call(
+                "call_verdict",
+                "submit_verdict",
+                json!({
+                    "verdict":"approved","assessment":"Responses path passed."
+                }),
+            )],
+            _ => panic!("unexpected request {index}"),
+        };
+        let event = json!({"type":"response.completed","response":{
+            "status":"completed","output":items,"usage":{"input_tokens":15,"output_tokens":7}
+        }});
+        stream_response_at_eof(&[event], index == 3)
+    });
+    succeeded(&cli(
+        root.path(),
+        &endpoint,
+        &["--goal", "Responses fixture", "--provider-api", "responses"],
+    ));
+    server.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("responses.txt")).unwrap(),
+        "tool result"
+    );
+}
+
+#[test]
+fn staged_run_publishes_only_the_verified_candidate_and_preserves_the_index() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(workspace)
+            .args(args)
+            .output()
+            .unwrap();
+        succeeded(&output);
+        output.stdout
+    };
+    git(&["init", "--quiet"]);
+    std::fs::write(workspace.join("tracked.txt"), "index version\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    let index = std::fs::read(workspace.join(".git/index")).unwrap();
+    std::fs::write(workspace.join("tracked.txt"), "dirty baseline\n").unwrap();
+    let config = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        config.path(),
+        "[orchestration]\nstage_workspace = true\nverification_commands = [\"git diff --check\"]\n",
+    )
+    .unwrap();
+    let live = workspace.to_owned();
+    let (endpoint, server) = mock(move |index, request| {
+        assert_eq!(
+            std::fs::read_to_string(live.join("tracked.txt")).unwrap(),
+            "dirty baseline\n"
+        );
+        match index {
+            0 => text("Implement the change against the current contents."),
+            1 => calls(&[tool(
+                "change",
+                "edit_file",
+                json!({
+                    "path":"tracked.txt","old_text":"dirty baseline","new_text":"approved contents"
+                }),
+            )]),
+            2 => {
+                assert!(
+                    request["messages"].as_array().unwrap().last().unwrap()["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Edited")
+                );
+                text("Edited tracked.txt")
+            }
+            3 => {
+                assert!(
+                    request["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|message| message["content"]
+                            .as_str()
+                            .is_some_and(|body| body.contains("Verification passed: true")))
+                );
+                calls(&[tool("inspect", "read_file", json!({"path":"tracked.txt"}))])
+            }
+            4 => {
+                assert!(
+                    request["messages"].as_array().unwrap().last().unwrap()["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("approved contents")
+                );
+                decision("approved", "Verified candidate.")
+            }
+            _ => panic!("unexpected request {index}"),
+        }
+    });
+    succeeded(&cli(
+        workspace,
+        &endpoint,
+        &[
+            "--goal",
+            "Edit tracked file",
+            "--config",
+            config.path().to_str().unwrap(),
+        ],
+    ));
+    server.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("tracked.txt")).unwrap(),
+        "approved contents\n"
+    );
+    assert_eq!(std::fs::read(workspace.join(".git/index")).unwrap(), index);
+    let reader = ra::session::Store::reader(workspace).unwrap();
+    let runs = reader.runs().unwrap();
+    let events = reader.events(&runs[0].run_id, 0, 1000).unwrap();
+    assert!(events.iter().any(|event| event.phase == "Publish"));
+    assert_eq!(events.last().unwrap().phase, "Approved");
+    let metrics = reader.metrics(&runs[0].run_id).unwrap();
+    assert_eq!(metrics.provider_attempts, 5);
+    let trace = reader.otlp_trace(&runs[0].run_id).unwrap();
+    assert_eq!(
+        trace["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+        "ratio.run"
+    );
+    let evaluation = reader
+        .evaluate(
+            &runs[0].run_id,
+            &ratio_protocol::Evaluation {
+                require_verified_candidate: true,
+                max_provider_attempts: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(evaluation["passed"], true);
+    let edits = events
+        .iter()
+        .flat_map(|event| &event.effects)
+        .filter(|effect| effect.tool == "edit_file")
+        .collect::<Vec<_>>();
+    assert_eq!(edits.len(), 2);
+    assert_ne!(edits[0].state, edits[1].state);
+}
+
+#[test]
 fn resume_uses_refined_checkpoint_goal_and_archives_old_formats() {
     use ra::session::{Phase, Session, Store};
     let temp = tempfile::tempdir().unwrap();
@@ -698,10 +999,24 @@ fn resume_uses_refined_checkpoint_goal_and_archives_old_formats() {
     let mut session = Session::new("Refined goal".into());
     session.phase = Phase::Approved;
     session.assessment = "Refined result".into();
-    store.save(&session).unwrap();
+    std::fs::write(
+        root.join(".ratio/session.json"),
+        serde_json::to_vec(&session).unwrap(),
+    )
+    .unwrap();
     drop(store);
     let args = ["--config", config.to_str().unwrap(), "--resume"];
     succeeded(&cli(root, "http://127.0.0.1:1/v1", &args));
+    assert_eq!(
+        Store::reader(root).unwrap().runs().unwrap()[0].run_id,
+        session.run_id()
+    );
+    let checkpoint = root.join(".ratio/session.json");
+    std::fs::write(&checkpoint, r#"{"version":1,"goal":"old"}"#).unwrap();
+    succeeded(&cli(root, "http://127.0.0.1:1/v1", &args));
+    let legacy = tempfile::tempdir().unwrap();
+    let root = legacy.path();
+    std::fs::create_dir(root.join(".ratio")).unwrap();
     let checkpoint = root.join(".ratio/session.json");
     std::fs::write(&checkpoint, r#"{"version":1,"goal":"old"}"#).unwrap();
     let resume = cli(root, "http://127.0.0.1:1/v1", &args);
@@ -890,7 +1205,10 @@ fn resume_does_not_replay_an_interrupted_tool() {
         .unwrap()
         .pop()
         .unwrap();
-    std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+    ra::session::Store::open(temp.path())
+        .unwrap()
+        .save(&serde_json::from_value(data).unwrap())
+        .unwrap();
 
     let (endpoint, server) = mock(|index, request| {
         if index == 0 {
@@ -1196,17 +1514,27 @@ phases = ["review"]
 
 #[test]
 fn three_workers_start_only_after_a_persisted_unanimous_ack() {
-    exercise_worker_gate(true, false);
+    exercise_worker_gate(true, false, false, false);
 }
 
 #[test]
 fn wrong_plan_ack_and_plain_text_approval_keep_every_worker_read_only() {
-    exercise_worker_gate(false, false);
+    exercise_worker_gate(false, false, false, false);
 }
 
 #[test]
 fn plan_objection_recoordinates_and_issues_a_fresh_digest() {
-    exercise_worker_gate(true, true);
+    exercise_worker_gate(true, true, false, false);
+}
+
+#[test]
+fn graph_runs_independent_workers_before_their_dependent() {
+    exercise_worker_gate(true, false, true, false);
+}
+
+#[test]
+fn staged_graph_integrates_predecessors_before_the_dependent_starts() {
+    exercise_worker_gate(true, false, true, true);
 }
 
 #[test]
@@ -1359,14 +1687,27 @@ phases = ["planning"]
     server.join().unwrap();
 }
 
-fn exercise_worker_gate(unanimous: bool, objects: bool) {
+fn exercise_worker_gate(unanimous: bool, objects: bool, graph: bool, staged: bool) {
     let temp = tempfile::tempdir().unwrap();
+    if staged {
+        succeeded(
+            &Command::new("git")
+                .current_dir(temp.path())
+                .args(["init", "--quiet"])
+                .output()
+                .unwrap(),
+        );
+    }
     let config = temp.path().join("ratio.toml");
     std::fs::write(
         &config,
-        r#"
+        format!(
+            r#"
 [orchestration]
 max_parallel_agents = 3
+require_task_graph = {graph}
+stage_workspace = {staged}
+verification_commands = ["git diff --check"]
 [[workers]]
 name = "One"
 persona = "Own worker_1.txt."
@@ -1376,12 +1717,14 @@ persona = "Own worker_2.txt."
 [[workers]]
 name = "Three"
 persona = "Own worker_3.txt."
-"#,
+"#
+        ),
     )
     .unwrap();
     let workspace = temp.path().to_path_buf();
     let mut coordinated = [false; 3];
     let mut started = [false; 3];
+    let mut finished = [false; 3];
     let mut plan_id: Option<String> = None;
     let mut first_id: Option<String> = None;
     let mut replanning = false;
@@ -1517,6 +1860,23 @@ persona = "Own worker_3.txt."
                 );
                 assert_eq!(checkpoint["worker_plan"]["id"], plan_id.as_deref().unwrap());
                 if !started[worker - 1] {
+                    if graph && worker == 3 {
+                        assert!(finished[0] && finished[1]);
+                        let worker_workspace = if staged {
+                            assert!(!workspace.join("worker_1.txt").exists());
+                            assert!(!workspace.join("worker_2.txt").exists());
+                            PathBuf::from(
+                                system
+                                    .lines()
+                                    .find_map(|line| line.strip_prefix("Working directory: "))
+                                    .unwrap(),
+                            )
+                        } else {
+                            workspace.clone()
+                        };
+                        assert!(worker_workspace.join("worker_1.txt").exists());
+                        assert!(worker_workspace.join("worker_2.txt").exists());
+                    }
                     started[worker - 1] = true;
                     let mut work = Vec::new();
                     if objects && worker == 1 {
@@ -1531,8 +1891,14 @@ persona = "Own worker_3.txt."
                         "create_file",
                         json!({"path":own_file,"content":worker.to_string()}),
                     ));
-                    (calls(&work), !started.iter().all(|&active| active))
+                    let defer = if graph {
+                        !started[0] || !started[1]
+                    } else {
+                        !started.iter().all(|&active| active)
+                    };
+                    (calls(&work), defer)
                 } else {
+                    finished[worker - 1] = true;
                     assert!(task.contains("Created"));
                     if objects && worker == 1 {
                         assert!(all_messages.contains("outside this worker's frozen ownership"));
@@ -1546,18 +1912,21 @@ persona = "Own worker_3.txt."
         } else if task.starts_with("Write the final execution plan") {
             assert!(coordinated.iter().all(|&active| active));
             assert!(task.contains("Assignment agreed for worker_3.txt."));
-            (
-                calls(&[tool(
-                    "plan",
-                    "submit_plan",
-                    json!({"plan":plan,"ownership":{
-                        "worker_1":[{"path":"./worker_1.txt","directory":false}],
-                        "worker_2":[{"path":"worker_2.txt","directory":false}],
-                        "worker_3":[{"path":"worker_3.txt","directory":false}]
-                    }}),
-                )]),
-                false,
-            )
+            let mut submission = json!({"plan":plan,"ownership":{
+                "worker_1":[{"path":"./worker_1.txt","directory":false}],
+                "worker_2":[{"path":"worker_2.txt","directory":false}],
+                "worker_3":[{"path":"worker_3.txt","directory":false}]
+            }});
+            if graph {
+                assert!(tools.contains("depends_on"));
+                submission["tasks"] = json!((1..=3).map(|worker| json!({
+                    "id":format!("task_{worker}"), "worker":format!("worker_{worker}"),
+                    "description":format!("Build artifact {worker}"),
+                    "depends_on": if worker == 3 { vec!["task_1","task_2"] } else { Vec::new() },
+                    "acceptance":["file exists"]
+                })).collect::<Vec<_>>());
+            }
+            (calls(&[tool("plan", "submit_plan", submission)]), false)
         } else if task.starts_with("Inspect the resulting workspace") {
             assert!(unanimous);
             assert!(started.iter().all(|&active| active));
@@ -1596,7 +1965,7 @@ persona = "Own worker_3.txt."
         }
     }
     server.join().unwrap();
-    if unanimous && !objects {
+    if unanimous && !objects && !graph {
         resume_interrupted_parallel_worker(temp.path(), &config);
     }
 }
@@ -1615,7 +1984,10 @@ fn resume_interrupted_parallel_worker(workspace: &Path, config: &Path) {
         "shell",
         json!({"command":"printf replay >> worker_1.txt"}),
     );
-    std::fs::write(path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    ra::session::Store::open(workspace)
+        .unwrap()
+        .save(&serde_json::from_value(checkpoint).unwrap())
+        .unwrap();
 
     let (endpoint, server) = mock(|index, request| {
         let messages = request["messages"].as_array().unwrap();

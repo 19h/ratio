@@ -4,10 +4,12 @@ use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Choice, Function, Message, Response, ToolCall, Usage};
+use super::{Choice, Function, Message, Response, ToolCall, Usage, responses};
+use crate::config::ProviderApi;
 
 #[derive(Default)]
 pub(super) struct Decoder {
+    api: ProviderApi,
     line: Vec<u8>,
     data: Vec<u8>,
     skip_lf: bool,
@@ -20,6 +22,8 @@ pub(super) struct Decoder {
     calls: BTreeMap<usize, ToolCall>,
     finish_reason: Option<String>,
     usage: Option<Usage>,
+    terminal: Option<Value>,
+    response_progress: Option<&'static str>,
 }
 
 #[cfg(test)]
@@ -92,6 +96,13 @@ struct FunctionDelta {
 }
 
 impl Decoder {
+    pub(super) fn new(api: ProviderApi) -> Self {
+        Self {
+            api,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn push(&mut self, chunk: &[u8]) -> Result<()> {
         for &byte in chunk {
             if std::mem::take(&mut self.skip_lf) && byte == b'\n' {
@@ -141,6 +152,12 @@ impl Decoder {
             self.done = true;
             self.data.clear();
             return Ok(());
+        }
+        if self.api == ProviderApi::Responses {
+            let packet =
+                serde_json::from_slice(&self.data).context("decode Responses stream event")?;
+            self.data.clear();
+            return self.responses_event(packet);
         }
         let packet: Packet =
             serde_json::from_slice(&self.data).context("decode chat completion stream event")?;
@@ -210,6 +227,46 @@ impl Decoder {
         Ok(())
     }
 
+    fn responses_event(&mut self, packet: Value) -> Result<()> {
+        match packet["type"]
+            .as_str()
+            .context("missing Responses event type")?
+        {
+            "response.completed" | "response.incomplete" => {
+                self.terminal = Some(packet["response"].clone());
+                self.done = true;
+            }
+            "response.failed" | "error" => {
+                let error = packet
+                    .pointer("/response/error")
+                    .filter(|value| !value.is_null())
+                    .or_else(|| packet.get("error"))
+                    .unwrap_or(&packet);
+                self.provider_error = Some(error.clone());
+                self.usage = packet
+                    .pointer("/response/usage")
+                    .and_then(|usage| serde_json::from_value(usage.clone()).ok());
+            }
+            "response.output_text.delta" => {
+                let text = packet["delta"]
+                    .as_str()
+                    .context("invalid Responses text delta")?;
+                self.content.get_or_insert_default().push_str(text);
+                self.choice_seen = true;
+            }
+            "response.function_call_arguments.delta" => {
+                self.response_progress = Some("Receiving tool calls…");
+                self.choice_seen = true;
+            }
+            "response.reasoning_summary_text.delta" => {
+                self.response_progress = Some("Receiving reasoning…");
+                self.choice_seen = true;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub(super) fn done(&self) -> bool {
         self.done || self.provider_error.is_some()
     }
@@ -238,7 +295,9 @@ impl Decoder {
     }
 
     pub(super) fn progress(&self) -> &'static str {
-        if !self.calls.is_empty() {
+        if let Some(progress) = self.response_progress {
+            progress
+        } else if !self.calls.is_empty() {
             "Receiving tool calls…"
         } else if self.reasoning.is_some() {
             "Receiving reasoning…"
@@ -248,6 +307,12 @@ impl Decoder {
     }
 
     pub(super) fn finish(self) -> Result<Response> {
+        if self.api == ProviderApi::Responses {
+            let value = self
+                .terminal
+                .context("Responses stream ended without a terminal response")?;
+            return responses::decode(value);
+        }
         ensure!(
             self.line.is_empty()
                 && self.data.is_empty()
@@ -278,6 +343,7 @@ impl Decoder {
                     content: self.content,
                     reasoning_content: self.reasoning,
                     tool_calls: self.calls.into_values().collect(),
+                    responses_items: Vec::new(),
                 },
                 finish_reason: self.finish_reason,
             }],

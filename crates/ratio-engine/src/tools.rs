@@ -18,6 +18,8 @@ use tokio::{
 
 use crate::{api::ToolCall, context::clip, line_tags};
 
+pub(crate) mod mcp;
+pub(crate) mod skills;
 #[cfg(windows)]
 mod windows_job;
 
@@ -387,6 +389,15 @@ impl Tools<'_> {
     }
 
     async fn run(&self, command: &mut Command) -> Result<String> {
+        Ok(self.command_result(command).await?.1)
+    }
+
+    pub(crate) async fn verify(&self, script: &str) -> Result<(bool, String)> {
+        let (passed, output) = self.command_result(&mut shell(script)).await?;
+        Ok((passed, self.redact(output)))
+    }
+
+    async fn command_result(&self, command: &mut Command) -> Result<(bool, String)> {
         command
             .current_dir(self.workspace)
             .env_remove("OPENAI_API_KEY")
@@ -420,8 +431,9 @@ impl Tools<'_> {
         #[cfg(windows)]
         job.disarm()?;
 
-        Ok(format!(
-            "Status: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        Ok((
+            status.success(),
+            format!("Status: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"),
         ))
     }
 }

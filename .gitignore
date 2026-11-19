@@ -38,6 +38,4 @@ Desktop.ini
 node_modules/
 target/
 
-/.ratio/session.json
-/.ratio/session.lock
-/.ratio/.tmp*
+/.ratio/

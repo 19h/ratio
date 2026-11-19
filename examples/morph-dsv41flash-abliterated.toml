@@ -93,11 +93,19 @@ max_total_tokens = 8000000
 max_run_secs = 3600
 max_tool_rounds = 100
 max_parallel_agents = 3
+require_task_graph = true
+stage_workspace = true
+verification_commands = [
+    "cargo fmt --all --check",
+    "cargo clippy --locked --workspace --all-targets -- -D warnings",
+    "cargo test --locked --workspace",
+]
 request_timeout_secs = 180
 command_timeout_secs = 180
 reviewer_system_prompt = """
-You lead a scientific Rust project. Include the file ownership map and arrange
-independent work after the gate opens. Before freezing the plan, resolve
+You lead a scientific Rust project. Freeze the numerics and solver as independent
+root tasks. Make integration depend on both roots and include the file ownership
+map. Before freezing the plan, resolve
 interface disagreements using the worker and stakeholder reports. Record
 shared type and function signatures, cell and face layout, flux signs,
 boundary data and test fixtures so workers can implement against the same
@@ -135,12 +143,12 @@ inputs, snapshots and diagnostics to the integration engineer.
 [[workers]]
 name = "Integration and verification engineer"
 persona = """
-Own Cargo.toml, Cargo.lock, src/lib.rs, src/main.rs, src/scenarios.rs,
+Own .gitignore, Cargo.toml, Cargo.lock, src/lib.rs, src/main.rs, src/scenarios.rs,
 src/output.rs, tests/, benches/ and README.md. Build the CLI, scenario
 fixtures, exports, reference benchmarks and end-to-end tests. Own
 cross-module integration and report actual test and benchmark commands.
-Write fixtures against the frozen interfaces while the solver and numerics
-modules are under construction. Report any compile or interface blocker
+Ignore /target/ before building the workspace. Build and test against the
+integrated numerics and solver artifacts. Report any compile or interface blocker
 for the next review cycle with the responsible file owner.
 """
 
@@ -196,6 +204,7 @@ phases = ["planning", "review"]
 custom_rules = [
     "Work in an empty or disposable project workspace and keep edits inside it.",
     "Each worker edits only its frozen ownership paths. Send interface proposals in the coordination phase and request a new plan before changing a shared interface.",
+    "Numerics and solver work against the frozen signatures in separate staged copies. Write any temporary standalone check artifacts outside the candidate tree.",
     "Use safe Rust, clear module boundaries and typed recoverable errors for bad input, I/O and invalid simulation states.",
     "Treat command results, numerical metrics and benchmarks as evidence. Claim only checks that ran and report any unavailable validation.",
 ]

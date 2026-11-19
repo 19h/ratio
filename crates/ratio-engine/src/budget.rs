@@ -11,18 +11,19 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::config::Config;
+use crate::{Journal, config::Config};
 
 #[derive(Default, Deserialize, Serialize)]
-struct Ledger {
-    requests: u64,
-    tokens: u64,
-    elapsed_ms: u64,
+pub(crate) struct Ledger {
+    pub(crate) requests: u64,
+    pub(crate) tokens: u64,
+    pub(crate) elapsed_ms: u64,
 }
 
 struct State {
     ledger: Ledger,
     path: Option<PathBuf>,
+    journal: Option<(Rc<RefCell<Journal>>, String)>,
     since: Option<Instant>,
     exhausted: Option<&'static str>,
 }
@@ -43,6 +44,7 @@ impl Budget {
             state: Rc::new(RefCell::new(State {
                 ledger: Ledger::default(),
                 path: None,
+                journal: None,
                 since: Some(Instant::now()),
                 exhausted: None,
             })),
@@ -53,15 +55,24 @@ impl Budget {
         }
     }
 
-    pub fn bind(&self, path: PathBuf, resume: bool) -> Result<()> {
+    pub(crate) fn bind(
+        &self,
+        path: PathBuf,
+        resume: bool,
+        journal: Rc<RefCell<Journal>>,
+        run_id: &str,
+    ) -> Result<()> {
         let mut state = self.state.borrow_mut();
-        if resume && path.exists() {
-            state.ledger =
-                serde_json::from_reader(File::open(&path)?).context("read run budget ledger")?;
+        if resume {
+            state.ledger = if let Some(bytes) = journal.borrow().budget(run_id)? {
+                serde_json::from_slice(&bytes).context("decode journaled run budget ledger")?
+            } else {
+                serde_json::from_reader(File::open(&path).context("run budget ledger is missing")?)
+                    .context("read format-2 run budget ledger")?
+            };
             state.since = Some(Instant::now());
-        } else if resume {
-            anyhow::bail!("run budget ledger is missing");
         }
+        state.journal = Some((journal, run_id.into()));
         state.path = Some(path);
         state.save()
     }
@@ -181,10 +192,14 @@ impl State {
         if self.since.is_some() {
             self.since = Some(Instant::now());
         }
+        let bytes = serde_json::to_vec(&self.ledger)?;
+        if let Some((journal, run_id)) = &self.journal {
+            journal.borrow().save_budget(run_id, &bytes)?;
+        }
         if let Some(path) = &self.path {
             let mut file =
                 tempfile::NamedTempFile::new_in(path.parent().context("budget ledger directory")?)?;
-            serde_json::to_writer(&mut file, &self.ledger)?;
+            file.write_all(&bytes)?;
             file.flush()?;
             file.as_file().sync_all()?;
             file.persist(path).context("replace run budget ledger")?;

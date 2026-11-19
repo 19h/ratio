@@ -1,7 +1,9 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    future::Future,
     io::{self, Stderr},
     sync::mpsc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -23,6 +25,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph, Wrap},
 };
+use ratio_engine::RunReader;
+use ratio_protocol::{
+    ControlAction, ControlReply, ControlRequest, RunEvent, TaskState, TaskView, Workflow,
+};
 use tokio::sync::{
     mpsc::{UnboundedReceiver, unbounded_channel},
     watch,
@@ -33,9 +39,12 @@ use crate::{
     budget::Budget,
     config::{Config, ConsultationPhase},
     context::clip,
-    events::{Event, Generation, GenerationControl, Kind, Reporter, clean},
+    events::{
+        AgentNode, Event, Generation, GenerationControl, Kind, NetworkEvent, Reporter, Traffic,
+        TrafficKind, TrafficScope, clean,
+    },
     orchestrator::Orchestrator,
-    session::{Session, Store},
+    session::{Phase, Session, Store},
     setup::{self, Draft},
 };
 
@@ -108,7 +117,79 @@ pub async fn run(
         }
     };
     let orchestrator = Orchestrator::new(config, store, reporter, budget)?;
-    ui.execute(orchestrator, session).await
+    ui.execute(orchestrator, session, Store::reader(&config.cwd)?)
+        .await
+}
+
+pub async fn attach<F, R>(reader: RunReader, run_id: &str, control: F) -> Result<u8>
+where
+    F: Fn(ControlRequest) -> R,
+    R: Future<Output = Result<ControlReply>>,
+{
+    anyhow::ensure!(reader.run(run_id)?.is_some(), "unknown Ratio run {run_id}");
+    let (_mode, mut screen) = TerminalMode::enter()?;
+    let mut inputs = EventStream::new();
+    let mut view = View {
+        executing: true,
+        status: format!("Run {run_id}"),
+        ..View::default()
+    };
+    let mut tick = tokio::time::interval(Duration::from_millis(200));
+    let mut after = 0;
+    let mut done = false;
+    if let Ok(reply) = control(ControlRequest {
+        action: ControlAction::Status,
+        guidance: None,
+        run_id: Some(run_id.into()),
+    })
+    .await
+    {
+        view.paused = reply.accepted && reply.paused;
+    }
+    loop {
+        screen
+            .draw(|frame| view.draw(frame, None, if done { Mode::Done } else { Mode::Attached }))?;
+        tokio::select! {
+            _ = tick.tick() => {
+                let events = reader.events(run_id, after, 256)?;
+                for event in events {
+                    after = event.sequence;
+                    let phase = event_phase(&event);
+                    done = phase.is_some_and(Phase::done) || event.workflow.stopped.is_some();
+                    view.ingest_checkpoint(event, phase);
+                }
+            }
+            event = inputs.next() => {
+                let action = match view.input(terminal_input(event)?) {
+                    Action::Escape | Action::Interrupt => return Ok(0),
+                    Action::Submit if done => return Ok(0),
+                    Action::ToggleGeneration if !done => {
+                        Some(if view.paused { ControlAction::Resume } else { ControlAction::Pause })
+                    }
+                    Action::Submit if !done => Some(ControlAction::Guide),
+                    _ if done && view.editor.text == "q" => return Ok(0),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    let guidance = (action == ControlAction::Guide).then(|| view.take_input()).flatten();
+                    if action != ControlAction::Guide || guidance.is_some() {
+                        match control(ControlRequest { action, guidance, run_id: Some(run_id.into()) }).await {
+                            Ok(reply) if reply.run_id == run_id => {
+                                view.paused = reply.paused;
+                                view.push(Kind::Info, "Control", &reply.detail);
+                            }
+                            Ok(_) => view.push(Kind::Info, "Control", "This run is no longer active."),
+                            Err(error) => view.push(Kind::Info, "Control", &format!("{error:#}")),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn event_phase(event: &RunEvent) -> Option<Phase> {
+    serde_json::from_value(serde_json::Value::String(event.phase.clone())).ok()
 }
 
 struct Ui {
@@ -205,19 +286,25 @@ impl Ui {
         &mut self,
         orchestrator: Orchestrator<'_>,
         session: Session,
+        reader: RunReader,
     ) -> Result<Outcome> {
         let (send, receive) = mpsc::sync_channel(16);
         self.view.executing = true;
         self.view.status = session.phase.label().into();
         self.view.push(Kind::Phase, "Goal", &session.goal);
+        let run_id = session.run_id().to_owned();
         let run = orchestrator.run(session, Some(receive));
         tokio::pin!(run);
+        let mut workflow_tick = tokio::time::interval(Duration::from_millis(250));
         let result = loop {
             self.draw(None, Mode::Running)?;
             tokio::select! {
                 input = self.inputs.next() => match self.view.input(terminal_input(input)?) {
                     Action::Interrupt if !self.view.paused && !self.view.generations.is_empty() => self.toggle_generation(),
-                    Action::Interrupt => return Ok(Outcome::Interrupted),
+                    Action::Interrupt => {
+                        orchestrator.interrupt(&run_id)?;
+                        return Ok(Outcome::Interrupted);
+                    }
                     Action::ToggleGeneration => self.toggle_generation(),
                     Action::Submit => {
                         if let Some(note) = self.view.take_input() {
@@ -239,11 +326,19 @@ impl Ui {
                         self.view.push_event(event);
                     }
                 },
+                _ = workflow_tick.tick() => {
+                    if let Some(event) = reader.latest_event(&run_id)? {
+                        self.view.workflow = event.workflow;
+                    }
+                }
                 result = &mut run => break result,
             }
         };
         while let Ok(event) = self.events.try_recv() {
             self.view.push_event(event);
+        }
+        if let Some(event) = reader.latest_event(&run_id)? {
+            self.view.workflow = event.workflow;
         }
         match &result {
             Ok(session) => {
@@ -304,6 +399,7 @@ enum Mode {
     Drafting,
     Ready,
     Running,
+    Attached,
     Done,
 }
 
@@ -327,6 +423,9 @@ struct View {
     proposal_focused: bool,
     executing: bool,
     show_network: bool,
+    show_workflow: bool,
+    workflow: Workflow,
+    workflow_scroll: u16,
     network: network::Network,
     generations: BTreeMap<usize, (String, String)>,
     selected_generation: usize,
@@ -334,6 +433,56 @@ struct View {
 }
 
 impl View {
+    fn ingest_checkpoint(&mut self, event: RunEvent, phase: Option<Phase>) {
+        let label = phase.map_or("Recorded phase", Phase::label);
+        let status = match event.workflow.stopped {
+            Some(stop) => format!("Cycle {} / {label} / {stop:?}", event.cycle),
+            None => format!("Cycle {} / {label}", event.cycle),
+        };
+        if self.status != status {
+            self.status.clone_from(&status);
+            self.push(Kind::Phase, &status, "");
+        }
+        if self.workflow.agents != event.workflow.agents {
+            self.network.ingest(NetworkEvent::Roster(
+                event
+                    .workflow
+                    .agents
+                    .iter()
+                    .map(|agent| AgentNode {
+                        id: agent.id.clone(),
+                        name: agent.name.clone(),
+                    })
+                    .collect(),
+            ));
+        }
+        self.workflow = event.workflow;
+        for effect in event.effects {
+            self.push(
+                Kind::Tool,
+                &format!("{} / {}", effect.actor, effect.tool),
+                &format!("{:?}", effect.state),
+            );
+        }
+        for message in event.ipc {
+            self.network.ingest(NetworkEvent::Traffic(Traffic {
+                scope: TrafficScope {
+                    cycle: event.cycle,
+                    attempt: self.workflow.plan_attempt,
+                    phase: label,
+                },
+                from: message.from,
+                to: message.to,
+                body: message.body,
+                kind: TrafficKind::Ipc {
+                    sequence: message.sequence,
+                    reply_to: message.reply_to,
+                    delivery: message.delivery,
+                },
+            }));
+        }
+    }
+
     fn push_event(&mut self, event: Event) {
         if let Some(generation) = event.generation {
             match generation {
@@ -413,8 +562,21 @@ impl View {
                         (self.selected_generation + 1) % self.generations.len();
                     return Action::None;
                 }
-                KeyCode::F(2) | KeyCode::F(3) => {
+                KeyCode::F(2) | KeyCode::F(3) | KeyCode::F(8) => {
                     self.show_network = key.code == KeyCode::F(3);
+                    self.show_workflow = key.code == KeyCode::F(8);
+                    return Action::None;
+                }
+                KeyCode::Up | KeyCode::PageUp if self.show_workflow => {
+                    self.workflow_scroll = self
+                        .workflow_scroll
+                        .saturating_sub(if key.code == KeyCode::Up { 1 } else { 12 });
+                    return Action::None;
+                }
+                KeyCode::Down | KeyCode::PageDown if self.show_workflow => {
+                    self.workflow_scroll = self
+                        .workflow_scroll
+                        .saturating_add(if key.code == KeyCode::Down { 1 } else { 12 });
                     return Action::None;
                 }
                 _ if self.show_network && self.network.key(key.code, modified) => {
@@ -504,9 +666,11 @@ impl View {
                 }
             };
             heading.push(Line::from(vec![
-                tab(" F2 Activity ", !self.show_network),
+                tab(" F2 Activity ", !self.show_network && !self.show_workflow),
                 Span::raw("  "),
                 tab(" F3 Communication ", self.show_network),
+                Span::raw("  "),
+                tab(" F8 Workflow ", self.show_workflow),
                 Span::raw(format!("  {} generating", self.generations.len())),
             ]));
         }
@@ -523,12 +687,14 @@ impl View {
             self.render_proposal(frame, proposal, draft);
         } else if self.show_network {
             self.network.render(frame, content);
+        } else if self.show_workflow {
+            self.render_workflow(frame, content);
         } else {
             self.proposal_focused = false;
             self.render_activity(frame, content);
         }
         if !matches!(mode, Mode::Done) {
-            let prompt = if matches!(mode, Mode::Running) {
+            let prompt = if matches!(mode, Mode::Running | Mode::Attached) {
                 " Guidance "
             } else {
                 " Message "
@@ -559,6 +725,9 @@ impl View {
             Mode::Running => {
                 " Enter Queue guidance   PgUp/PgDn Scroll   F6 Pause/resume\n F7 Next live agent   Ctrl+C Cancel generation / Exit"
             }
+            Mode::Attached => {
+                " F2 Activity  F3 Communication  F8 Workflow  F6 Pause/resume\n Enter Queue guidance   Esc Detach"
+            }
             Mode::Done => " PgUp/PgDn  Scroll    Enter / q  Exit",
         };
         frame.render_widget(
@@ -566,6 +735,83 @@ impl View {
                 .style(Style::default().fg(Color::DarkGray))
                 .wrap(Wrap { trim: true }),
             footer,
+        );
+    }
+
+    fn render_workflow(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let mut lines = Vec::new();
+        if let Some(plan_id) = &self.workflow.plan_id {
+            lines.push(Line::raw(format!("Plan {plan_id}")));
+            lines.push(Line::raw(format!(
+                "Acknowledged by {}",
+                if self.workflow.acknowledgements.is_empty() {
+                    "no workers".into()
+                } else {
+                    self.workflow.acknowledgements.join(", ")
+                }
+            )));
+        }
+        for TaskView {
+            task,
+            state,
+            artifact_sha256,
+        } in &self.workflow.tasks
+        {
+            let color = match state {
+                TaskState::Complete => Color::Green,
+                TaskState::Working => Color::Cyan,
+                TaskState::Blocked | TaskState::AwaitingAck => Color::Yellow,
+                TaskState::Ready => Color::White,
+            };
+            lines.push(Line::default());
+            lines.push(Line::styled(
+                format!("{} / {}  [{state:?}]", task.id, task.worker),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            if !task.depends_on.is_empty() {
+                lines.push(Line::raw(format!("  <- {}", task.depends_on.join(", "))));
+            }
+            if let Some(digest) = artifact_sha256 {
+                lines.push(Line::raw(format!("  Artifact {digest}")));
+            }
+            lines.push(Line::raw(clean(task.description.clone())));
+            lines.extend(
+                task.acceptance
+                    .iter()
+                    .map(|criterion| Line::raw(format!("  - {}", clean(criterion.clone())))),
+            );
+        }
+        if let Some(receipt) = &self.workflow.verification {
+            lines.push(Line::default());
+            lines.push(Line::raw(format!("Candidate {}", receipt.candidate)));
+            lines.push(Line::raw(if receipt.passed {
+                "Verification passed"
+            } else {
+                "Verification failed"
+            }));
+        }
+        if let Some(verdict) = &self.workflow.verdict {
+            lines.push(Line::raw(format!("Reviewer verdict {verdict}")));
+        }
+        for receipt in &self.workflow.context {
+            lines.push(Line::raw(format!(
+                "{} folded {} exchanges, estimated tokens {} -> {}",
+                receipt.actor, receipt.folded_groups, receipt.before_tokens, receipt.after_tokens
+            )));
+        }
+        if lines.is_empty() {
+            lines.push(Line::raw("Waiting for a plan or verification receipt."));
+        }
+        let block = Block::bordered().title(" Workflow ");
+        let inner = block.inner(area);
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let max_scroll = paragraph
+            .line_count(inner.width)
+            .saturating_sub(usize::from(inner.height));
+        self.workflow_scroll = self.workflow_scroll.min(line_offset(max_scroll));
+        frame.render_widget(
+            paragraph.scroll((self.workflow_scroll, 0)).block(block),
+            area,
         );
     }
 

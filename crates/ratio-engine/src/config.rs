@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, env, path::PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
@@ -33,6 +33,8 @@ pub struct Cli {
     /// Request SSE streaming (true by default).
     #[arg(long, value_name = "BOOL")]
     stream: Option<bool>,
+    #[arg(long, value_enum)]
+    provider_api: Option<ProviderApi>,
     #[arg(long)]
     temperature: Option<f64>,
     #[arg(long)]
@@ -62,6 +64,59 @@ pub struct Cli {
     /// Continue the checkpoint for this workspace.
     #[arg(long)]
     pub resume: bool,
+    /// Continue a specific recorded run.
+    #[arg(long, requires = "resume")]
+    pub run_id: Option<String>,
+    /// Print one JSON record per run in the workspace history.
+    #[arg(long, conflicts_with_all = ["events", "resume", "goal"])]
+    pub list_runs: bool,
+    /// Print checkpoint events for a run as JSON Lines.
+    #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["resume", "goal"])]
+    pub events: Option<String>,
+    /// Start reading events after this sequence number.
+    #[arg(long, requires = "events", default_value = "0")]
+    pub after: u64,
+    /// Follow durably committed events until the run reaches a terminal phase.
+    #[arg(long, requires = "events")]
+    pub follow: bool,
+    /// Run headlessly in a process independent of this terminal.
+    #[arg(long, conflicts_with_all = ["list_runs", "events", "control"])]
+    pub detached: bool,
+    #[arg(long, hide = true, conflicts_with = "detached")]
+    pub managed_run: bool,
+    /// Control the active detached run.
+    #[arg(long, value_enum, conflicts_with_all = ["events", "list_runs", "resume", "goal"])]
+    pub control: Option<ControlOperation>,
+    /// Text to send with --control guide.
+    #[arg(long, requires = "control")]
+    pub guidance: Option<String>,
+    /// Start a fresh run from a recorded run's goal and roster.
+    #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["resume", "list_runs", "events", "control"])]
+    pub fork: Option<String>,
+    /// Open a live or historical run in the terminal.
+    #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["resume", "detached", "fork", "goal", "list_runs", "events", "control"])]
+    pub attach: Option<String>,
+    /// Print metered usage and effect counts for a recorded run.
+    #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["attach", "control", "detached", "events", "fork", "goal", "list_runs", "resume", "evaluate", "otlp_trace"])]
+    pub metrics: Option<String>,
+    /// Print a redacted OTLP/HTTP JSON trace derived from durable checkpoints.
+    #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["attach", "control", "detached", "events", "fork", "goal", "list_runs", "resume", "evaluate"])]
+    pub otlp_trace: Option<String>,
+    /// Evaluate a recorded run against reproducible acceptance thresholds.
+    #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["attach", "control", "detached", "events", "fork", "goal", "list_runs", "resume"])]
+    pub evaluate: Option<String>,
+    /// Optional JSON file containing evaluation thresholds.
+    #[arg(long, requires = "evaluate")]
+    pub evaluation: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum ControlOperation {
+    Status,
+    Pause,
+    Resume,
+    Cancel,
+    Guide,
 }
 
 #[derive(Default, Deserialize)]
@@ -83,11 +138,36 @@ struct FileConfig {
     stakeholders: Vec<Stakeholder>,
     reviewers: Vec<Stakeholder>,
     workers: Vec<Worker>,
+    mcp_servers: BTreeMap<String, McpServer>,
+    skills: BTreeMap<String, Skill>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Skill {
+    pub directory: PathBuf,
+    pub description: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServer {
+    pub command: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub tools: Vec<String>,
+    #[serde(default = "default_mcp_protocol")]
+    pub protocol: String,
+}
+
+fn default_mcp_protocol() -> String {
+    "2025-11-25".into()
 }
 
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Provider {
+    pub api: ProviderApi,
     pub stream: bool,
     pub stream_usage: bool,
     pub temperature: Option<f64>,
@@ -97,9 +177,18 @@ pub struct Provider {
     pub headers: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderApi {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
 impl Default for Provider {
     fn default() -> Self {
         Self {
+            api: ProviderApi::default(),
             stream: true,
             stream_usage: true,
             temperature: None,
@@ -131,6 +220,9 @@ pub struct Orchestration {
     pub command_timeout_secs: u64,
     pub parallel_stakeholders: bool,
     pub max_parallel_agents: usize,
+    pub require_task_graph: bool,
+    pub stage_workspace: bool,
+    pub verification_commands: Vec<String>,
     pub worker_system_prompt: Option<String>,
     pub reviewer_system_prompt: Option<String>,
 }
@@ -148,6 +240,9 @@ impl Default for Orchestration {
             command_timeout_secs: 120,
             parallel_stakeholders: true,
             max_parallel_agents: 8,
+            require_task_graph: false,
+            stage_workspace: false,
+            verification_commands: Vec::new(),
             worker_system_prompt: None,
             reviewer_system_prompt: None,
         }
@@ -243,23 +338,64 @@ pub struct Config {
     pub stakeholders: Vec<Stakeholder>,
     pub reviewers: Vec<Stakeholder>,
     pub workers: Vec<Worker>,
+    pub mcp_servers: BTreeMap<String, McpServer>,
+    pub skills: BTreeMap<String, Skill>,
     pub headless: bool,
     pub debug: bool,
     pub resume: bool,
 }
 
 impl Config {
-    pub fn load(cli: Cli) -> Result<Self> {
-        let file: FileConfig = match cli.config {
+    fn read_file(path: Option<&std::path::Path>) -> Result<FileConfig> {
+        Ok(match path {
             Some(path) => {
-                let text = std::fs::read_to_string(&path)
+                let text = std::fs::read_to_string(path)
                     .with_context(|| format!("read {}", path.display()))?;
                 toml::from_str(&text).map_err(|error| {
                     anyhow::anyhow!("invalid config {}: {}", path.display(), error.message())
                 })?
             }
             None => FileConfig::default(),
-        };
+        })
+    }
+
+    pub fn history_workspace(cli: &Cli) -> Result<PathBuf> {
+        let file = Self::read_file(cli.config.as_deref())?;
+        Self::workspace(cli.cwd.clone().or(file.cwd))
+    }
+
+    fn workspace(cwd: Option<PathBuf>) -> Result<PathBuf> {
+        let cwd = cwd.unwrap_or_else(|| PathBuf::from("."));
+        let cwd = cwd
+            .canonicalize()
+            .with_context(|| format!("resolve {}", cwd.display()))?;
+        ensure!(cwd.is_dir(), "workspace must be a directory");
+        Ok(cwd)
+    }
+
+    pub fn load(cli: Cli) -> Result<Self> {
+        let mut file = Self::read_file(cli.config.as_deref())?;
+        ensure!(
+            file.mcp_servers.len() <= 16,
+            "configure at most 16 MCP servers"
+        );
+        for (name, server) in &file.mcp_servers {
+            ensure!(
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+                    && !server.command.as_os_str().is_empty()
+                    && (1..=64).contains(&server.tools.len())
+                    && server
+                        .tools
+                        .iter()
+                        .all(|tool| !tool.is_empty() && tool.len() <= 128)
+                    && matches!(server.protocol.as_str(), "2025-11-25" | "2026-07-28"),
+                "invalid MCP server {name}: require a command, allowed tools and a supported protocol"
+            );
+        }
         let model = cli.model.or(file.model);
         let worker_model = cli.worker_model.or(file.worker.model).or(model.clone());
         let reviewer_model = cli.reviewer_model.or(file.reviewer.model).or(model);
@@ -286,11 +422,17 @@ impl Config {
             "output token budget must be positive and smaller than the context window"
         );
         let mut provider = file.provider;
+        provider.api = cli.provider_api.unwrap_or(provider.api);
         provider.stream = cli.stream.unwrap_or(provider.stream);
         provider.temperature = cli.temperature.or(provider.temperature);
         provider.top_p = cli.top_p.or(provider.top_p);
         provider.seed = cli.seed.or(provider.seed);
         provider.parallel_tool_calls = cli.parallel_tool_calls.or(provider.parallel_tool_calls);
+        ensure!(
+            provider.api != ProviderApi::Responses
+                || (provider.seed.is_none() && !(cli.legacy_max_tokens || file.legacy_max_tokens)),
+            "seed and legacy_max_tokens require the Chat Completions provider API"
+        );
         ensure!(
             provider
                 .temperature
@@ -322,6 +464,16 @@ impl Config {
         );
         ensure!(file.workers.len() <= 64, "configure at most 64 workers");
         ensure!(
+            !orchestration.stage_workspace
+                || (!orchestration.verification_commands.is_empty()
+                    && orchestration.verification_commands.len() <= 16
+                    && orchestration
+                        .verification_commands
+                        .iter()
+                        .all(|command| !command.trim().is_empty() && command.len() <= 4096)),
+            "staged execution requires 1–16 nonempty verification commands of at most 4096 bytes each"
+        );
+        ensure!(
             file.workers
                 .iter()
                 .all(|worker| !worker.name.trim().is_empty()
@@ -351,11 +503,33 @@ impl Config {
             orchestration.request_timeout_secs > 0 && orchestration.command_timeout_secs > 0,
             "timeouts must be positive"
         );
-        let cwd = cli.cwd.or(file.cwd).unwrap_or_else(|| PathBuf::from("."));
-        let cwd = cwd
-            .canonicalize()
-            .with_context(|| format!("resolve {}", cwd.display()))?;
-        ensure!(cwd.is_dir(), "workspace must be a directory");
+        let cwd = Self::workspace(cli.cwd.or(file.cwd))?;
+        ensure!(file.skills.len() <= 32, "configure at most 32 skills");
+        for (name, skill) in &mut file.skills {
+            ensure!(
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+                    && !skill.description.trim().is_empty()
+                    && skill.description.len() <= 512,
+                "invalid skill {name}: require an ID and a description of at most 512 bytes"
+            );
+            let root = cli
+                .config
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .unwrap_or(&cwd);
+            skill.directory = root
+                .join(&skill.directory)
+                .canonicalize()
+                .with_context(|| format!("resolve skill directory for {name}"))?;
+            ensure!(
+                skill.directory.is_dir() && skill.directory.join("SKILL.md").is_file(),
+                "skill {name} must contain SKILL.md"
+            );
+        }
 
         Ok(Self {
             goal: cli.goal.or(file.goal),
@@ -381,6 +555,8 @@ impl Config {
             stakeholders: file.stakeholders,
             reviewers: file.reviewers,
             workers: file.workers,
+            mcp_servers: file.mcp_servers,
+            skills: file.skills,
             headless: cli.headless,
             debug: cli.debug,
             resume: cli.resume,

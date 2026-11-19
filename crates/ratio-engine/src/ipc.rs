@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 
 use anyhow::{Context, Result, ensure};
+use ratio_protocol::IpcEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -27,6 +28,7 @@ pub struct Mailbox {
     inbox_bytes: usize,
     worker_count: Option<usize>,
     network: Option<(Reporter, TrafficScope)>,
+    traffic: RefCell<Vec<IpcEvent>>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -68,6 +70,7 @@ impl Mailbox {
             inbox_bytes,
             worker_count: None,
             network: None,
+            traffic: RefCell::default(),
         }
     }
 
@@ -84,20 +87,29 @@ impl Mailbox {
     }
 
     fn trace(&self, mail: &Envelope, to: impl IntoIterator<Item = usize>, delivery: Delivery) {
-        let Some((reporter, scope)) = &self.network else {
-            return;
-        };
-        reporter.network(NetworkEvent::Traffic(Traffic {
-            scope: *scope,
-            from: self.id(mail.from).into(),
-            to: to.into_iter().map(|index| self.id(index).into()).collect(),
-            body: clean(mail.body.clone()),
-            kind: TrafficKind::Ipc {
-                sequence: mail.sequence,
-                reply_to: mail.reply_to.map(|index| self.id(index).into()),
-                delivery,
-            },
-        }));
+        let event = ipc_event(self, mail, to, delivery);
+        self.display(&event);
+        self.traffic.borrow_mut().push(event);
+    }
+
+    fn display(&self, event: &IpcEvent) {
+        if let Some((reporter, scope)) = &self.network {
+            reporter.network(NetworkEvent::Traffic(Traffic {
+                scope: *scope,
+                from: event.from.clone(),
+                to: event.to.clone(),
+                body: event.body.clone(),
+                kind: TrafficKind::Ipc {
+                    sequence: event.sequence,
+                    reply_to: event.reply_to.clone(),
+                    delivery: event.delivery,
+                },
+            }));
+        }
+    }
+
+    pub(crate) fn take_traffic(&self) -> Vec<IpcEvent> {
+        std::mem::take(&mut self.traffic.borrow_mut())
     }
 
     pub(crate) fn snapshot(&self) -> MailboxState {
@@ -126,7 +138,7 @@ impl Mailbox {
         if self.network.is_some() {
             for (recipient, inbox) in state.inboxes.iter().enumerate() {
                 for mail in inbox {
-                    self.trace(mail, [recipient], Delivery::Queued);
+                    self.display(&ipc_event(self, mail, [recipient], Delivery::Queued));
                 }
             }
         }
@@ -214,10 +226,36 @@ impl Mailbox {
     }
 }
 
+fn ipc_event(
+    mailbox: &Mailbox,
+    mail: &Envelope,
+    to: impl IntoIterator<Item = usize>,
+    delivery: Delivery,
+) -> IpcEvent {
+    IpcEvent {
+        from: mailbox.id(mail.from).into(),
+        to: to
+            .into_iter()
+            .map(|index| mailbox.id(index).into())
+            .collect(),
+        sequence: mail.sequence,
+        body: clean(mail.body.clone()),
+        reply_to: mail.reply_to.map(|index| mailbox.id(index).into()),
+        delivery,
+    }
+}
+
 pub struct PlanGate<'a> {
     pub id: &'a str,
     accepted: RefCell<Vec<bool>>,
     objections: RefCell<Vec<Option<String>>>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct GateState {
+    plan_id: String,
+    pub(crate) accepted: Vec<bool>,
+    objections: Vec<Option<String>>,
 }
 
 impl<'a> PlanGate<'a> {
@@ -227,6 +265,26 @@ impl<'a> PlanGate<'a> {
             accepted: RefCell::new(vec![false; workers]),
             objections: RefCell::new(vec![None; workers]),
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> GateState {
+        GateState {
+            plan_id: self.id.into(),
+            accepted: self.accepted.borrow().clone(),
+            objections: self.objections.borrow().clone(),
+        }
+    }
+
+    pub(crate) fn restore(&self, state: GateState) -> Result<()> {
+        ensure!(
+            state.plan_id == self.id
+                && state.accepted.len() == self.accepted.borrow().len()
+                && state.objections.len() == self.objections.borrow().len(),
+            "acknowledgement checkpoint does not match frozen plan"
+        );
+        self.accepted.replace(state.accepted);
+        self.objections.replace(state.objections);
+        Ok(())
     }
 
     pub fn accepted(&self, worker: usize) -> bool {

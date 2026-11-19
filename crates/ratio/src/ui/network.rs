@@ -515,7 +515,10 @@ impl Network {
                     .add_modifier(Modifier::BOLD),
             ),
             Line::styled(
-                format!(" Cycle {} / {}", item.scope.cycle, item.scope.phase),
+                format!(
+                    " Cycle {} / attempt {} / {}",
+                    item.scope.cycle, item.scope.attempt, item.scope.phase
+                ),
                 Style::default().fg(Color::Gray),
             ),
             agent_line(self.node(item.from), " From "),
@@ -660,6 +663,7 @@ mod tests {
             NetworkEvent::Traffic(Traffic {
                 scope: TrafficScope {
                     cycle: 1,
+                    attempt: 1,
                     phase: "Worker",
                 },
                 from: "stakeholder_1".into(),

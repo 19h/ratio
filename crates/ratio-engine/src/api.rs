@@ -11,11 +11,12 @@ use serde_json::Value;
 
 use crate::{
     budget::Budget,
-    config::{Config, Provider},
+    config::{Config, Provider, ProviderApi},
     context::{clip, estimate},
     events::{Generation, Kind, Reporter, clean},
 };
 
+mod responses;
 mod stream;
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -58,6 +59,8 @@ pub enum Message {
         tool_calls: Vec<ToolCall>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        responses_items: Vec<Value>,
     },
     Tool {
         tool_call_id: String,
@@ -93,7 +96,9 @@ struct Choice {
 
 #[derive(Clone, Deserialize)]
 struct Usage {
+    #[serde(alias = "input_tokens")]
     prompt_tokens: Option<usize>,
+    #[serde(alias = "output_tokens")]
     completion_tokens: Option<usize>,
 }
 
@@ -132,7 +137,7 @@ pub struct Api {
 
 impl Api {
     pub fn new(config: &Config, reporter: Reporter, budget: Budget) -> Result<Self> {
-        let endpoint = completions_url(&config.endpoint)?;
+        let endpoint = completion_url(&config.endpoint, config.provider.api)?;
         let mut headers = header::HeaderMap::new();
         let mut secrets = Vec::new();
         if let Some(key) = &config.api_key {
@@ -314,12 +319,17 @@ impl Api {
         reserved: u64,
         preview: &mut Preview<'_>,
     ) -> Result<Completion, ApiError> {
-        let mut payload = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": self.provider.stream
-        });
-        if self.provider.stream && self.provider.stream_usage {
+        let responses = self.provider.api == ProviderApi::Responses;
+        let mut payload = if responses {
+            responses::payload(model, messages, tools, output_tokens, self.provider.stream)
+        } else {
+            let messages = messages
+                .iter()
+                .map(|message| chat_message(message))
+                .collect::<Vec<_>>();
+            serde_json::json!({"model": model, "messages": messages, "stream": self.provider.stream})
+        };
+        if !responses && self.provider.stream && self.provider.stream_usage {
             payload["stream_options"] = serde_json::json!({"include_usage": true});
         }
         if let Some(value) = self.provider.temperature {
@@ -332,17 +342,21 @@ impl Api {
             payload["seed"] = serde_json::json!(value);
         }
         if !tools.is_empty() {
-            payload["tools"] = serde_json::json!(tools);
+            if !responses {
+                payload["tools"] = serde_json::json!(tools);
+            }
             if let Some(value) = self.provider.parallel_tool_calls {
                 payload["parallel_tool_calls"] = serde_json::json!(value);
             }
         }
-        let limit = if self.legacy_max_tokens {
-            "max_tokens"
-        } else {
-            "max_completion_tokens"
-        };
-        payload[limit] = serde_json::json!(output_tokens);
+        if !responses {
+            let limit = if self.legacy_max_tokens {
+                "max_tokens"
+            } else {
+                "max_completion_tokens"
+            };
+            payload[limit] = serde_json::json!(output_tokens);
+        }
         if self.debug {
             self.reporter.emit(
                 Kind::Info,
@@ -370,7 +384,7 @@ impl Api {
             .send()
             .await
             .map_err(|error| {
-                anyhow::Error::new(error.without_url()).context("send chat completion")
+                anyhow::Error::new(error.without_url()).context("send model completion")
             })?;
         let status = response.status();
         if status.is_success()
@@ -398,7 +412,7 @@ impl Api {
         preview: &mut Preview<'_>,
     ) -> Result<Completion, ApiError> {
         let status = response.status().as_u16();
-        let mut decoder = stream::Decoder::default();
+        let mut decoder = stream::Decoder::new(self.provider.api);
         let mut received = 0usize;
         let mut dirty = false;
         loop {
@@ -422,7 +436,7 @@ impl Api {
                 result = response.chunk() => result,
             }
             .map_err(|error| {
-                anyhow::Error::new(error.without_url()).context("read chat completion stream")
+                anyhow::Error::new(error.without_url()).context("read model completion stream")
             })?;
             let Some(chunk) = chunk else { break };
             received = received.saturating_add(chunk.len());
@@ -485,7 +499,7 @@ impl Api {
         };
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|error| {
-            anyhow::Error::new(error.without_url()).context("read chat completion")
+            anyhow::Error::new(error.without_url()).context("read model completion")
         })? {
             let remaining = limit_bytes - bytes.len();
             if chunk.len() > remaining {
@@ -520,16 +534,9 @@ impl Api {
                 .filter(|c| !c.is_control())
                 .collect();
             let status = status.as_u16();
-            let usage = body
-                .pointer("/usage/prompt_tokens")
-                .and_then(Value::as_u64)
-                .zip(
-                    body.pointer("/usage/completion_tokens")
-                        .and_then(Value::as_u64),
-                );
-            if let Some((prompt, completion)) = usage {
-                self.budget
-                    .reconcile(reserved, prompt.saturating_add(completion))?;
+            let usage = serde_json::from_value::<Usage>(body["usage"].clone()).ok();
+            if let Some(total) = usage.as_ref().and_then(Usage::total) {
+                self.budget.reconcile(reserved, total)?;
             } else if status == 429 || context_rejection {
                 // The provider explicitly refused admission. Keep the attempt
                 // charge, but release the token reservation.
@@ -546,9 +553,15 @@ impl Api {
             };
         }
 
-        let response: Response = serde_json::from_slice(&bytes)
-            .context("decode chat completion")
-            .map_err(|error| self.safe_error(error))?;
+        let response = match self.provider.api {
+            ProviderApi::ChatCompletions => {
+                serde_json::from_slice(&bytes).context("decode chat completion")
+            }
+            ProviderApi::Responses => serde_json::from_slice(&bytes)
+                .context("decode Responses reply")
+                .and_then(responses::decode),
+        }
+        .map_err(|error| self.safe_error(error))?;
         self.finish(response, reserved)
     }
 
@@ -759,7 +772,15 @@ fn retry_delay(value: &str) -> Option<Duration> {
     Some(date.duration_since(SystemTime::now()).unwrap_or_default())
 }
 
-fn completions_url(endpoint: &str) -> Result<Url> {
+pub(crate) fn chat_message(message: &Message) -> Value {
+    let mut value = serde_json::to_value(message).expect("serializable model message");
+    if let Some(fields) = value.as_object_mut() {
+        fields.remove("responses_items");
+    }
+    value
+}
+
+fn completion_url(endpoint: &str, api: ProviderApi) -> Result<Url> {
     let mut url = Url::parse(endpoint).context("invalid API endpoint URL")?;
     ensure!(
         matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
@@ -770,8 +791,12 @@ fn completions_url(endpoint: &str) -> Result<Url> {
         "API endpoint cannot contain user info or a fragment"
     );
     let path = url.path().trim_end_matches('/');
-    if !path.ends_with("/chat/completions") {
-        let path = format!("{path}/chat/completions");
+    let suffix = match api {
+        ProviderApi::ChatCompletions => "/chat/completions",
+        ProviderApi::Responses => "/responses",
+    };
+    if !path.ends_with(suffix) {
+        let path = format!("{path}{suffix}");
         url.set_path(&path);
     } else if path.len() != url.path().len() {
         let path = path.to_owned();
