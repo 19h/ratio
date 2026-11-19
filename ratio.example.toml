@@ -1,163 +1,30 @@
-# RA — example configuration
-#
-# Copy this to `ratio.toml` and customize for your project.
-# All fields have sensible defaults; only `goal` is required.
-#
-# RA orchestrates LLM agents through iterative review cycles:
-#   - Reviewer: formulates tasks, reviews output, enforces constraints
-#   - Worker: executes the coding work
-#   - Stakeholders (optional): provide additional perspectives during
-#     planning and/or review phases
-#
-# All agents are opencode instances communicating over ACP.
+goal = "Fix the failing workspace tests and explain the changes."
+# cwd = "/path/to/workspace"
 
-# The goal to accomplish — a detailed natural-language description.
-goal = """
-Review and improve the decompiler output in src/decompiler/: ensure all \
-generated code compiles, follows idiomatic Rust patterns, has proper error \
-handling, and passes `cargo test`.
-"""
+endpoint = "https://api.openai.com/v1"
+model = "replace-with-provider-model"
+context_window = 32768
+# Set RATIO_API_KEY or OPENAI_API_KEY in the environment.
+# output_tokens = 4096
+# legacy_max_tokens = false
 
-# Working directory all agents operate in.
-# Defaults to the current directory.
-# cwd = "/path/to/project"
+# [worker]
+# model = "worker-model"
 
-# ── Worker agent configuration ──────────────────────────────
-# The agent that does the actual coding / implementation work.
-
-[worker]
-binary = "opencode"
-# model = "anthropic/claude-sonnet-4-5"
-# agent = "my-custom-worker-agent"
-# env = [
-#   { key = "ANTHROPIC_API_KEY", value = "sk-ant-..." },
-# ]
-# extra_args = []
-
-# ── Reviewer agent configuration ────────────────────────────
-# The agent that formulates tasks, reviews output, and makes
-# approval/revision/rejection decisions via LLM reasoning.
-
-[reviewer]
-binary = "opencode"
-# model = "anthropic/claude-sonnet-4-5"
-# agent = "my-custom-reviewer-agent"
-
-# ── Orchestration behavior ──────────────────────────────────
+# [reviewer]
+# model = "reviewer-model"
 
 [orchestration]
-# Maximum number of review-revise cycles before giving up.
-max_review_cycles = 5
-
-# Custom system prompt for the reviewer agent.
-# reviewer_system_prompt = "You are a senior Rust engineer reviewing generated code."
-
-# Custom system prompt for the worker agent.
-# worker_system_prompt = "You are a precise, thorough coding agent."
-
-# Seconds of inactivity before nudging a stalled agent.
-# If an agent produces no ACP events (text, tool calls, thinking) for this
-# long, the orchestrator cancels the current turn and sends "continue where
-# you left off" to restart it. This catches agents that silently hang after
-# a subagent tool call. Set to 0 to disable. Default: 120 (2 minutes).
-# stall_timeout_secs = 120
-
-# Maximum nudge attempts before treating the turn as failed. Default: 3.
-# max_nudges = 3
-
-# Run stakeholder consultations in parallel instead of sequentially.
-# When enabled, all stakeholders for a given phase (planning or review)
-# are prompted concurrently, which can significantly reduce wait time
-# when there are multiple stakeholders. Toggle in the TUI with 'p'.
-# Default: true.
-# parallel_stakeholders = true
-
-# ── Enforced constraints ────────────────────────────────────
-# These are provided to BOTH agents: the worker must follow them,
-# and the reviewer verifies compliance.
+max_review_cycles = 3
+max_plan_attempts = 3
+max_requests = 512
+max_total_tokens = 8000000
+max_run_secs = 3600
+max_tool_rounds = 100
+request_timeout_secs = 180
+command_timeout_secs = 120
+parallel_stakeholders = true
 
 [constraints]
-# Tools the worker MUST use during its work.
-required_tools = [
-    "cargo clippy",
-    "cargo test",
-]
-
-# Tools the worker must NOT use.
-# forbidden_tools = ["rm -rf"]
-
-# Coding approaches the worker must follow.
-required_approaches = [
-    "Use Result<T, E> for all error handling — no unwrap() or expect()",
-    "All public types must derive Debug",
-]
-
-# Approaches the worker must avoid.
-forbidden_approaches = [
-    "unsafe code blocks",
-]
-
-# File paths the worker is allowed to modify (empty = unrestricted).
-# allowed_paths = ["src/decompiler/"]
-
-# File paths the worker must NOT touch.
-forbidden_paths = [
-    "Cargo.lock",
-]
-
-# Custom rules expressed as free-form sentences.
-# These are injected as MANDATORY QUALITY RULES — the reviewer cannot
-# approve unless every rule is satisfied.
-custom_rules = [
-    "Do not add new dependencies without explicit approval",
-    "Preserve existing public API signatures",
-]
-
-# ── Stakeholders (optional) ─────────────────────────────────
-#
-# Stakeholders are additional LLM agents that participate in planning
-# and/or review phases. Each gets its own opencode subprocess with a
-# clean, unpolluted context and a unique persona.
-#
-# During planning: stakeholders review the reviewer's DRAFT WORK
-# INSTRUCTION before it reaches the worker. They are explicitly told
-# they are reviewing an instruction for the worker agent, and their
-# feedback is incorporated by the reviewer into the final instruction.
-# This ensures all perspectives are captured BEFORE work begins.
-#
-# During review: stakeholders review the worker's output and the
-# reviewer's draft assessment. The reviewer synthesizes their input
-# into the final verdict.
-#
-# When parallel_stakeholders = true (the default), all stakeholders
-# for a given phase are consulted concurrently. Toggle this at
-# runtime with the 'p' key in the TUI.
-#
-# Uncomment below to add stakeholders:
-
-# [[stakeholders]]
-# name = "Security Reviewer"
-# persona = """
-# You are a security engineer. Review for auth flaws, injection
-# vulnerabilities, data exposure, and insecure defaults.
-# """
-# # Which phases to participate in. Options: "planning", "review".
-# # Defaults to both.
-# phases = ["planning", "review"]
-#
-# # Optional: override the agent config (binary, model, env, etc.).
-# # If omitted, the reviewer's agent config is used.
-# # [stakeholders.agent]
-# # binary = "opencode"
-# # model = "anthropic/claude-sonnet-4-5"
-#
-# [[stakeholders]]
-# name = "Performance Engineer"
-# persona = """
-# You review for algorithmic efficiency, memory allocation patterns,
-# and scalability concerns. Flag any O(n^2) or worse algorithms.
-# """
-# phases = ["review"]  # Only review, not planning
-
-# See examples/fullstack-stakeholders.toml for a comprehensive example
-# with three stakeholders (Security Auditor, UX Engineer, SRE).
+required_tools = ["cargo test"]
+custom_rules = ["Preserve public behavior unrelated to the reported failures."]

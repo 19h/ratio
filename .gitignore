@@ -37,3 +37,7 @@ Desktop.ini
 *.pdb
 node_modules/
 target/
+
+/.ratio/session.json
+/.ratio/session.lock
+/.ratio/.tmp*

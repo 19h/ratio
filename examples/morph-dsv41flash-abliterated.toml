@@ -1,0 +1,201 @@
+# Supply the Morph credential through RATIO_API_KEY. Run in an empty workspace.
+endpoint = "https://api.morphllm.com/v1"
+model = "morph-dsv41flash-abliterated"
+context_window = 1048576
+output_tokens = 8192
+
+goal = """
+Build an Estuary Flood Simulator in modern Rust 2024. Simulate a surge pulse
+entering a synthetic tidal basin, overtopping an initially exposed sill, and advancing
+across initially dry floodplain cells around an island. Deliver a reusable
+library and a CLI that can run the scenario and export results for analysis.
+
+Default surge fixture
+- Use a 1200 m by 800 m basin with 5 m square cells and g = 9.81 m/s^2.
+  Set the west channel bed to -2 m, the sill near x = 450 m to +0.35 m,
+  and the connected eastern floodplain to +0.10 m through +0.80 m. Place a
+  dry elliptical island near x = 850 m, y = 400 m, with crest +1.60 m.
+  Document the exact terrain functions and grid origin.
+- Start from rest at west-channel free-surface elevation 0 m. Drive the
+  west boundary with a 0.90 m sin-squared pulse from t = 60 s to t = 420 s.
+  Reflect at the other boundaries. Run to t = 900 s and report the increase
+  in inundated floodplain area. Use the dry tolerance to define wet area.
+
+Physics and numerics
+- Solve the two-dimensional, depth-integrated Saint-Venant equations with
+  gravity and spatially varying fixed bed elevation on a Cartesian grid.
+  Store conserved depth h [m] and discharges qx, qy [m^2/s] in f64. Use a
+  common vertical datum for bed elevation and free surface. Use SI throughout.
+- Implement a finite-volume Rusanov flux with Audusse-style hydrostatic
+  reconstruction and the matching cell-side pressure corrections. Use
+  dimensionally unsplit updates and SSPRK2 with stage-consistent boundary
+  forcing and flux accounting. Document flux signs and component units.
+- Support reflecting walls and a driven tide boundary with a documented
+  ghost-state rule for inflow, outflow and dry states. Use an adaptive
+  two-dimensional CFL bound, a defined dry tolerance, and explicit checks
+  for nonfinite state or depth below the roundoff tolerance. Account for any
+  roundoff correction in the volume audit.
+- Deliver an idealized, frictionless barotropic model. Keep rainfall,
+  turbulence, sediment transport and real-world inundation forecasts out
+  of scope. The shipped terrain and forcing are reproducible synthetic cases.
+
+Parallel solver and application
+- Provide serial and Rayon execution using the same kernels. Compute one
+  flux per face into indexed buffers, then gather into disjoint cell updates
+  in a fixed order. Reuse scratch storage between steps. Keep diagnostic
+  reductions deterministic across thread counts. Document per-step time and
+  storage complexity in grid dimensions.
+- Provide named lake-at-rest, Ritter dam-break and surge scenarios. Expose
+  grid spacing, end time, CFL and thread count in the CLI. Reject invalid
+  values and checked-allocation overflow through typed errors. Export depth,
+  bed elevation and free surface as documented CSV snapshots. Write time,
+  minimum depth, wet area, volume, net boundary flux and volume residual to
+  a reproducible diagnostics file. Include SI units and grid orientation.
+
+Acceptance evidence
+- Run lake-at-rest on a nonflat bed with a partially dry island. For a
+  documented 60 s regression, require maximum initially wet free-surface
+  drift <= 1e-10 m and maximum discharge magnitude <= 1e-10 m^2/s.
+- Embed the frictionless Ritter dry-bed dam break in a two-dimensional
+  strip with x in [-100, 100] m, a dam at x = 0, upstream depth 1 m, and
+  reflecting transverse boundaries. At t = 8 s, compare against analytical
+  cell-average depth before waves reach the longitudinal boundaries. Report
+  the wet-front threshold and domain-mean absolute depth error in metres
+  for 200, 400 and 800 longitudinal cells. Require the error to decrease
+  with refinement.
+- For the surge case, verify initially dry cells inundate and all states
+  stay finite with nonnegative depth. Integrate outward boundary discharge
+  over face length and time. Compute residual as final minus initial volume,
+  plus outward transport, minus numerically added volume. Apply the same
+  budget to a separate closed-domain conservation test.
+  Use a relative residual tolerance of 5e-11 against the larger of initial
+  volume and total absolute boundary transport, with an absolute tolerance
+  of 1e-10 m^3 for the zero-scale case.
+- Compare final fields and diagnostics at 1, 2 and 4 threads on the same
+  build and machine. Require identical fields and diagnostics for the fixed
+  regression case. Record release-mode throughput on a fixed 512 by 512 grid,
+  with thread count, hardware and workload. Keep timing out of pass/fail.
+- Supply cargo fmt --check, cargo clippy --all-targets -- -D warnings and
+  cargo test evidence, plus a command to reproduce the benchmark. Report
+  failed or unavailable checks explicitly. Document the physics assumptions,
+  benchmark setup and supported numerical ranges.
+
+Method references
+- E. Audusse et al., hydrostatic reconstruction, DOI 10.1137/S1064827503431090.
+- O. Delestre et al., SWASHES and the Ritter benchmark, DOI 10.1002/fld.3741.
+"""
+
+[orchestration]
+max_review_cycles = 3
+max_plan_attempts = 3
+max_requests = 512
+max_total_tokens = 8000000
+max_run_secs = 3600
+max_tool_rounds = 100
+max_parallel_agents = 3
+request_timeout_secs = 180
+command_timeout_secs = 180
+reviewer_system_prompt = """
+You lead a scientific Rust project. Include the file ownership map and arrange
+independent work after the gate opens. Before freezing the plan, resolve
+interface disagreements using the worker and stakeholder reports. Record
+shared type and function signatures, cell and face layout, flux signs,
+boundary data and test fixtures so workers can implement against the same
+contract. Assign the integration engineer ownership of the crate root and
+final integration. Freeze ownership with submit_plan, and use submit_verdict
+for the final review. The runtime owns BWP delivery and plan acknowledgement.
+Ask the team to use stakeholder IPC for unresolved requirements and shared
+memory for agreed datum, flux signs, boundary semantics and verification
+evidence. Treat any clarification that changes the plan as a revision.
+
+Review source and reported command results against the acceptance criteria.
+Distinguish what you inspected from what the workers executed. If an
+interface change or integration fix is needed, name its owner and request
+revision so the revised plan can receive fresh acknowledgements.
+"""
+
+[[workers]]
+name = "Finite-volume methods engineer"
+persona = """
+Own src/numerics.rs and src/numerics/. Define conserved state, axis-aware
+physical and numerical fluxes, hydrostatic reconstruction, dry-state rules,
+signal speeds and cell-side pressure corrections. Write kernel unit tests.
+Agree on the pure face-kernel and state APIs before parallel execution.
+"""
+
+[[workers]]
+name = "Parallel solver engineer"
+persona = """
+Own src/solver.rs and src/solver/. Implement grid indexing, ghost cells,
+boundary forcing, SSPRK2, CFL, serial and Rayon scheduling, scratch buffers
+and volume diagnostics. Work against the agreed numerics API. Expose solver
+inputs, snapshots and diagnostics to the integration engineer.
+"""
+
+[[workers]]
+name = "Integration and verification engineer"
+persona = """
+Own Cargo.toml, Cargo.lock, src/lib.rs, src/main.rs, src/scenarios.rs,
+src/output.rs, tests/, benches/ and README.md. Build the CLI, scenario
+fixtures, exports, reference benchmarks and end-to-end tests. Own
+cross-module integration and report actual test and benchmark commands.
+Write fixtures against the frozen interfaces while the solver and numerics
+modules are under construction. Report any compile or interface blocker
+for the next review cycle with the responsible file owner.
+"""
+
+[[reviewers]]
+name = "Numerical verification reviewer"
+persona = """
+Check well-balanced source discretization, dry-front behavior, the Ritter
+comparison, tolerance scales, and stage-weighted outward volume accounting.
+Cross-check validation fixtures against the method references and inspect
+failure cases where the metrics could pass for the wrong reason.
+"""
+phases = ["planning", "review"]
+
+[[reviewers]]
+name = "Rust architecture reviewer"
+persona = """
+Inspect crate and module boundaries, documented APIs, typed input errors,
+buffer ownership, thread safety and isolated testing. Verify that the
+parallel path gathers into disjoint cells and that contributor paths and
+shared signatures avoid conflicting edits.
+"""
+phases = ["planning", "review"]
+
+[[stakeholders]]
+name = "Coastal hydraulics modeller"
+persona = """
+Represent physical fidelity. Check that the pulse, sill, dry floodplain
+and island form an interpretable synthetic scenario. Review boundary
+semantics, nondimensional assumptions, SI units and the water-volume budget.
+"""
+phases = ["planning", "review"]
+
+[[stakeholders]]
+name = "Flood mapping analyst"
+persona = """
+Represent downstream users of simulation output. Check that snapshots and
+diagnostics expose grid origin, orientation, units, datum, wet/dry semantics
+and simulated timestamps. Confirm the documentation gives an end-to-end
+reproduction command and identifies the case as synthetic.
+"""
+phases = ["planning", "review"]
+
+[[stakeholders]]
+name = "Research computing operator"
+persona = """
+Represent reproducible execution. Review explicit thread counts, a single
+bounded pool, identical results across thread counts, bounded memory on
+large grids, and fair, reproducible release-mode throughput measurements.
+"""
+phases = ["planning", "review"]
+
+[constraints]
+custom_rules = [
+    "Work in an empty or disposable project workspace and keep edits inside it.",
+    "Each worker edits only its frozen ownership paths. Send interface proposals in the coordination phase and request a new plan before changing a shared interface.",
+    "Use safe Rust, clear module boundaries and typed recoverable errors for bad input, I/O and invalid simulation states.",
+    "Treat command results, numerical metrics and benchmarks as evidence. Claim only checks that ran and report any unavailable validation.",
+]
