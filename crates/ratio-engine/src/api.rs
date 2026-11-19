@@ -210,10 +210,13 @@ impl Api {
         };
         if control.borrow().paused {
             let _pause = self.budget.pause()?;
-            control
-                .wait_for(|state| !state.paused)
+            let state = control
+                .wait_for(|state| !state.paused || state.checkpoint_and_exit)
                 .await
                 .context("generation controls closed")?;
+            if state.checkpoint_and_exit {
+                return Err(crate::events::CheckpointExit.into());
+            }
         }
         Ok(())
     }

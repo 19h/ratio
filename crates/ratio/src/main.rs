@@ -157,6 +157,7 @@ async fn run() -> Result<u8> {
     let run_id = cli.run_id.clone();
     let fork = cli.fork.clone();
     let managed = cli.managed_run;
+    let dashboard_managed = cli.dashboard_managed;
     let plan_only = cli.plan_only;
     let check_mcp = cli.check_mcp.clone();
     let config = Config::load(cli)?;
@@ -240,7 +241,12 @@ async fn run() -> Result<u8> {
         let session = session.take().expect("headless session initialized");
         let reporter = Reporter::Managed(control_state, live_generations.clone());
         let orchestrator = Orchestrator::new(&config, &store, reporter, budget.clone())?;
-        let session = orchestrator.run(session, Some(guidance)).await?;
+        let session = match orchestrator.run(session, Some(guidance)).await {
+            Err(error) if error.is::<ra::events::CheckpointExit>() => {
+                return Ok(ui::Outcome::Interrupted);
+            }
+            result => result?,
+        };
         Ok(ui::Outcome::Finished(Box::new(session)))
     };
     let controls = async {
@@ -248,6 +254,7 @@ async fn run() -> Result<u8> {
             control::serve(
                 listener,
                 &active_run,
+                dashboard_managed,
                 generation,
                 guide,
                 live_generations.clone(),

@@ -45,7 +45,12 @@ impl Orchestrator<'_> {
                 session.worker_addition_status =
                     Some(format!("Worker request {id} / admitted {worker}"));
             }
-            Err(error) if self.budget.exhaustion().is_some() => return Err(error),
+            Err(error)
+                if self.budget.exhaustion().is_some()
+                    || error.is::<crate::events::CheckpointExit>() =>
+            {
+                return Err(error);
+            }
             Err(error) => {
                 session.worker_addition_status =
                     Some(format!("Worker request {id} / declined: {error:#}"));

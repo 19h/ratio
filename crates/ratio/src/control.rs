@@ -143,6 +143,7 @@ pub async fn request_control(workspace: &Path, request: &ControlRequest) -> Resu
 pub async fn serve(
     mut listener: Listener,
     run_id: &str,
+    dashboard_managed: bool,
     generation: watch::Sender<GenerationControl>,
     guidance: SyncSender<String>,
     live: LiveGenerations,
@@ -280,8 +281,22 @@ pub async fn serve(
                     (true, "pause requested")
                 }
                 (ControlAction::Resume, _) => {
-                    generation.send_modify(|state| state.paused = false);
-                    (true, "model requests resumed")
+                    if generation.borrow().checkpoint_and_exit {
+                        (false, "runner is saving its restart checkpoint")
+                    } else {
+                        generation.send_modify(|state| state.paused = false);
+                        (true, "model requests resumed")
+                    }
+                }
+                (ControlAction::CheckpointAndExit, _) => {
+                    if dashboard_managed && generation.borrow().paused {
+                        (true, "runner will exit at its next checkpoint")
+                    } else {
+                        (
+                            false,
+                            "checkpoint restart requires a paused dashboard runner",
+                        )
+                    }
                 }
                 (ControlAction::Cancel, _) => (true, "run cancellation requested"),
                 (ControlAction::Status, _) => (true, "run is active"),
@@ -293,6 +308,7 @@ pub async fn serve(
             if accepted && request.action == ControlAction::Status && request.run_id.is_some() {
                 response.generations = live.snapshot();
             }
+            response.dashboard_managed = dashboard_managed;
             let result = send_frame(
                 &mut connection,
                 &serde_json::to_vec(&response)?,
@@ -303,6 +319,9 @@ pub async fn serve(
                 return Ok(true);
             }
             result?;
+            if accepted && request.action == ControlAction::CheckpointAndExit {
+                generation.send_modify(|state| state.checkpoint_and_exit = true);
+            }
             Ok(false)
         })
         .await;
@@ -319,6 +338,7 @@ fn reply(run_id: &str, paused: bool, accepted: bool, detail: &str) -> ControlRep
         paused,
         accepted,
         detail: detail.into(),
+        dashboard_managed: false,
         generations: Vec::new(),
     }
 }

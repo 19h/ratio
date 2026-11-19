@@ -1934,6 +1934,49 @@ fn direct_tool_loop_compacts_and_reviews() {
 }
 
 #[test]
+fn resume_advances_a_committed_verdict_without_another_model_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path();
+    let (endpoint, server) = mock(|index, _| match index {
+        0 => text("Plan."),
+        1 => text("Work."),
+        2 => decision("approved", "Verdict checkpoint."),
+        _ => panic!("unexpected request {index}"),
+    });
+    succeeded(&cli(
+        workspace,
+        &endpoint,
+        &["--goal", "Test verdict resume"],
+    ));
+    server.join().unwrap();
+
+    let reader = ra::session::Store::reader(workspace).unwrap();
+    let run = reader.runs().unwrap().pop().unwrap();
+    let checkpoint = reader
+        .events(&run.run_id, 0, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.phase == "Review")
+        .filter_map(|event| reader.snapshot(&run.run_id, Some(event.sequence)).unwrap())
+        .map(|snapshot| serde_json::from_slice::<Value>(&snapshot).unwrap())
+        .find(|snapshot| snapshot["phase_result"] == "Verdict checkpoint.")
+        .expect("completed verdict should be checkpointed before the phase advances");
+    ra::session::Store::open(workspace)
+        .unwrap()
+        .save(&serde_json::from_value(checkpoint).unwrap())
+        .unwrap();
+
+    let result = cli(
+        workspace,
+        "http://127.0.0.1:1/v1",
+        &["--resume", "--run-id", &run.run_id],
+    );
+    succeeded(&result);
+    assert!(String::from_utf8_lossy(&result.stdout).contains("Verdict checkpoint."));
+    assert_eq!(reader.runs().unwrap()[0].phase, "Approved");
+}
+
+#[test]
 fn resume_does_not_replay_an_interrupted_tool() {
     let temp = tempfile::tempdir().unwrap();
     let (endpoint, server) = mock(|index, _| match index {

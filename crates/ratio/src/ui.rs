@@ -352,6 +352,7 @@ impl Ui {
         let controls = crate::control::serve(
             listener,
             &run_id,
+            false,
             self.control.clone(),
             send.clone(),
             self.live.clone(),

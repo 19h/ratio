@@ -116,6 +116,8 @@ pub struct Session {
     #[serde(default)]
     pub(crate) onboarding: Option<WorkerOnboarding>,
     pub phase: Phase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) phase_result: Option<String>,
     pub cycle: usize,
     pub plan_attempt: usize,
     run_id: String,
@@ -506,6 +508,7 @@ impl Session {
             version: FORMAT,
             goal,
             phase: Phase::Plan,
+            phase_result: None,
             cycle: 1,
             plan_attempt: 1,
             run_id: format!(
@@ -558,6 +561,20 @@ impl Drop for Store {
 }
 
 impl Store {
+    pub fn has_live_writer(workspace: &Path) -> Result<bool> {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(workspace.join(".ratio/session.lock"))?;
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => Ok(false),
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                Ok(true)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn record_control(&self, run: &str, action: &str, detail: &str) -> Result<()> {
         Ok(self
             .journal

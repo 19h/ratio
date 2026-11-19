@@ -2,12 +2,16 @@ use std::{
     collections::{BTreeMap, VecDeque},
     ffi::OsString,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
+use clap::Parser;
 use http_body_util::{BodyExt, Full, Limited, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{
     Method, Request, Response, StatusCode,
@@ -18,8 +22,16 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use ra::control;
-use ratio_engine::{RunReader, audit::AuditFilter, session::Store};
-use ratio_protocol::{ControlAction, ControlRequest};
+use ratio_engine::{
+    RunReader,
+    api::Api,
+    audit::AuditFilter,
+    budget::Budget,
+    config::{Cli, Config},
+    events::Reporter,
+    session::Store,
+};
+use ratio_protocol::{ControlAction, ControlReply, ControlRequest};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
@@ -62,6 +74,7 @@ struct Dashboard {
     host: String,
     authorization: String,
     actions: Mutex<VecDeque<(String, Value)>>,
+    runner_pid: AtomicU32,
 }
 
 pub async fn serve(workspace: PathBuf, port: u16) -> Result<u8> {
@@ -81,6 +94,7 @@ pub async fn serve(workspace: PathBuf, port: u16) -> Result<u8> {
         host,
         authorization: format!("Bearer {token}"),
         actions: Mutex::new(VecDeque::new()),
+        runner_pid: AtomicU32::new(0),
     });
     let capacity = Arc::new(Semaphore::new(48));
     loop {
@@ -495,7 +509,8 @@ impl Dashboard {
             .map(str::trim)
             .filter(|text| !text.is_empty());
         let receipt = match action.action.as_str() {
-            "start" | "resume_saved" | "fork" => {
+            "start" | "resume" | "resume_saved" | "fork" => {
+                let resume = matches!(action.action.as_str(), "resume" | "resume_saved");
                 let active = control::request_control(
                     &self.workspace,
                     &ControlRequest {
@@ -505,40 +520,53 @@ impl Dashboard {
                     },
                 )
                 .await
-                .ok();
-                ensure!(
-                    !active.is_some_and(|reply| reply.accepted),
-                    "This workspace already has an active run"
-                );
+                .ok()
+                .filter(|reply| reply.accepted);
+                if let Some(active) = &active {
+                    ensure!(
+                        resume && Some(active.run_id.as_str()) == run,
+                        "This workspace already has an active run"
+                    );
+                }
                 let mut args = self.launch_args.clone();
+                args.push("--dashboard-managed".into());
                 if action.action != "start" {
                     let run = run.context("Choose a saved run")?;
-                    ensure!(
-                        Store::reader(&self.workspace)?.run(run)?.is_some(),
-                        "Run not found"
-                    );
+                    let record = Store::reader(&self.workspace)?
+                        .run(run)?
+                        .context("Run not found")?;
                     if action.action == "fork" {
                         args.extend(["--fork".into(), run.into()]);
                     } else {
+                        ensure!(
+                            !matches!(record.phase.as_str(), "Approved" | "Rejected" | "Exhausted"),
+                            "This run has already finished"
+                        );
                         args.extend(["--resume".into(), "--run-id".into(), run.into()]);
                     }
                 } else {
                     ensure!(note.is_some(), "Enter a request to start a run");
                 }
                 if let Some(note) = note {
-                    ensure!(
-                        note.len() <= 65_536 && action.action != "resume_saved",
-                        "Invalid run request"
-                    );
+                    ensure!(note.len() <= 65_536 && !resume, "Invalid run request");
                     args.push("--goal-stdin".into());
                 }
-                let (reply, log) = control::launch_with_args(&self.workspace, args, note).await?;
-                json!({"accepted":true, "run_id":reply.map(|reply| reply.run_id), "detail":"Runner launched", "log":log.file_name()})
+                let reload = active.as_ref().is_some_and(|runner| {
+                    runner.paused
+                        && runner.dashboard_managed
+                        && self.runner_pid.load(Ordering::Relaxed) != runner.pid
+                });
+                if active.is_some() && !reload {
+                    let run = run.context("Choose a run")?;
+                    serde_json::to_value(self.control(run, ControlAction::Resume, None).await?)?
+                } else {
+                    self.launch(args, note, run.filter(|_| resume), reload)
+                        .await?
+                }
             }
             command => {
                 let command = match command {
                     "pause" => ControlAction::Pause,
-                    "resume" => ControlAction::Resume,
                     "stop" => ControlAction::Cancel,
                     "guide" => ControlAction::Guide,
                     "triage" => ControlAction::Triage,
@@ -547,17 +575,7 @@ impl Dashboard {
                     _ => anyhow::bail!("Unknown action"),
                 };
                 let run = run.context("Choose a run")?;
-                let reply = control::request_control(
-                    &self.workspace,
-                    &ControlRequest {
-                        action: command,
-                        guidance: note.map(str::to_owned),
-                        run_id: Some(run.into()),
-                    },
-                )
-                .await?;
-                ensure!(reply.accepted && reply.run_id == run, "{}", reply.detail);
-                serde_json::to_value(reply)?
+                serde_json::to_value(self.control(run, command, note).await?)?
             }
         };
         actions.push_back((action.id, receipt.clone()));
@@ -565,6 +583,76 @@ impl Dashboard {
             actions.pop_front();
         }
         Ok(receipt)
+    }
+
+    async fn control(
+        &self,
+        run: &str,
+        action: ControlAction,
+        text: Option<&str>,
+    ) -> Result<ControlReply> {
+        let reply = control::request_control(
+            &self.workspace,
+            &ControlRequest {
+                action,
+                guidance: text.map(str::to_owned),
+                run_id: Some(run.into()),
+            },
+        )
+        .await?;
+        ensure!(reply.accepted && reply.run_id == run, "{}", reply.detail);
+        Ok(reply)
+    }
+
+    async fn launch(
+        &self,
+        args: Vec<OsString>,
+        note: Option<&str>,
+        resume: Option<&str>,
+        reload: bool,
+    ) -> Result<Value> {
+        if let Some(run) = resume {
+            let cli = Cli::try_parse_from(
+                std::iter::once(OsString::from("ra"))
+                    .chain(args.iter().cloned())
+                    .chain(std::iter::once(OsString::from("--managed-run"))),
+            )?;
+            let config = Config::load(cli)?;
+            ensure!(
+                config.cwd == self.workspace,
+                "The updated profile selects a different workspace. Reopen the dashboard for this workspace."
+            );
+            if reload {
+                Api::new(&config, Reporter::Silent, Budget::new(&config))?;
+                self.control(run, ControlAction::CheckpointAndExit, None)
+                    .await?;
+                tokio::time::timeout(
+                    Duration::from_secs(
+                        config.orchestration.command_timeout_secs.saturating_add(10),
+                    ),
+                    async {
+                        while Store::has_live_writer(&self.workspace)? {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    },
+                )
+                .await
+                .context("The paused runner has not reached its restart checkpoint")??;
+            }
+        }
+        let (reply, log) = control::launch_with_args(&self.workspace, args, note).await?;
+        self.runner_pid.store(
+            reply.as_ref().map_or(0, |reply| reply.pid),
+            Ordering::Relaxed,
+        );
+        let run_id = reply.as_ref().map(|reply| reply.run_id.as_str()).or(resume);
+        let detail = if resume.is_some() {
+            "Run resumed with current configuration"
+        } else {
+            "Runner launched"
+        };
+        Ok(json!({"accepted":true, "run_id":run_id, "detail":detail, "log":log.file_name()}))
     }
 }
 

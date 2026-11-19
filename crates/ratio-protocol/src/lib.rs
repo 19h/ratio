@@ -172,6 +172,7 @@ pub enum ControlAction {
     Status,
     Pause,
     Resume,
+    CheckpointAndExit,
     Cancel,
     Guide,
     AddWorker,
@@ -195,6 +196,8 @@ pub struct ControlReply {
     pub paused: bool,
     pub accepted: bool,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dashboard_managed: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generations: Vec<LiveGeneration>,
 }

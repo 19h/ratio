@@ -112,6 +112,8 @@ pub struct Cli {
     pub detached: bool,
     #[arg(long, hide = true, conflicts_with = "detached")]
     pub managed_run: bool,
+    #[arg(long, hide = true, requires = "managed_run")]
+    pub dashboard_managed: bool,
     /// Control the active foreground headless or detached run.
     #[arg(long, value_enum, conflicts_with_all = ["events", "list_runs", "resume", "goal"])]
     pub control: Option<ControlOperation>,

@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::Stdio,
@@ -44,15 +44,37 @@ type ConnectionKey = (String, String, PathBuf);
 type ConnectionSlot = Rc<tokio::sync::Mutex<Option<Client>>>;
 
 #[derive(Default)]
-pub(crate) struct Connections(RefCell<BTreeMap<ConnectionKey, ConnectionSlot>>);
+pub(crate) struct Connections {
+    clients: RefCell<BTreeMap<ConnectionKey, ConnectionSlot>>,
+    refreshed: Option<RefCell<BTreeMap<ConnectionKey, BTreeMap<String, bool>>>>,
+}
 
 impl Connections {
+    pub(crate) fn new(resumed: bool) -> Self {
+        Self {
+            refreshed: resumed.then(RefCell::default),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn clear(&self) {
-        self.0.borrow_mut().clear();
+        self.clients.borrow_mut().clear();
+    }
+
+    pub(crate) fn model_turn(&self, actor: &str, workspace: &Path) {
+        if let Some(refreshed) = &self.refreshed {
+            for ((_, owner, directory), tools) in refreshed.borrow_mut().iter_mut() {
+                if owner == actor && directory == workspace {
+                    for visible in tools.values_mut() {
+                        *visible = true;
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn close_worker(&self, actor: &str) {
-        self.0
+        self.clients
             .borrow_mut()
             .retain(|(_, owner, _), _| owner != actor);
     }
@@ -72,6 +94,7 @@ enum Operation<'a> {
     List {
         name: Option<&'a str>,
         offset: Option<usize>,
+        before_call: bool,
     },
 }
 
@@ -81,6 +104,8 @@ enum Output {
     Catalog {
         tools: BTreeMap<String, Value>,
         offset: Option<usize>,
+        named: bool,
+        before_call: bool,
     },
 }
 
@@ -151,20 +176,53 @@ pub(crate) async fn dispatch(
     key: Option<&str>,
 ) -> (String, String) {
     let same = |text: String| (text.clone(), text);
+    let call_started = Cell::new(false);
     let (visible, full) = match timeout(
         time_limit,
-        run(sessions, actor, servers, access, call, workspace),
+        run(
+            sessions,
+            actor,
+            servers,
+            access,
+            call,
+            workspace,
+            &call_started,
+        ),
     )
     .await
     {
-        Ok(Ok(Output::Response(value))) => same(format!("{OUTPUT_HEADER}{value}")),
-        Ok(Ok(Output::Catalog { tools, offset })) => {
+        Ok(Ok((_, Output::Response(value)))) => same(format!("{OUTPUT_HEADER}{value}")),
+        Ok(Ok((
+            key,
+            Output::Catalog {
+                tools,
+                offset,
+                named,
+                before_call,
+            },
+        ))) => {
+            let prefix = if before_call {
+                "REFUSED: MCP schema refreshed after restart. Review the current schema and retry if appropriate.\n"
+            } else {
+                OUTPUT_HEADER
+            };
             let full = offset.is_none().then(|| {
                 let listing = json!({"tools":tools.values().collect::<Vec<_>>()});
-                format!("{OUTPUT_HEADER}{listing}")
+                format!("{prefix}{listing}")
             });
             let visible = match &full {
-                Some(output) if output.len() <= output_limit => output.clone(),
+                Some(output) if output.len() <= output_limit => {
+                    if let Some(refreshed) = &sessions.refreshed {
+                        let mut refreshed = refreshed.borrow_mut();
+                        let known = refreshed.entry(key).or_default();
+                        for name in tools.keys() {
+                            known.entry(name.clone()).or_insert(false);
+                        }
+                    }
+                    output.clone()
+                }
+                Some(_) if before_call => "REFUSED: Current MCP schema exceeds the tool output budget. See the full schema in the tool audit.".into(),
+                Some(output) if named => output.clone(),
                 _ => format!(
                     "{OUTPUT_HEADER}{}",
                     catalog_page(&tools, offset.unwrap_or(0), output_limit)
@@ -176,7 +234,7 @@ pub(crate) async fn dispatch(
         Ok(Err(error)) if error.to_string().starts_with("REFUSED") => same(format!("{error:#}")),
         Ok(Err(error)) => {
             sessions
-                .0
+                .clients
                 .borrow_mut()
                 .retain(|(_, owner, path), _| owner != actor || path != workspace);
             if error.to_string().starts_with(UNKNOWN_CALL) {
@@ -187,10 +245,10 @@ pub(crate) async fn dispatch(
         }
         Err(_) => {
             sessions
-                .0
+                .clients
                 .borrow_mut()
                 .retain(|(_, owner, path), _| owner != actor || path != workspace);
-            if call.function.name == "mcp_call" {
+            if call_started.get() {
                 same(format!(
                     "{UNKNOWN_CALL}server timed out after possible dispatch"
                 ))
@@ -213,7 +271,8 @@ async fn run(
     access: Access,
     call: &ToolCall,
     workspace: &Path,
-) -> Result<Output> {
+    call_started: &Cell<bool>,
+) -> Result<(ConnectionKey, Output)> {
     ensure!(call.kind == "function", "unsupported tool call type");
     ensure!(
         call.function.arguments.len() <= 128 * 1024,
@@ -235,11 +294,24 @@ async fn run(
             "REFUSED: MCP tool {name:?} is blocked by the configured tool policy for this phase. Use mcp_list for available tools."
         );
     }
+    let key = (input.server.clone(), actor.into(), workspace.to_owned());
     let operation = if call.function.name == "mcp_call" {
-        Operation::Call(
-            input.name.as_deref().context("mcp_call requires name")?,
-            &input.arguments,
-        )
+        let name = input.name.as_deref().context("mcp_call requires name")?;
+        if sessions.refreshed.as_ref().is_some_and(|refreshed| {
+            refreshed
+                .borrow()
+                .get(&key)
+                .and_then(|tools| tools.get(name))
+                != Some(&true)
+        }) {
+            Operation::List {
+                name: Some(name),
+                offset: None,
+                before_call: true,
+            }
+        } else {
+            Operation::Call(name, &input.arguments)
+        }
     } else {
         ensure!(
             input.name.is_none() || input.offset.is_none(),
@@ -248,13 +320,14 @@ async fn run(
         Operation::List {
             name: input.name.as_deref(),
             offset: input.offset,
+            before_call: false,
         }
     };
-    if server.lifetime == McpLifetime::Worker {
+    let result = if server.lifetime == McpLifetime::Worker {
         let slot = sessions
-            .0
+            .clients
             .borrow_mut()
-            .entry((input.server.clone(), actor.into(), workspace.to_owned()))
+            .entry(key.clone())
             .or_default()
             .clone();
         let mut connection = slot.lock().await;
@@ -266,12 +339,14 @@ async fn run(
             server,
             access,
             operation,
+            call_started,
         )
         .await
     } else {
         let mut client = Client::open(server, workspace).await?;
-        invoke(&mut client, server, access, operation).await
-    }
+        invoke(&mut client, server, access, operation, call_started).await
+    }?;
+    Ok((key, result))
 }
 
 async fn invoke(
@@ -279,9 +354,11 @@ async fn invoke(
     server: &McpServer,
     access: Access,
     operation: Operation<'_>,
+    call_started: &Cell<bool>,
 ) -> Result<Output> {
     match operation {
         Operation::Call(name, arguments) => {
+            call_started.set(true);
             let result = client
                 .rpc("tools/call", json!({"name":name,"arguments":arguments}))
                 .await;
@@ -295,19 +372,24 @@ async fn invoke(
             }
             result.map(Output::Response)
         }
-        Operation::List { name, offset } => {
-            let mut catalog = discover(client, server, access, name).await?;
+        Operation::List {
+            name,
+            offset,
+            before_call,
+        } => {
+            let tools = discover(client, server, access, name).await?;
             if let Some(name) = name {
-                let entry = catalog
-                    .remove(name)
-                    .with_context(|| format!("MCP tool {name:?} was not advertised"))?;
-                Ok(Output::Response(json!({"tools":[entry]})))
-            } else {
-                Ok(Output::Catalog {
-                    tools: catalog,
-                    offset,
-                })
+                ensure!(
+                    tools.contains_key(name),
+                    "MCP tool {name:?} was not advertised"
+                );
             }
+            Ok(Output::Catalog {
+                tools,
+                offset,
+                named: name.is_some(),
+                before_call,
+            })
         }
     }
 }
@@ -603,6 +685,7 @@ mod tests {
             Access::Inspect,
             &call("mcp_call", json!({"server":"fixture","name":"unlisted"})),
             directory.path(),
+            &Cell::new(false),
         )
         .await
         .unwrap_err();
@@ -648,13 +731,14 @@ mod tests {
             },
         };
         for (actor, expected) in [("worker_1", 2), ("worker_1", 3), ("worker_2", 2)] {
-            let Output::Response(result) = run(
+            let (_, Output::Response(result)) = run(
                 &sessions,
                 actor,
                 &servers,
                 Access::Inspect,
                 &call,
                 directory.path(),
+                &Cell::new(false),
             )
             .await
             .unwrap() else {
@@ -663,13 +747,14 @@ mod tests {
             assert_eq!(result["count"], expected);
         }
         sessions.clear();
-        let Output::Response(result) = run(
+        let (_, Output::Response(result)) = run(
             &sessions,
             "worker_1",
             &servers,
             Access::Inspect,
             &call,
             directory.path(),
+            &Cell::new(false),
         )
         .await
         .unwrap() else {

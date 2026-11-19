@@ -826,7 +826,7 @@ let actionState;
 const descriptions = {
   start: ["Start a run", "Describe the outcome and constraints. Ratio will propose a roster and start the run.", "Request", true],
   fork: ["Fork this run", "Start a new run with this roster. Leave the request empty to keep the original goal.", "Replacement request", false],
-  resume_saved: ["Resume saved run", "Continue from the latest committed checkpoint.", "", false],
+  resume_saved: ["Resume saved run", "Continue from the latest committed checkpoint with the current runner configuration.", "", false],
   add_worker: ["Request a worker", "Describe the role and scope. Writes remain gated until unanimous acknowledgement.", "Assignment and proposed scope", true],
   triage: ["Submit information", "The lead reviewer will classify and route this item automatically.", "Information", true],
   stop: ["Stop this run", "Cancel active work and retain the last checkpoint.", "", false],

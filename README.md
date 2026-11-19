@@ -251,7 +251,7 @@ ra -C PROJECT --web
 ra -C PROJECT --config ratio.toml --web --web-port 7350
 ```
 
-Open the private URL printed by Ratio. The dashboard binds to `127.0.0.1` and chooses a free port by default. It uses the provider configuration and CLI overrides supplied at startup. Use **Start run** to enter a request, or select a run from the workspace history. Live controls let you pause, resume, and stop a run. Saved runs can be resumed from their latest checkpoint or forked into a new run. Closing the dashboard leaves its managed runner active.
+Open the private URL printed by Ratio. The dashboard binds to `127.0.0.1` and chooses a free port by default. Use **Start run** to enter a request, or select a run from workspace history. Closing the dashboard leaves its runner active. To apply configuration changes, pause the run, restart the dashboard using the profile you want, open the same run, and click **Resume**. Ratio lets the paused dashboard runner exit at a checkpoint before launching its replacement. If the runner has already exited, click **Resume saved**. Both paths keep the run ID, roster, work plan, and committed conversations while loading the current profile and CLI overrides.
 
 | View | Use it to |
 | --- | --- |
@@ -326,6 +326,8 @@ During execution under a frozen worker plan, Ratio can queue one additional-work
 ```
 
 The SQLite WAL journal at `.ratio/runs.sqlite3` stores run state, IPC, tool outcomes, and budgets. An interrupted workspace tool is recorded as having an unknown outcome and requires inspection before relying on its effects. Interrupted IPC, memory, and acknowledgement operations can resume from their checkpoints. Ratio can import legacy format-2 JSON checkpoints and still maintains a format-2 mirror. Keep `.ratio/` private and outside version control because it contains transcripts and workspace data.
+
+Each resumed model request uses the current native tool schemas and access settings. For example, an updated `allow_inspection_shell` takes effect in inspection. For MCP, Ratio opens fresh connections and uses the current server policy. Agents can fetch live schemas with `mcp_list`. If an agent tries a tool before seeing its current schema, Ratio returns the schema and asks the agent to reconsider the call. Service-side handles that lived only in the previous connection may need to be reopened.
 
 ## Context, limits, and automation
 

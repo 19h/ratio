@@ -263,3 +263,174 @@ tools = ["inspect"]
     await rm(dir,{recursive:true,force:true});
   }
 });
+
+test("resume after restarting the dashboard preserves the run and refreshes tools", { timeout: 60_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ratio-restart-"));
+  const profile = join(dir, "ratio.toml");
+  const dashboards = [];
+  let browser;
+  let activeRun;
+  let updated = false;
+  let attempts = 0;
+  let beforeRestart;
+  const ready = new Promise(resolve => { beforeRestart = resolve; });
+  const failures = [];
+  const provider = createServer(async (request, response) => {
+    try {
+      const body = [];
+      for await (const part of request) body.push(part);
+      const input = JSON.parse(Buffer.concat(body));
+      const functions = new Set(input.tools.map(tool => tool.function.name));
+      const history = input.messages.filter(message => message.role === "tool");
+      const result = id => history.find(message => message.tool_call_id === id)?.content;
+      let output;
+      if (!updated) {
+        assert.equal(functions.has("shell"), false);
+        if (result("old-schema")) {
+          assert.match(result("old-schema"), /old_subject/);
+          beforeRestart();
+          return;
+        }
+        output = completion("Initial inspection.", call("mcp_list", {
+          server: "fixture", name: "inspect",
+        }, "old-schema"));
+      } else if (functions.has("submit_verdict")) {
+        output = completion(null, call("submit_verdict", { verdict: "approved", assessment: "Restart verified" }));
+      } else if (input.messages[0].content.startsWith("You are the worker")) {
+        output = completion("Work checked.");
+      } else {
+        assert.equal(functions.has("shell"), true);
+        assert.match(input.messages[0].content, /Runner resumed/);
+        assert.match(input.messages[0].content, /Current fixture instructions/);
+        assert.match(result("old-schema"), /old_subject/);
+        assert.equal(input.model, "updated-model");
+        attempts++;
+        if (!result("stale-one")) {
+          const args = { server: "fixture", name: "inspect", arguments: { old_subject: "stale" } };
+          output = completion(null, call("mcp_call", args, "stale-one"), call("mcp_call", args, "stale-two"));
+        } else if (!result("current")) {
+          for (const id of ["stale-one", "stale-two"]) {
+            assert.match(result(id), /^REFUSED: MCP schema refreshed after restart/);
+            assert.match(result(id), /new_subject/);
+          }
+          output = completion(null,
+            call("mcp_call", { server: "fixture", name: "inspect", arguments: { new_subject: "current" } }, "current"),
+            call("shell", { command: "echo inspection-after-restart" }, "shell-after-restart"));
+        } else {
+          assert.match(result("current"), /accepted-current-subject/);
+          assert.match(result("shell-after-restart"), /inspection-after-restart/);
+          output = completion("Continue the original run.");
+        }
+      }
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify(output));
+    } catch (error) {
+      failures.push(error);
+      response.statusCode = 400;
+      response.end(String(error));
+    }
+  });
+  provider.listen(0, "127.0.0.1");
+  await once(provider, "listening");
+
+  const writeProfile = async () => {
+    const field = updated ? "new_subject" : "old_subject";
+    const server = `
+const readline = require("node:readline");
+readline.createInterface({input:process.stdin}).on("line",line=>{
+  const request=JSON.parse(line);
+  if(request.id===undefined)return;
+  const result=request.method==="initialize"?
+    {protocolVersion:"2025-11-25",capabilities:{tools:{}}}:
+    request.method==="tools/list"?
+      {tools:[{name:"inspect",inputSchema:{type:"object",required:["${field}"]}}]}:
+      {content:[{type:"text",text:request.params.arguments.new_subject==="current"?
+        "accepted-current-subject":"unexpected-stale-dispatch"}]};
+  process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:request.id,result})+"\\n");
+});
+`;
+    await writeFile(profile, `endpoint = "http://127.0.0.1:${provider.address().port}/v1"
+model = "${updated ? "updated-model" : "original-model"}"
+context_window = 8192
+output_tokens = 256
+[orchestration]
+allow_inspection_shell = ${updated}
+[mcp_servers.fixture]
+command = ${JSON.stringify(process.execPath)}
+args = ["-e", ${JSON.stringify(server)}]
+tools = ["inspect"]
+inspection_tools = ["inspect"]
+instructions = "${updated ? "Current" : "Initial"} fixture instructions."
+`);
+  };
+  const launch = async () => {
+    const child = spawn(bin, ["-C", dir, "--config", profile, "--fixed-team", "--web"],
+      { stdio: ["ignore", "pipe", "pipe"] });
+    dashboards.push(child);
+    let errors = "";
+    child.stderr.on("data", data => { errors += data; });
+    const lines = createInterface({ input: child.stdout });
+    const [address] = await Promise.race([once(lines, "line"), once(child, "exit").then(() => {
+      throw new Error("Dashboard did not start: " + errors);
+    })]);
+    return new URL(address);
+  };
+  const api = async (url, path, body) => {
+    const authorization = "Bearer " + new URLSearchParams(url.hash.slice(1)).get("access");
+    const response = await fetch(new URL(path, url), {
+      method: body ? "POST" : "GET",
+      headers: { Authorization: authorization, Origin: url.origin, "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const json = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(json));
+    return json;
+  };
+  try {
+    await writeProfile();
+    const first = await launch();
+    const launched = await api(first, "/api/action", { id: "start", action: "start", text: "Inspect a fixture" });
+    activeRun = launched.run_id;
+    assert.ok(activeRun);
+    await ready;
+    const previous = await api(first, `/api/run/${activeRun}/live`);
+    await api(first, "/api/action", { id: "pause", action: "pause", run: activeRun });
+    const exited = once(dashboards[0], "exit");
+    dashboards[0].kill();
+    await exited;
+    updated = true;
+    await writeProfile();
+    const second = await launch();
+    const paused = await api(second, `/api/run/${activeRun}/live`);
+    assert.equal(paused.paused, true);
+    assert.equal(paused.pid, previous.pid);
+    browser = await chromium.launch();
+    const page = await browser.newPage();
+    page.setDefaultTimeout(10_000);
+    const target = new URL(`/run/${activeRun}/overview`, second);
+    target.hash = second.hash;
+    await page.goto(target.href);
+    await page.locator("#controls").getByRole("button", { name: "Resume", exact: true }).click();
+    await page.getByText("Restart verified", { exact: false }).first().waitFor();
+    assert.equal(new URL(page.url()).pathname.split("/")[2], activeRun);
+    assert.deepEqual(failures, []);
+    assert.equal(attempts, 3);
+    const runs = await api(second, "/api/runs");
+    assert.deepEqual(runs.runs.map(run => [run.run_id, run.phase]), [[activeRun, "Approved"]]);
+  } finally {
+    if (browser) await browser.close();
+    for (const child of dashboards) {
+      if (child.exitCode !== null || child.signalCode !== null) continue;
+      const exited = once(child, "exit");
+      child.kill();
+      await exited;
+    }
+    if (activeRun) {
+      const cancel = spawn(bin, ["-C", dir, "--control", "cancel"], { stdio: "ignore" });
+      await once(cancel, "exit");
+    }
+    provider.closeAllConnections();
+    await new Promise(resolve => provider.close(resolve));
+    await rm(dir, { recursive: true, force: true });
+  }
+});

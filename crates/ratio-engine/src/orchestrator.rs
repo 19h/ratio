@@ -47,7 +47,7 @@ impl<'a> Orchestrator<'a> {
             store,
             reporter,
             budget,
-            mcp: Default::default(),
+            mcp: crate::tools::mcp::Connections::new(config.resume),
         })
     }
 
@@ -111,6 +111,13 @@ impl<'a> Orchestrator<'a> {
         };
         self.mcp.clear();
         self.budget.save()?;
+        if outcome
+            .as_ref()
+            .is_err_and(|error| error.is::<crate::events::CheckpointExit>())
+        {
+            self.store.mark_stopped(&run_id, RunStop::Interrupted)?;
+            return outcome;
+        }
         if let (Err(_), Some(limit)) = (&outcome, self.budget.exhaustion()) {
             let mut saved = self.store.load_run(Some(&run_id))?;
             if saved.phase == Phase::Publish {
@@ -176,7 +183,6 @@ impl<'a> Orchestrator<'a> {
                 "proposal",
                 &self.api.redact(&proposal_text),
             );
-            self.store.save(&session)?;
             session.phase = Phase::Plan;
             self.store.save(&session)?;
             self.reporter.emit(
@@ -236,17 +242,18 @@ impl<'a> Orchestrator<'a> {
                 format!("Cycle {} / {}", session.cycle, phase.label()),
                 "",
             );
-            let response = match phase {
-                Phase::Coordinate => {
+            let response = match (session.phase_result.clone(), phase) {
+                (Some(response), _) => response,
+                (None, Phase::Coordinate) => {
                     self.receive_guidance(&mut session, guidance.as_ref())?;
                     self.worker_team(&mut session, None, staging, workspace)
                         .await?
                 }
-                Phase::Acknowledge => {
+                (None, Phase::Acknowledge) => {
                     self.worker_team(&mut session, None, staging, workspace)
                         .await?
                 }
-                Phase::Work
+                (None, Phase::Work)
                     if session
                         .workers
                         .as_ref()
@@ -260,7 +267,7 @@ impl<'a> Orchestrator<'a> {
                     self.worker_team(&mut session, guidance.as_ref(), staging, workspace)
                         .await?
                 }
-                Phase::PlanConsult | Phase::ReviewConsult => {
+                (None, Phase::PlanConsult | Phase::ReviewConsult) => {
                     self.receive_guidance(&mut session, guidance.as_ref())?;
                     self.consult(&mut session, workspace).await?
                 }
@@ -288,8 +295,9 @@ impl<'a> Orchestrator<'a> {
                     }
                     loop {
                         if session.dialogue.pending()?.is_none() {
-                            self.api.wait_for_generation().await?;
+                            let ready = self.api.wait_for_generation().await;
                             self.receive_guidance(&mut session, guidance.as_ref())?;
+                            ready?;
                             let actor = if phase == Phase::Work {
                                 "worker_1"
                             } else {
@@ -345,7 +353,6 @@ impl<'a> Orchestrator<'a> {
                             Step::Verdict(verdict, call_id) => {
                                 session.verdict = Some(verdict);
                                 session.verdict_tool_call_id = Some(call_id);
-                                self.store.save(&session)?;
                                 break session
                                     .verdict
                                     .as_ref()
@@ -367,7 +374,6 @@ impl<'a> Orchestrator<'a> {
                                 );
                                 session.worker_plan =
                                     Some(frozen.bind_graph(plan.graph, session.cycle, workers));
-                                self.store.save(&session)?;
                                 break session
                                     .worker_plan
                                     .as_ref()
@@ -420,7 +426,6 @@ impl<'a> Orchestrator<'a> {
                                 self.store.save(&session)?;
                             }
                             Step::Finished(text) => {
-                                self.store.save(&session)?;
                                 if !self.receive_guidance(&mut session, guidance.as_ref())? {
                                     break text;
                                 }
@@ -435,6 +440,9 @@ impl<'a> Orchestrator<'a> {
             if phase == Phase::Work {
                 self.mcp.clear();
                 session.work_intake_closed = true;
+            }
+            if session.phase_result.is_none() {
+                session.phase_result = Some(response.clone());
                 self.store.save(&session)?;
             }
             let response = if phase == Phase::Work {
@@ -878,6 +886,15 @@ impl<'a> Orchestrator<'a> {
         } else {
             crate::tools::mcp::with_instructions(system, servers, access)
         };
+        if self.config.resume
+            && schemas
+                .iter()
+                .any(|schema| schema["function"]["name"] == "mcp_list")
+        {
+            system.to_mut().push_str(
+                "\nRunner resumed. Fetch current MCP schemas with mcp_list. Reopen external session handles as needed.",
+            );
+        }
         if !peer.repairing && matches!(access, Access::Inspect) && tools.allow_inspection_shell {
             system.to_mut().push_str(
                 "\nUse shell to inspect or verify. Preserve workspace files during inspection.",
@@ -926,6 +943,7 @@ impl<'a> Orchestrator<'a> {
             let prefix = dialogue.prefix(&system);
             let messages = dialogue.messages(&prefix);
             let projected = estimate(&messages, &schemas);
+            self.mcp.model_turn(peer.author, peer.workspace);
             let completion = match self
                 .api
                 .complete_as(
@@ -1234,9 +1252,12 @@ impl<'a> Orchestrator<'a> {
     ) -> Result<()> {
         let limit = mailbox.inbox_bytes();
         loop {
-            if panel.iter().any(|agent| agent.assessment.is_none()) || mailbox.has_pending() {
-                self.api.wait_for_generation().await?;
-            }
+            let ready =
+                if panel.iter().any(|agent| agent.assessment.is_none()) || mailbox.has_pending() {
+                    self.api.wait_for_generation().await
+                } else {
+                    Ok(())
+                };
             if let Some(note) = read_guidance(options.guidance) {
                 let workers = options.stakeholder_start.unwrap_or(panel.len());
                 for agent in &mut panel[..workers] {
@@ -1246,6 +1267,18 @@ impl<'a> Orchestrator<'a> {
                 self.progress("[steer] Added user guidance to the worker team");
                 checkpoint(&panel.iter().map(PanelAgent::snapshot).collect::<Vec<_>>())?;
             }
+            if ready
+                .as_ref()
+                .is_err_and(|error| error.is::<crate::events::CheckpointExit>())
+            {
+                // The previous wave settled. Any remaining marked call was queued
+                // for dispatch in a subsequent wave, so it can still run on resume.
+                for agent in panel.iter_mut() {
+                    agent.dialogue.in_flight = false;
+                }
+                checkpoint(&panel.iter().map(PanelAgent::snapshot).collect::<Vec<_>>())?;
+            }
+            ready?;
             if let Some(run) = options.triage_run.filter(|_| {
                 panel.iter().all(|agent| {
                     agent
@@ -2087,6 +2120,7 @@ impl<'a> Orchestrator<'a> {
             _ => unreachable!("completed phase cannot advance"),
         };
         session.phase = phase;
+        session.phase_result = None;
         session.dialogue = Dialogue::start(if phase.done() { String::new() } else { task });
     }
 

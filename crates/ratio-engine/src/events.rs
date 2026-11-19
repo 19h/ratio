@@ -62,7 +62,12 @@ impl LiveGenerations {
 pub struct GenerationControl {
     pub paused: bool,
     pub epoch: u64,
+    pub checkpoint_and_exit: bool,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("runner stopped at a checkpoint for restart")]
+pub struct CheckpointExit;
 
 pub struct AgentNode {
     pub id: String,
