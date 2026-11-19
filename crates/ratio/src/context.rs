@@ -19,6 +19,7 @@ pub struct Dialogue {
     pub tool_rounds: usize,
     /// Saved before starting a tool with side effects.
     pub in_flight: bool,
+    /// Hint for the compaction target. The request's input ceiling is set separately.
     pub estimated_budget: Option<usize>,
 }
 

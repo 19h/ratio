@@ -458,20 +458,21 @@ impl<'a> Orchestrator<'a> {
             schemas.push(plan_schema());
         }
         let window_budget = self.config.context_window - self.config.output_tokens;
-        let mut budget = dialogue
-            .estimated_budget
-            .unwrap_or(window_budget)
-            .min(window_budget);
+        let mut hard_limit = window_budget;
         let mut retries = 0;
         let mut length_repaired = false;
         loop {
+            let target = dialogue
+                .estimated_budget
+                .unwrap_or(window_budget)
+                .min(hard_limit);
             let compact = Compact {
                 api: &self.api,
                 model,
                 system,
                 tools: &schemas,
-                input_budget: budget - budget / 10,
-                hard_limit: budget,
+                input_budget: target - target / 10,
+                hard_limit,
                 output_tokens: self.config.output_tokens,
             };
             let compacted = compact
@@ -492,9 +493,10 @@ impl<'a> Orchestrator<'a> {
                 Ok(completion) => completion,
                 Err(ApiError::Context { .. }) if retries < 4 => {
                     retries += 1;
-                    budget = (projected * 3 / 4).min(budget - 1);
-                    dialogue.estimated_budget = Some(budget);
-                    self.progress(&format!("[context] Provider rejected the prompt. Retrying with a {budget}-token estimated input budget"));
+                    hard_limit =
+                        (projected.saturating_mul(3) / 4).min(hard_limit.saturating_sub(1));
+                    dialogue.estimated_budget = Some(target.min(hard_limit));
+                    self.progress(&format!("[context] Provider rejected the prompt. Retrying with a {hard_limit}-token estimated input ceiling"));
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -504,7 +506,7 @@ impl<'a> Orchestrator<'a> {
                 .filter(|actual| *actual > projected)
             {
                 let calibrated = window_budget.saturating_mul(projected) / actual;
-                dialogue.estimated_budget = Some(budget.min(calibrated));
+                dialogue.estimated_budget = Some(hard_limit.min(calibrated));
             }
             let Message::Assistant {
                 ref content,

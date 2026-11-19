@@ -563,6 +563,41 @@ fn resume_does_not_replay_an_interrupted_tool() {
 }
 
 #[test]
+fn reported_usage_adjusts_compaction_without_blocking_the_next_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let (endpoint, server) = mock(move |_, request| {
+        let messages = request["messages"].as_array().unwrap();
+        let system = messages[0]["content"].as_str().unwrap();
+        if system.contains("You are the worker") {
+            if let Some(last) = messages.last().filter(|last| last["role"] == "tool") {
+                assert_eq!(last["tool_call_id"], "inspect");
+                return text("Inspected the workspace.");
+            }
+            let (status, mut response) = calls(&[tool("inspect", "git_status", json!({}))]);
+            // The provider accepts the request and uses more tokens than Ratio projected.
+            response["usage"] = json!({"prompt_tokens": 2800, "completion_tokens": 5});
+            return (status, response);
+        }
+        if messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Inspect the resulting")
+        {
+            decision("approved", "Verified.")
+        } else {
+            text("Inspect the workspace status.")
+        }
+    });
+    let run = cli(
+        temp.path(),
+        &endpoint,
+        &["--goal", "test usage calibration"],
+    );
+    succeeded(&run);
+    server.join().unwrap();
+}
+
+#[test]
 fn provider_context_limit_retries_with_compacted_history() {
     let temp = tempfile::tempdir().unwrap();
     let mut worker_requests = 0;
