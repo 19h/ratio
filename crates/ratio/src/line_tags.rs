@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 
 pub fn lines(text: &str) -> impl Iterator<Item = &str> {
     text.split_terminator('\n')
@@ -92,6 +92,7 @@ pub fn apply(
     path: &str,
     original: &str,
     edits: &BTreeMap<String, Option<String>>,
+    line_hints: &BTreeMap<String, usize>,
 ) -> Result<(String, usize)> {
     ensure!(
         !edits.is_empty(),
@@ -104,26 +105,65 @@ pub fn apply(
         .enumerate()
         .map(|(i, tag)| (tag.as_str(), i))
         .collect::<HashMap<_, _>>();
-    let index = |tag: &str| {
-        indices
-            .get(tag)
-            .copied()
-            .with_context(|| format!("stale or unknown line tag {tag:?}. Re-read affected lines"))
+    let index = |tag: &str, key: &str, other: Option<&str>| {
+        if let Some(&index) = indices.get(tag) {
+            return Ok(index);
+        }
+        let mut error = format!("stale or unknown line tag {tag:?} in edit {key:?}.");
+        let base_tag = tag.split('-').next().unwrap_or(tag);
+        let matches = tags
+            .iter()
+            .enumerate()
+            .filter(|(_, current)| current.split('-').next() == Some(base_tag))
+            .take(3)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let hint = line_hints.get(tag).or_else(|| line_hints.get(key)).copied();
+        let nearby = hint
+            .filter(|&line| (1..=lines.len()).contains(&line))
+            .map(|line| line - 1)
+            .or_else(|| other.and_then(|other| indices.get(other).copied()))
+            .or_else(|| (lines.len() == 1).then_some(0));
+        if !matches.is_empty() {
+            error.push_str(" Current lines with the same content hash (untrusted):");
+            for index in matches {
+                append_current_line(&mut error, index, &tags, &lines);
+            }
+        } else if let Some(nearby) = nearby {
+            error.push_str(
+                " Current lines near the supplied position or surviving anchor (untrusted):",
+            );
+            for index in nearby.saturating_sub(1)..(nearby + 2).min(lines.len()) {
+                append_current_line(&mut error, index, &tags, &lines);
+            }
+        } else if lines.is_empty() {
+            error.push_str(" The file is now empty.");
+        } else {
+            error.push_str(" The hash does not identify a current line.");
+            if let Some(line) = hint {
+                error.push_str(&format!(
+                    " Previous line {line} is outside the current {} lines.",
+                    lines.len()
+                ));
+            }
+        }
+        error.push_str("\nRe-read the affected range and use its current tags.");
+        Err(anyhow::anyhow!(error))
     };
     let mut plan = Vec::with_capacity(edits.len());
     for (key, text) in edits {
         let (first, last) = if let Some(tag) = key.strip_prefix('+') {
             ensure!(text.is_some(), "insertion requires text");
-            let at = index(tag)?;
+            let at = index(tag, key, None)?;
             (at, at)
         } else if let Some(tag) = key.strip_suffix('+') {
             ensure!(text.is_some(), "insertion requires text");
-            let at = index(tag)? + 1;
+            let at = index(tag, key, None)? + 1;
             (at, at)
         } else if let Some((from, to)) = key.split_once("..") {
-            (index(from)?, index(to)? + 1)
+            (index(from, key, Some(to))?, index(to, key, Some(from))? + 1)
         } else {
-            let at = index(key)?;
+            let at = index(key, key, None)?;
             (at, at + 1)
         };
         ensure!(
@@ -170,6 +210,18 @@ pub fn apply(
     Ok((updated, first_changed))
 }
 
+fn append_current_line(output: &mut String, index: usize, tags: &[String], lines: &[&str]) {
+    use std::fmt::Write;
+    let line = lines[index].strip_suffix('\r').unwrap_or(lines[index]);
+    let _ = write!(
+        output,
+        "\n{} {}|{}",
+        index + 1,
+        tags[index],
+        crate::context::clip(line, 160)
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,13 +240,33 @@ mod tests {
             (format!("+{}", tags[0]), Some("before".into())),
             (format!("{}+", tags[3]), Some("after".into())),
         ]);
-        let (updated, first) = apply(path, moved, &edits).unwrap();
+        let (updated, first) = apply(path, moved, &edits, &BTreeMap::new()).unwrap();
         assert_eq!(first, 2);
         assert_eq!(
             updated,
             "new head\r\nbefore\r\nhead\r\nreplacement\r\nsecond\r\ntail\r\nafter\r\n"
         );
-        assert!(apply(path, &updated, &edits).is_err());
+        assert!(apply(path, &updated, &edits, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn changed_text_uses_a_line_hint_without_authorizing_the_edit() {
+        let path = "sample";
+        let original = "first\nold\nlast\n";
+        let before = tags(path, &lines(original).collect::<Vec<_>>());
+        let edits = BTreeMap::from([(before[1].clone(), Some("replacement".into()))]);
+        let hints = BTreeMap::from([(before[1].clone(), 2)]);
+        let current = "first\nchanged\nlast\n";
+        let current_tags = tags(path, &lines(current).collect::<Vec<_>>());
+        let error = apply(path, current, &edits, &hints)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("2 {}|changed", current_tags[1])));
+        let error = apply(path, current, &edits, &BTreeMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not identify a current line"));
+        assert!(!error.contains("|changed"));
     }
 
     #[test]
@@ -207,7 +279,12 @@ mod tests {
             (tags[0].clone(), None),
             (tags[1].clone(), Some("updated".into())),
         ]);
-        assert!(apply(path, "other\nsame\n", &edits).is_err());
-        assert_eq!(apply(path, original, &edits).unwrap().0, "updated\nsame\n");
+        let error = apply(path, "other\nsame\n", &edits, &BTreeMap::new()).unwrap_err();
+        assert!(error.to_string().contains("2 "));
+        assert!(error.to_string().contains("|same"));
+        assert_eq!(
+            apply(path, original, &edits, &BTreeMap::new()).unwrap().0,
+            "updated\nsame\n"
+        );
     }
 }

@@ -36,7 +36,14 @@ impl SharedMemory {
     ) -> String {
         match self.dispatch(call, author, key, limit) {
             Ok(result) => result,
-            Err(error) => format!("REFUSED: {error}"),
+            Err(error) => {
+                let message = format!("REFUSED: {error:#}");
+                let message = match key {
+                    Some(key) => message.replace(key, "[redacted]"),
+                    None => message,
+                };
+                clip(&message, limit)
+            }
         }
     }
 
@@ -49,7 +56,7 @@ impl SharedMemory {
     ) -> Result<String> {
         ensure!(call.kind == "function", "expected a function tool call");
         if call.function.name == "remember" {
-            let input: Remember = serde_json::from_str(&call.function.arguments)
+            let input: Remember = crate::api::tool_arguments(&call.function.arguments)
                 .context("remember requires topic and note")?;
             let topic = input.topic.trim();
             let note = input.note.trim();
@@ -75,7 +82,7 @@ impl SharedMemory {
             });
             Ok(format!("Saved shared memory {}.", entries.len()))
         } else {
-            let input: Recall = serde_json::from_str(&call.function.arguments)
+            let input: Recall = crate::api::tool_arguments(&call.function.arguments)
                 .context("recall accepts optional query and before_id")?;
             ensure!(
                 input.query.len() <= MAX_TOPIC,
@@ -138,14 +145,12 @@ fn valid(text: &str, max: usize, multiline: bool) -> bool {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Remember {
     topic: String,
     note: String,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Recall {
     #[serde(default)]
     query: String,

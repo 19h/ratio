@@ -142,6 +142,7 @@ pub struct Compact<'a> {
     pub input_budget: usize,
     pub hard_limit: usize,
     pub output_tokens: usize,
+    pub shrink_for_retry: bool,
 }
 
 impl Compact<'_> {
@@ -184,14 +185,27 @@ impl Compact<'_> {
                 self.hard_limit
             );
             let target = self.input_budget.max(essential);
-            if total <= target || (essential >= self.input_budget && total <= self.hard_limit) {
+            if total <= target
+                || (!self.shrink_for_retry
+                    && essential >= self.input_budget
+                    && total <= self.hard_limit)
+            {
                 return Ok(compacted);
             }
             if dialogue.groups.len() <= 1 {
+                if self.shrink_for_retry
+                    && total > target
+                    && self.try_fit_recent(dialogue, total - target)
+                {
+                    continue;
+                }
                 if total <= self.hard_limit {
                     return Ok(compacted);
                 }
-                self.fit_recent(dialogue, total - self.hard_limit)?;
+                ensure!(
+                    self.try_fit_recent(dialogue, total - self.hard_limit),
+                    "current task and newest tool exchange do not fit in the context window"
+                );
                 continue;
             }
 
@@ -237,7 +251,7 @@ impl Compact<'_> {
         }
     }
 
-    fn fit_recent(&self, dialogue: &mut Dialogue, excess: usize) -> Result<()> {
+    fn try_fit_recent(&self, dialogue: &mut Dialogue, excess: usize) -> bool {
         if dialogue.summary.len() > 80 {
             let limit = dialogue
                 .summary
@@ -245,7 +259,7 @@ impl Compact<'_> {
                 .saturating_sub(excess.saturating_mul(3))
                 .max(80);
             dialogue.summary = clip(&dialogue.summary, limit.min(dialogue.summary.len() - 1));
-            return Ok(());
+            return true;
         }
         if let Some(group) = dialogue.groups.back_mut() {
             // Keep the call and every tool_call_id. Trim result content before
@@ -264,10 +278,10 @@ impl Compact<'_> {
             if let Some(text) = largest.filter(|text| text.len() > 80) {
                 let limit = text.len().saturating_sub(excess.saturating_mul(3)).max(80);
                 *text = clip(text, limit.min(text.len() - 1));
-                return Ok(());
+                return true;
             }
         }
-        anyhow::bail!("current task and newest tool exchange do not fit in the context window");
+        false
     }
 
     async fn summarize(&self, previous: &str, excerpt: &str, output: usize) -> Result<String> {
@@ -280,6 +294,7 @@ impl Compact<'_> {
         let budget = self.input_budget.saturating_mul(3);
         let previous = clip(previous, budget / 6);
         let mut limit = excerpt.len().min(budget / 2);
+        let mut length_retries = 0;
         loop {
             let request = Message::user(format!(
                 "Prior summary:\n{previous}\nExchanges to fold into the summary:\n{}",
@@ -287,8 +302,26 @@ impl Compact<'_> {
             ));
             let messages = [&system, &request];
             if estimate(&messages, &[]) <= self.input_budget {
-                match self.api.complete(self.model, &messages, &[], output).await {
+                match self
+                    .api
+                    .complete_for("Context compaction", self.model, &messages, &[], output)
+                    .await
+                {
                     Ok(completion) => {
+                        match completion.finish_reason.as_deref() {
+                            Some("length") if limit > 128 && length_retries < 2 => {
+                                length_retries += 1;
+                                limit /= 2;
+                                continue;
+                            }
+                            Some("length") => {
+                                return Ok(clip(&format!("{previous}\n{excerpt}"), output * 2));
+                            }
+                            Some("content_filter") => {
+                                anyhow::bail!("provider filtered the context summary")
+                            }
+                            _ => {}
+                        }
                         let Message::Assistant {
                             content,
                             tool_calls,
@@ -310,10 +343,9 @@ impl Compact<'_> {
                     Err(error) => return Err(error.into()),
                 }
             }
-            ensure!(
-                limit > 128,
-                "compaction prompt exceeds the available context"
-            );
+            if limit <= 128 {
+                return Ok(clip(&format!("{previous}\n{excerpt}"), output * 2));
+            }
             limit /= 2;
         }
     }

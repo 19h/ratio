@@ -18,6 +18,9 @@ use tokio::{
 
 use crate::{api::ToolCall, context::clip, line_tags};
 
+#[cfg(windows)]
+mod windows_job;
+
 #[derive(Clone, Copy)]
 pub enum Access {
     Inspect,
@@ -84,6 +87,7 @@ impl Tools<'_> {
             schemas.push(schema("edit_file", "Atomically edit lines by tags from read_file. Use tag, tag..tag inclusive, +tag before, tag+ after; new text preserves explicit indentation, null deletes. One stale tag aborts all edits. Legacy old_text and new_text require a unique exact match.", json!({
                 "path": {"type":"string"},
                 "edits": {"type":"object","additionalProperties":{"type":["string","null"]}},
+                "line_hints": {"type":"object","description":"Optional previous 1-based line by tag for stale-tag diagnostics.","additionalProperties":{"type":"integer","minimum":1}},
                 "snapshot_id": {"type":"string","description":"Required for range edits. Copy from read_file."},
                 "old_text": {"type":"string"},
                 "new_text": {"type":"string"}
@@ -132,16 +136,16 @@ impl Tools<'_> {
         let arguments = &call.function.arguments;
         match call.function.name.as_str() {
             "read_file" => {
-                let args: ReadFile = serde_json::from_str(arguments)?;
+                let args: ReadFile = crate::api::tool_arguments(arguments)?;
                 self.read(&args).await
             }
             "list_directory" => {
-                let args: PathArg = serde_json::from_str(arguments)?;
+                let args: PathArg = crate::api::tool_arguments(arguments)?;
                 let output = self.list(&args.path).await?;
                 Ok(format!("Untrusted directory listing\n{output}"))
             }
             "git_status" => {
-                let _: Empty = serde_json::from_str(arguments)?;
+                let _: Empty = crate::api::tool_arguments(arguments)?;
                 let output = self
                     .run(git().args([
                         "status",
@@ -156,7 +160,7 @@ impl Tools<'_> {
                 Ok(format!("Untrusted Git status\n{output}"))
             }
             "git_diff" => {
-                let args: Diff = serde_json::from_str(arguments)?;
+                let args: Diff = crate::api::tool_arguments(arguments)?;
                 let mut command = git();
                 command.args([
                     "diff",
@@ -173,7 +177,7 @@ impl Tools<'_> {
                 Ok(format!("Untrusted Git diff\n{output}"))
             }
             "create_file" if matches!(self.access, Access::Work) => {
-                let args: CreateFile = serde_json::from_str(arguments)?;
+                let args: CreateFile = crate::api::tool_arguments(arguments)?;
                 let path = self.edit_path(&args.path).await?;
                 let content_len = args.content.len();
                 tokio::task::spawn_blocking(move || create_file(&path, &args.content)).await??;
@@ -184,7 +188,7 @@ impl Tools<'_> {
                 ))
             }
             "edit_file" if matches!(self.access, Access::Work) => {
-                let args: EditFile = serde_json::from_str(arguments)?;
+                let args: EditFile = crate::api::tool_arguments(arguments)?;
                 let path = self.edit_path(&args.path).await?;
                 match (args.edits, args.old_text, args.new_text) {
                     (Some(edits), None, None) => {
@@ -192,15 +196,19 @@ impl Tools<'_> {
                         let count = edits.len();
                         let (updated, first) = tokio::task::spawn_blocking(move || {
                             change_file(&changed_path, |original| {
-                                if edits.keys().any(|tag| tag.contains(".."))
-                                    || args.snapshot_id.is_some()
-                                {
-                                    ensure!(
-                                        args.snapshot_id.as_deref() == Some(&snapshot_id(original)),
-                                        "range edit requires a current snapshot_id from read_file"
-                                    );
+                                if edits.keys().any(|tag| tag.contains("..")) || args.snapshot_id.is_some() {
+                                    let current = snapshot_id(original);
+                                    if args.snapshot_id.as_deref() != Some(&current) {
+                                        let lines = line_tags::lines(original).count();
+                                        let start = args.line_hints.values().copied().find(|line| {
+                                            (1..=lines).contains(line)
+                                        }).unwrap_or(1);
+                                        let excerpt = line_tags::excerpt(&changed_path.to_string_lossy(), original,
+                                            start, Some(start.saturating_add(2)), 700)?;
+                                        anyhow::bail!("range edit requires a current snapshot_id from read_file. Current snapshot ID: {current}\nUntrusted current file excerpt:\n{excerpt}");
+                                    }
                                 }
-                                line_tags::apply(&changed_path.to_string_lossy(), original, &edits)
+                                line_tags::apply(&changed_path.to_string_lossy(), original, &edits, &args.line_hints)
                             })
                         })
                         .await??;
@@ -240,9 +248,9 @@ impl Tools<'_> {
                 }
             }
             "shell" if matches!(self.access, Access::Work) => {
-                let args: Shell = serde_json::from_str(arguments)?;
+                let args: Shell = crate::api::tool_arguments(arguments)?;
                 ensure!(!args.command.trim().is_empty(), "shell command is empty");
-                let output = self.run(shell().arg(args.command)).await?;
+                let output = self.run(&mut shell(&args.command)).await?;
                 Ok(format!("Untrusted command output\n{output}"))
             }
             name => anyhow::bail!("tool {name} is unavailable in this role"),
@@ -390,9 +398,13 @@ impl Tools<'_> {
         #[cfg(unix)]
         command.process_group(0);
 
+        #[cfg(windows)]
+        let job = windows_job::Job::prepare(command)?;
         let mut child = command.spawn().context("start command")?;
         #[cfg(unix)]
         let mut guard = ProcessGroup(child.id());
+        #[cfg(windows)]
+        job.start(&child)?;
         let stdout = child.stdout.take().context("open command stdout")?;
         let stderr = child.stderr.take().context("open command stderr")?;
         let cap = self.output_bytes.saturating_sub(128) / 2;
@@ -405,6 +417,8 @@ impl Tools<'_> {
         {
             guard.0 = None;
         }
+        #[cfg(windows)]
+        job.disarm()?;
 
         Ok(format!(
             "Status: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -448,13 +462,13 @@ fn create_file(path: &Path, content: &str) -> Result<()> {
         content.len() <= MAX_EDIT_BYTES,
         "file would exceed {MAX_EDIT_BYTES} bytes"
     );
-    let mut temp = tempfile::Builder::new();
+    let builder = &mut tempfile::Builder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        temp.permissions(std::fs::Permissions::from_mode(0o666));
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
     }
-    let mut temp = temp.tempfile_in(path.parent().context("create file parent")?)?;
+    let mut temp = builder.tempfile_in(path.parent().context("create file parent")?)?;
     temp.write_all(content.as_bytes())?;
     temp.persist_noclobber(path).context("create new file")?;
     Ok(())
@@ -551,16 +565,18 @@ fn git() -> Command {
 }
 
 #[cfg(unix)]
-fn shell() -> Command {
+fn shell(script: &str) -> Command {
     let mut command = Command::new("/bin/sh");
-    command.arg("-c");
+    command.args(["-c", script]);
     command
 }
 
 #[cfg(windows)]
-fn shell() -> Command {
+fn shell(script: &str) -> Command {
     let mut command = Command::new("cmd.exe");
-    command.args(["/D", "/C"]);
+    command
+        .args(["/D", "/S", "/C"])
+        .raw_arg(format!("\"{script}\""));
     command
 }
 
@@ -616,7 +632,6 @@ fn schema(name: &str, description: &str, properties: Value, required: &[&str]) -
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReadFile {
     path: PathBuf,
     offset: Option<u64>,
@@ -626,18 +641,18 @@ struct ReadFile {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CreateFile {
     path: PathBuf,
     content: String,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct EditFile {
     path: PathBuf,
     edits: Option<BTreeMap<String, Option<String>>>,
     snapshot_id: Option<String>,
+    #[serde(default)]
+    line_hints: BTreeMap<String, usize>,
     #[serde(alias = "old_string")]
     old_text: Option<String>,
     #[serde(alias = "new_string")]
@@ -645,24 +660,20 @@ struct EditFile {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct PathArg {
     path: PathBuf,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Empty {}
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Diff {
     #[serde(default)]
     staged: bool,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Shell {
     command: String,
 }
@@ -670,6 +681,31 @@ struct Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn command_timeout_terminates_windows_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let tools = Tools {
+            ownership: None,
+            workspace: &workspace,
+            access: Access::Work,
+            timeout: Duration::from_secs(3),
+            output_bytes: 1024,
+            key: None,
+        };
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-Command", r#"
+            Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile -Command "New-Item -Name descendant-started -ItemType File; Start-Sleep -Seconds 5; New-Item -Name descendant-escaped -ItemType File"' -NoNewWindow
+            Start-Sleep -Seconds 30
+        "#]);
+        let error = tools.run(&mut command).await.unwrap_err();
+        assert!(error.to_string().contains("command timed out"), "{error:#}");
+        assert!(workspace.join("descendant-started").exists());
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!workspace.join("descendant-escaped").exists());
+    }
 
     #[tokio::test]
     async fn read_ranges_keep_split_utf8_code_points() {

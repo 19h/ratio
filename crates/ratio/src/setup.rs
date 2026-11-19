@@ -45,24 +45,48 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
         config.cwd.display(),
         config.constraints.prompt()
     ));
-    let prompt = Message::user(format!(
-        "Current proposal (JSON):\n{}\n\nUser input:\n{user}",
-        serde_json::to_string(draft)?
-    ));
-    let messages = [&instructions, &prompt];
-    ensure!(
-        estimate(&messages, &[]) + config.output_tokens < config.context_window,
-        "setup proposal and feedback exceed the context budget"
-    );
+    let mut previous = draft.clone();
+    let mut length_retries = 0;
     let mut correction = None;
-    for _ in 0..=1 {
-        let mut messages = messages.to_vec();
+    loop {
+        let prompt = Message::user(format!(
+            "Current proposal (JSON):\n{}\n\nUser input:\n{user}{}",
+            serde_json::to_string(&previous)?,
+            if length_retries > 0 {
+                "\nUse concise descriptions and return complete JSON."
+            } else {
+                ""
+            }
+        ));
+        let mut messages = vec![&instructions, &prompt];
         if let Some(message) = &correction {
             messages.push(message);
         }
+        ensure!(
+            estimate(&messages, &[]).saturating_add(config.output_tokens) <= config.context_window,
+            "setup proposal and feedback exceed the context budget"
+        );
         let completion = api
-            .complete(&config.reviewer_model, &messages, &[], config.output_tokens)
+            .complete_for(
+                "Setup agent",
+                &config.reviewer_model,
+                &messages,
+                &[],
+                config.output_tokens,
+            )
             .await?;
+        match completion.finish_reason.as_deref() {
+            Some("length") if length_retries < 2 => {
+                length_retries += 1;
+                previous.message =
+                    crate::context::clip(&previous.message, previous.message.len() / 3);
+                continue;
+            }
+            Some("length" | "content_filter") => {
+                anyhow::bail!("provider stopped before returning the full proposal");
+            }
+            _ => {}
+        }
         match decode(completion) {
             Ok(draft) => return Ok(draft),
             Err(error) if correction.is_none() => {
@@ -73,17 +97,9 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
             Err(error) => return Err(error),
         }
     }
-    unreachable!("setup repair is bounded")
 }
 
 fn decode(completion: crate::api::Completion) -> Result<Draft> {
-    ensure!(
-        !matches!(
-            completion.finish_reason.as_deref(),
-            Some("length" | "content_filter")
-        ),
-        "provider stopped before returning the full proposal"
-    );
     let Message::Assistant {
         content: Some(content),
         tool_calls,

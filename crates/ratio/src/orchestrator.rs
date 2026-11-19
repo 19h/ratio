@@ -169,6 +169,7 @@ impl<'a> Orchestrator<'a> {
                     }
                     loop {
                         if session.dialogue.pending()?.is_none() {
+                            self.api.wait_for_generation().await?;
                             self.receive_guidance(&mut session, guidance.as_ref())?;
                         }
                         match self
@@ -460,7 +461,8 @@ impl<'a> Orchestrator<'a> {
         let window_budget = self.config.context_window - self.config.output_tokens;
         let mut hard_limit = window_budget;
         let mut retries = 0;
-        let mut length_repaired = false;
+        let mut length_retries = 0;
+        let mut length_target = None;
         loop {
             let target = dialogue
                 .estimated_budget
@@ -471,14 +473,19 @@ impl<'a> Orchestrator<'a> {
                 model,
                 system,
                 tools: &schemas,
-                input_budget: target - target / 10,
+                input_budget: (target - target / 10).min(length_target.unwrap_or(window_budget)),
                 hard_limit,
                 output_tokens: self.config.output_tokens,
+                shrink_for_retry: length_retries > 0,
             };
-            let compacted = compact
-                .run(dialogue)
-                .await
-                .context("compact conversation")?;
+            let compacted = match compact.run(dialogue).await {
+                Err(error)
+                    if matches!(error.downcast_ref::<ApiError>(), Some(ApiError::Cancelled)) =>
+                {
+                    return Ok(Step::Continue);
+                }
+                result => result.context("compact conversation")?,
+            };
             if compacted > 0 {
                 self.progress(&format!("[context] Compacted {compacted} tool exchanges"));
             }
@@ -487,10 +494,11 @@ impl<'a> Orchestrator<'a> {
             let projected = estimate(&messages, &schemas);
             let completion = match self
                 .api
-                .complete(model, &messages, &schemas, self.config.output_tokens)
+                .complete_for(scope, model, &messages, &schemas, self.config.output_tokens)
                 .await
             {
                 Ok(completion) => completion,
+                Err(ApiError::Cancelled) => return Ok(Step::Continue),
                 Err(ApiError::Context { .. }) if retries < 4 => {
                     retries += 1;
                     hard_limit =
@@ -516,9 +524,13 @@ impl<'a> Orchestrator<'a> {
             else {
                 anyhow::bail!("provider returned a non-assistant message");
             };
-            if completion.finish_reason.as_deref() == Some("length") && !length_repaired {
-                length_repaired = true;
-                self.append_guidance(dialogue, "Previous completion was truncated. Respond concisely and submit one complete tool call at a time.");
+            if completion.finish_reason.as_deref() == Some("length") && length_retries < 2 {
+                length_retries += 1;
+                length_target = Some(length_target.unwrap_or(projected).min(projected) * 3 / 4);
+                if length_retries == 1 {
+                    self.append_guidance(dialogue, "Previous completion hit the output limit. Keep text and tool arguments short. Submit one complete tool call at a time.");
+                }
+                self.progress("[context] Completion hit the output limit. Retrying with a smaller prompt where possible.");
                 continue;
             }
             ensure!(
@@ -584,6 +596,10 @@ impl<'a> Orchestrator<'a> {
                     .all(|call| !call.id.is_empty() && ids.insert(&call.id)),
                 "provider returned empty or duplicate tool call IDs"
             );
+            if let Some(text) = content.as_deref().filter(|text| !text.trim().is_empty()) {
+                self.reporter
+                    .emit(Kind::Agent, scope, clip(text, 24 * 1024));
+            }
             dialogue.tool_rounds += 1;
             let mixed_plan_decision = peer.ack.is_some()
                 && tool_calls.len() > 1
@@ -692,6 +708,9 @@ impl<'a> Orchestrator<'a> {
     ) -> Result<()> {
         let limit = (self.config.context_window / 2).clamp(256, 8192);
         loop {
+            if panel.iter().any(|agent| agent.assessment.is_none()) || mailbox.has_pending() {
+                self.api.wait_for_generation().await?;
+            }
             if let Some(note) = read_guidance(options.guidance) {
                 let workers = options.stakeholder_start.unwrap_or(panel.len());
                 for agent in &mut panel[..workers] {

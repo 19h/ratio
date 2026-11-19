@@ -8,6 +8,17 @@ context_window = 32768
 # output_tokens = 4096
 # legacy_max_tokens = false
 
+# [provider]
+# stream = true
+# stream_usage = true
+# temperature = 0.2
+# top_p = 0.9
+# seed = 42
+# parallel_tool_calls = false
+#
+# [provider.headers]
+# x-provider-project = "project-id"
+
 # [worker]
 # model = "worker-model"
 

@@ -1,16 +1,25 @@
-use std::time::Duration;
+use std::{
+    future::pending,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, ensure};
 use reqwest::{Client, Url, header};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{
     budget::Budget,
-    config::Config,
-    context::estimate,
-    events::{Kind, Reporter},
+    config::{Config, Provider},
+    context::{clip, estimate},
+    events::{Generation, Kind, Reporter, clean},
 };
+
+mod stream;
+
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+static GENERATION_IDS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolCall {
@@ -24,6 +33,14 @@ pub struct ToolCall {
 pub struct Function {
     pub name: String,
     pub arguments: String,
+}
+
+pub(crate) fn tool_arguments<T: DeserializeOwned>(arguments: &str) -> Result<T> {
+    ensure!(
+        arguments.trim_start().starts_with('{'),
+        "arguments must be a JSON object"
+    );
+    serde_json::from_str(arguments).context("invalid tool arguments")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -74,7 +91,7 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Usage {
     prompt_tokens: Option<usize>,
     completion_tokens: Option<usize>,
@@ -88,6 +105,8 @@ pub struct Completion {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
+    #[error("model generation cancelled")]
+    Cancelled,
     #[error("provider rejected context (HTTP {status}): {detail}")]
     Context { status: u16, detail: String },
     #[error("provider returned HTTP {status}: {detail}")]
@@ -103,7 +122,8 @@ pub enum ApiError {
 pub struct Api {
     client: Client,
     endpoint: Url,
-    key: Option<String>,
+    secrets: Vec<String>,
+    provider: Provider,
     legacy_max_tokens: bool,
     debug: bool,
     reporter: Reporter,
@@ -114,12 +134,40 @@ impl Api {
     pub fn new(config: &Config, reporter: Reporter, budget: Budget) -> Result<Self> {
         let endpoint = completions_url(&config.endpoint)?;
         let mut headers = header::HeaderMap::new();
+        let mut secrets = Vec::new();
         if let Some(key) = &config.api_key {
             let mut value = header::HeaderValue::from_str(&format!("Bearer {key}"))
                 .context("invalid API key header")?;
             value.set_sensitive(true);
             headers.insert(header::AUTHORIZATION, value);
+            secrets.push(key.clone());
         }
+        for (name, value) in &config.provider.headers {
+            let name = header::HeaderName::from_bytes(name.as_bytes())
+                .context("invalid provider header name")?;
+            ensure!(
+                !matches!(
+                    name.as_str(),
+                    "accept"
+                        | "connection"
+                        | "content-length"
+                        | "content-type"
+                        | "expect"
+                        | "host"
+                        | "transfer-encoding"
+                        | "upgrade"
+                ),
+                "provider header {name} is managed by Ratio or HTTP"
+            );
+            let mut encoded = header::HeaderValue::from_str(value)
+                .with_context(|| format!("invalid value for provider header {name}"))?;
+            encoded.set_sensitive(true);
+            headers.insert(name, encoded);
+            if !value.is_empty() {
+                secrets.push(value.clone());
+            }
+        }
+        secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
         let client = Client::builder()
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
@@ -131,7 +179,8 @@ impl Api {
         Ok(Self {
             client,
             endpoint,
-            key: config.api_key.clone(),
+            secrets,
+            provider: config.provider.clone(),
             legacy_max_tokens: config.legacy_max_tokens,
             debug: config.debug,
             reporter,
@@ -146,15 +195,71 @@ impl Api {
         tools: &[Value],
         output_tokens: usize,
     ) -> Result<Completion, ApiError> {
+        self.complete_for(model, model, messages, tools, output_tokens)
+            .await
+    }
+
+    pub(crate) async fn wait_for_generation(&self) -> Result<()> {
+        if let Some(mut control) = self.reporter.generation_control() {
+            tokio::time::timeout(
+                self.budget.remaining(),
+                control.wait_for(|state| !state.paused),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("run budget exhausted: active time"))?
+            .context("generation controls closed")?;
+        }
+        Ok(())
+    }
+
+    pub async fn complete_for(
+        &self,
+        label: &str,
+        model: &str,
+        messages: &[&Message],
+        tools: &[Value],
+        output_tokens: usize,
+    ) -> Result<Completion, ApiError> {
         let reserved = estimate(messages, tools).saturating_add(output_tokens) as u64;
         let mut last_http = None;
-        for attempt in 0..=2 {
+        let mut attempt = 0;
+        let mut control = self.reporter.generation_control();
+        loop {
+            let state = control
+                .as_ref()
+                .map(|control| *control.borrow())
+                .unwrap_or_default();
+            if state.paused {
+                return Err(ApiError::Cancelled);
+            }
+            let epoch = state.epoch;
             self.budget.reserve(reserved)?;
+            let mut preview = Preview::new(self, label);
+            let cancelled = async {
+                match &mut control {
+                    Some(control) => {
+                        let _ = control.wait_for(|state| state.epoch != epoch).await;
+                    }
+                    None => pending::<()>().await,
+                }
+            };
             let result = tokio::time::timeout(
                 self.budget.remaining(),
-                self.complete_once(model, messages, tools, output_tokens, reserved),
-            )
-            .await;
+                self.complete_once(
+                    model,
+                    messages,
+                    tools,
+                    output_tokens,
+                    reserved,
+                    &mut preview,
+                ),
+            );
+            let result = tokio::select! {
+                biased;
+                () = cancelled => return Err(ApiError::Cancelled),
+                result = result => result,
+            };
+            drop(preview);
             let error = match result {
                 Ok(Ok(completion)) => return Ok(completion),
                 Ok(Err(error)) => error,
@@ -195,8 +300,8 @@ impl Api {
                 last_http = Some(error);
             }
             tokio::time::sleep(wait).await;
+            attempt += 1;
         }
-        unreachable!("request retry loop is bounded")
     }
 
     async fn complete_once(
@@ -206,14 +311,30 @@ impl Api {
         tools: &[Value],
         output_tokens: usize,
         reserved: u64,
+        preview: &mut Preview<'_>,
     ) -> Result<Completion, ApiError> {
         let mut payload = serde_json::json!({
             "model": model,
             "messages": messages,
-            "stream": false
+            "stream": self.provider.stream
         });
+        if self.provider.stream && self.provider.stream_usage {
+            payload["stream_options"] = serde_json::json!({"include_usage": true});
+        }
+        if let Some(value) = self.provider.temperature {
+            payload["temperature"] = serde_json::json!(value);
+        }
+        if let Some(value) = self.provider.top_p {
+            payload["top_p"] = serde_json::json!(value);
+        }
+        if let Some(value) = self.provider.seed {
+            payload["seed"] = serde_json::json!(value);
+        }
         if !tools.is_empty() {
             payload["tools"] = serde_json::json!(tools);
+            if let Some(value) = self.provider.parallel_tool_calls {
+                payload["parallel_tool_calls"] = serde_json::json!(value);
+            }
         }
         let limit = if self.legacy_max_tokens {
             "max_tokens"
@@ -233,15 +354,118 @@ impl Api {
             );
         }
 
-        let mut response = self
+        let response = self
             .client
             .post(self.endpoint.clone())
+            .header(
+                header::ACCEPT,
+                if self.provider.stream {
+                    "text/event-stream, application/json"
+                } else {
+                    "application/json"
+                },
+            )
             .json(&payload)
             .send()
             .await
             .map_err(|error| {
                 anyhow::Error::new(error.without_url()).context("send chat completion")
             })?;
+        let status = response.status();
+        if status.is_success()
+            && response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .is_some_and(|value| {
+                    value.to_str().ok().is_some_and(|value| {
+                        value.split(';').next().is_some_and(|mime| {
+                            mime.trim().eq_ignore_ascii_case("text/event-stream")
+                        })
+                    })
+                })
+        {
+            self.read_stream(response, reserved, preview).await
+        } else {
+            self.read_json(response, reserved).await
+        }
+    }
+
+    async fn read_stream(
+        &self,
+        mut response: reqwest::Response,
+        reserved: u64,
+        preview: &mut Preview<'_>,
+    ) -> Result<Completion, ApiError> {
+        let status = response.status().as_u16();
+        let mut decoder = stream::Decoder::default();
+        let mut received = 0usize;
+        let mut dirty = false;
+        loop {
+            let flush = async {
+                if preview.id.is_some() && dirty {
+                    tokio::time::sleep(
+                        Duration::from_millis(50).saturating_sub(preview.last.elapsed()),
+                    )
+                    .await;
+                } else {
+                    pending::<()>().await;
+                }
+            };
+            let chunk = tokio::select! {
+                biased;
+                () = flush => {
+                    preview.update(decoder.content(), decoder.progress());
+                    dirty = false;
+                    continue;
+                }
+                result = response.chunk() => result,
+            }
+            .map_err(|error| {
+                anyhow::Error::new(error.without_url()).context("read chat completion stream")
+            })?;
+            let Some(chunk) = chunk else { break };
+            received = received.saturating_add(chunk.len());
+            ensure_response_size(received)?;
+            decoder
+                .push(&chunk)
+                .map_err(|error| self.safe_error(error))?;
+            dirty = true;
+            if decoder.done() {
+                break;
+            }
+        }
+        if let Some((error, usage, choice_seen)) = decoder.take_error() {
+            let code = error
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let detail = error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+                .unwrap_or("unknown error");
+            let context_rejection = is_context_error(code, detail);
+            let detail = clean(clip(&self.redact(detail), 1024));
+            if let Some(actual) = usage.as_ref().and_then(Usage::total) {
+                self.budget.reconcile(reserved, actual)?;
+            } else if context_rejection && !choice_seen {
+                self.budget.reconcile(reserved, 0)?;
+            }
+            return Err(if context_rejection {
+                ApiError::Context { status, detail }
+            } else {
+                anyhow::anyhow!("provider stream error: {detail}").into()
+            });
+        }
+        let response = decoder.finish().map_err(|error| self.safe_error(error))?;
+        self.finish(response, reserved)
+    }
+
+    async fn read_json(
+        &self,
+        mut response: reqwest::Response,
+        reserved: u64,
+    ) -> Result<Completion, ApiError> {
         let status = response.status();
         let retry_after = response.headers().get(header::RETRY_AFTER).map(|value| {
             value
@@ -251,7 +475,7 @@ impl Api {
                 .unwrap_or(Duration::MAX)
         });
         let limit_bytes = if status.is_success() {
-            16 * 1024 * 1024
+            MAX_RESPONSE_BYTES
         } else {
             32 * 1024
         };
@@ -282,24 +506,16 @@ impl Api {
                 .pointer("/error/message")
                 .and_then(Value::as_str)
                 .unwrap_or(&raw);
-            let lower = detail.to_ascii_lowercase();
-            let detail = match &self.key {
-                Some(key) => detail.replace(key, "[redacted]"),
-                None => detail.to_owned(),
-            };
-            let detail = detail
+            let context_rejection = status.as_u16() == 413
+                || code == "context_length_exceeded"
+                || (matches!(status.as_u16(), 400 | 422) && is_context_error(code, detail));
+            let detail = self
+                .redact(detail)
                 .chars()
                 .take(1000)
                 .filter(|c| !c.is_control())
                 .collect();
             let status = status.as_u16();
-            let context_rejection = code == "context_length_exceeded"
-                || status == 413
-                || (matches!(status, 400 | 422)
-                    && (lower.contains("maximum context length")
-                        || lower.contains("context window")
-                        || lower.contains("context length exceeded")
-                        || lower.contains("context size")));
             let usage = body
                 .pointer("/usage/prompt_tokens")
                 .and_then(Value::as_u64)
@@ -326,8 +542,13 @@ impl Api {
             };
         }
 
-        let response: Response =
-            serde_json::from_slice(&bytes).context("decode chat completion")?;
+        let response: Response = serde_json::from_slice(&bytes)
+            .context("decode chat completion")
+            .map_err(|error| self.safe_error(error))?;
+        self.finish(response, reserved)
+    }
+
+    fn finish(&self, response: Response, reserved: u64) -> Result<Completion, ApiError> {
         let choice = response
             .choices
             .into_iter()
@@ -337,13 +558,8 @@ impl Api {
             .usage
             .as_ref()
             .and_then(|usage| usage.prompt_tokens);
-        if let Some((prompt, completion)) = response
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.prompt_tokens.zip(usage.completion_tokens))
-        {
-            self.budget
-                .reconcile(reserved, prompt.saturating_add(completion) as u64)?;
+        if let Some(actual) = response.usage.as_ref().and_then(Usage::total) {
+            self.budget.reconcile(reserved, actual)?;
         }
         if self.debug {
             self.reporter.emit(
@@ -361,6 +577,111 @@ impl Api {
             prompt_tokens,
             finish_reason: choice.finish_reason,
         })
+    }
+
+    fn redact(&self, text: &str) -> String {
+        self.secrets.iter().fold(text.to_owned(), |text, secret| {
+            text.replace(secret, "[redacted]")
+        })
+    }
+
+    fn safe_error(&self, error: anyhow::Error) -> ApiError {
+        anyhow::anyhow!("{}", clean(clip(&self.redact(&format!("{error:#}")), 1024))).into()
+    }
+}
+
+impl Usage {
+    fn total(&self) -> Option<u64> {
+        Some((self.prompt_tokens? as u64).saturating_add(self.completion_tokens? as u64))
+    }
+}
+
+fn is_context_error(code: &str, detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    code == "context_length_exceeded"
+        || [
+            "maximum context length",
+            "context window",
+            "context length exceeded",
+            "context size",
+        ]
+        .iter()
+        .any(|phrase| detail.contains(phrase))
+}
+
+fn ensure_response_size(received: usize) -> Result<()> {
+    ensure!(
+        received <= MAX_RESPONSE_BYTES,
+        "provider response exceeds {MAX_RESPONSE_BYTES} bytes"
+    );
+    Ok(())
+}
+
+struct Preview<'a> {
+    api: &'a Api,
+    id: Option<usize>,
+    label: &'a str,
+    last: Instant,
+}
+
+impl<'a> Preview<'a> {
+    fn new(api: &'a Api, label: &'a str) -> Self {
+        let id = api
+            .reporter
+            .observes_network()
+            .then(|| GENERATION_IDS.fetch_add(1, Ordering::Relaxed));
+        if let Some(id) = id {
+            api.reporter.generation(Generation::Preview {
+                id,
+                label: clean(clip(label, 240)),
+                text: "Waiting for provider…".into(),
+            });
+        }
+        Self {
+            api,
+            id,
+            label,
+            last: Instant::now(),
+        }
+    }
+
+    fn update(&mut self, content: &str, progress: &str) {
+        let Some(id) = self.id else { return };
+        self.last = Instant::now();
+        let text = self.api.redact(content);
+        let mut end = text.len();
+        // A credential can span two deltas. Withhold a matching prefix.
+        for secret in &self.api.secrets {
+            for (length, _) in secret.char_indices().rev() {
+                if length > 0 && text.ends_with(&secret[..length]) {
+                    end = end.min(text.len() - length);
+                    break;
+                }
+            }
+        }
+        let text = &text[..end];
+        let text = if text.trim().is_empty() {
+            progress
+        } else {
+            text
+        };
+        let mut start = text.len().saturating_sub(2048);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        self.api.reporter.generation(Generation::Preview {
+            id,
+            label: clean(clip(self.label, 240)),
+            text: clean(text[start..].to_owned()),
+        });
+    }
+}
+
+impl Drop for Preview<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            self.api.reporter.generation(Generation::End(id));
+        }
     }
 }
 

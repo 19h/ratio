@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::{collections::BTreeMap, env, path::PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
@@ -30,6 +30,17 @@ pub struct Cli {
     context_window: Option<usize>,
     #[arg(long, value_name = "TOKENS")]
     output_tokens: Option<usize>,
+    /// Request SSE streaming (true by default).
+    #[arg(long, value_name = "BOOL")]
+    stream: Option<bool>,
+    #[arg(long)]
+    temperature: Option<f64>,
+    #[arg(long)]
+    top_p: Option<f64>,
+    #[arg(long, allow_hyphen_values = true)]
+    seed: Option<i64>,
+    #[arg(long, value_name = "BOOL")]
+    parallel_tool_calls: Option<bool>,
     /// Send max_tokens for providers that require the legacy field.
     #[arg(long)]
     legacy_max_tokens: bool,
@@ -64,6 +75,7 @@ struct FileConfig {
     context_window: Option<usize>,
     output_tokens: Option<usize>,
     legacy_max_tokens: bool,
+    provider: Provider,
     worker: RoleConfig,
     reviewer: RoleConfig,
     orchestration: Orchestration,
@@ -71,6 +83,32 @@ struct FileConfig {
     stakeholders: Vec<Stakeholder>,
     reviewers: Vec<Stakeholder>,
     workers: Vec<Worker>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Provider {
+    pub stream: bool,
+    pub stream_usage: bool,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub seed: Option<i64>,
+    pub parallel_tool_calls: Option<bool>,
+    pub headers: BTreeMap<String, String>,
+}
+
+impl Default for Provider {
+    fn default() -> Self {
+        Self {
+            stream: true,
+            stream_usage: true,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            parallel_tool_calls: None,
+            headers: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -199,6 +237,7 @@ pub struct Config {
     pub context_window: usize,
     pub output_tokens: usize,
     pub legacy_max_tokens: bool,
+    pub provider: Provider,
     pub orchestration: Orchestration,
     pub constraints: Constraints,
     pub stakeholders: Vec<Stakeholder>,
@@ -245,6 +284,24 @@ impl Config {
         ensure!(
             (1..context_window).contains(&output_tokens),
             "output token budget must be positive and smaller than the context window"
+        );
+        let mut provider = file.provider;
+        provider.stream = cli.stream.unwrap_or(provider.stream);
+        provider.temperature = cli.temperature.or(provider.temperature);
+        provider.top_p = cli.top_p.or(provider.top_p);
+        provider.seed = cli.seed.or(provider.seed);
+        provider.parallel_tool_calls = cli.parallel_tool_calls.or(provider.parallel_tool_calls);
+        ensure!(
+            provider
+                .temperature
+                .is_none_or(|value| (0.0..=2.0).contains(&value)),
+            "provider temperature must be in 0..=2"
+        );
+        ensure!(
+            provider
+                .top_p
+                .is_none_or(|value| (0.0..=1.0).contains(&value)),
+            "provider top_p must be in 0..=1"
         );
         let mut orchestration = file.orchestration;
         if let Some(limit) = cli.max_requests {
@@ -318,6 +375,7 @@ impl Config {
             context_window,
             output_tokens,
             legacy_max_tokens: cli.legacy_max_tokens || file.legacy_max_tokens,
+            provider,
             orchestration,
             constraints: file.constraints,
             stakeholders: file.stakeholders,

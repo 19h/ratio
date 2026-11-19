@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::{self, Stderr},
     sync::mpsc,
 };
@@ -23,14 +23,17 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph, Wrap},
 };
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::{
+    mpsc::{UnboundedReceiver, unbounded_channel},
+    watch,
+};
 
 use crate::{
     api::Api,
     budget::Budget,
     config::{Config, ConsultationPhase},
     context::clip,
-    events::{Event, Kind, Reporter, clean},
+    events::{Event, Generation, GenerationControl, Kind, Reporter, clean},
     orchestrator::Orchestrator,
     session::{Session, Store},
     setup::{self, Draft},
@@ -78,11 +81,13 @@ pub async fn run(
 ) -> Result<Outcome> {
     let (_mode, screen) = TerminalMode::enter()?;
     let (sender, receiver) = unbounded_channel();
-    let reporter = Reporter::Tui(sender);
+    let (control, control_rx) = watch::channel(GenerationControl::default());
+    let reporter = Reporter::Tui(sender, control_rx);
     let mut ui = Ui {
         screen,
         inputs: EventStream::new(),
         events: receiver,
+        control,
         view: View::default(),
     };
     let session = match resumed {
@@ -110,6 +115,7 @@ struct Ui {
     screen: Screen,
     inputs: EventStream,
     events: UnboundedReceiver<Event>,
+    control: watch::Sender<GenerationControl>,
     view: View,
 }
 
@@ -148,6 +154,9 @@ impl Ui {
                         }
                     }
                 };
+                while let Ok(event) = self.events.try_recv() {
+                    self.view.push_event(event);
+                }
                 match result {
                     None => self.view.push(Kind::Info, "Setup", "Drafting cancelled."),
                     Some(Ok(proposal)) => {
@@ -207,7 +216,9 @@ impl Ui {
             self.draw(None, Mode::Running)?;
             tokio::select! {
                 input = self.inputs.next() => match self.view.input(terminal_input(input)?) {
+                    Action::Interrupt if !self.view.paused && !self.view.generations.is_empty() => self.toggle_generation(),
                     Action::Interrupt => return Ok(Outcome::Interrupted),
+                    Action::ToggleGeneration => self.toggle_generation(),
                     Action::Submit => {
                         if let Some(note) = self.view.take_input() {
                             match send.try_send(note) {
@@ -263,6 +274,22 @@ impl Ui {
             .draw(|frame| self.view.draw(frame, draft, mode))?;
         Ok(())
     }
+
+    fn toggle_generation(&mut self) {
+        self.view.paused = !self.view.paused;
+        self.control.send_modify(|state| {
+            state.paused = self.view.paused;
+            if state.paused {
+                state.epoch = state.epoch.wrapping_add(1);
+            }
+        });
+        let message = if self.view.paused {
+            "Model requests paused. Press F6 to resume."
+        } else {
+            "Model requests resumed."
+        };
+        self.view.push(Kind::Info, "Generation", message);
+    }
 }
 
 fn terminal_input(event: Option<io::Result<Input>>) -> Result<Input> {
@@ -286,6 +313,7 @@ enum Action {
     Approve,
     Escape,
     Interrupt,
+    ToggleGeneration,
 }
 
 #[derive(Default)]
@@ -300,10 +328,27 @@ struct View {
     executing: bool,
     show_network: bool,
     network: network::Network,
+    generations: BTreeMap<usize, (String, String)>,
+    selected_generation: usize,
+    paused: bool,
 }
 
 impl View {
     fn push_event(&mut self, event: Event) {
+        if let Some(generation) = event.generation {
+            match generation {
+                Generation::Preview { id, label, text } => {
+                    self.generations.insert(id, (label, text));
+                }
+                Generation::End(id) => {
+                    self.generations.remove(&id);
+                    self.selected_generation = self
+                        .selected_generation
+                        .min(self.generations.len().saturating_sub(1));
+                }
+            }
+            return;
+        }
         if let Some(network) = event.network {
             self.network.ingest(network);
             return;
@@ -362,6 +407,12 @@ impl View {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if self.executing {
             match key.code {
+                KeyCode::F(6) => return Action::ToggleGeneration,
+                KeyCode::F(7) if !self.generations.is_empty() => {
+                    self.selected_generation =
+                        (self.selected_generation + 1) % self.generations.len();
+                    return Action::None;
+                }
                 KeyCode::F(2) | KeyCode::F(3) => {
                     self.show_network = key.code == KeyCode::F(3);
                     return Action::None;
@@ -427,7 +478,15 @@ impl View {
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!("  {}", self.status)),
+            Span::raw(format!(
+                "  {}{}",
+                self.status,
+                if self.paused {
+                    " · Model requests paused"
+                } else {
+                    ""
+                }
+            )),
         ]);
         let mut heading = vec![title];
         if self.executing {
@@ -448,6 +507,7 @@ impl View {
                 tab(" F2 Activity ", !self.show_network),
                 Span::raw("  "),
                 tab(" F3 Communication ", self.show_network),
+                Span::raw(format!("  {} generating", self.generations.len())),
             ]));
         }
         frame.render_widget(Paragraph::new(heading), header);
@@ -486,7 +546,7 @@ impl View {
         }
         let hints = match mode {
             Mode::Running if self.show_network => {
-                " Tab Sequence/Routes   F4 Filter   Arrows Navigate   Ctrl+Up/Down Inspector\n Enter Queue guidance   F2 Activity   Ctrl+C Interrupt"
+                " Tab Sequence/Routes   F4 Filter   Arrows Navigate   Ctrl+Up/Down Inspector\n Enter Queue guidance   F2 Activity   F6 Pause/resume   Ctrl+C Interrupt"
             }
             Mode::Done if self.show_network => {
                 " Tab Sequence/Routes   F4 Filter   Arrows Navigate   Ctrl+Up/Down Inspector\n F2 Activity   Enter / q Exit"
@@ -496,7 +556,9 @@ impl View {
             Mode::Ready => {
                 " Enter  Refine    F5  Approve and run    Tab  Choose pane    PgUp/PgDn  Scroll"
             }
-            Mode::Running => " Enter  Queue guidance    PgUp/PgDn  Scroll    Ctrl+C  Interrupt",
+            Mode::Running => {
+                " Enter Queue guidance   PgUp/PgDn Scroll   F6 Pause/resume\n F7 Next live agent   Ctrl+C Cancel generation / Exit"
+            }
             Mode::Done => " PgUp/PgDn  Scroll    Enter / q  Exit",
         };
         frame.render_widget(
@@ -508,6 +570,31 @@ impl View {
     }
 
     fn render_activity(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let area =
+            if let Some((label, text)) = self.generations.values().nth(self.selected_generation) {
+                let [transcript, preview] = Layout::vertical([
+                    Constraint::Min(2),
+                    Constraint::Length((area.height / 3).clamp(3, 9).min(area.height)),
+                ])
+                .areas(area);
+                let block = Block::bordered().title(format!(
+                    " Live {}/{} · {label} ",
+                    self.selected_generation + 1,
+                    self.generations.len(),
+                ));
+                let inner = block.inner(preview);
+                let paragraph = Paragraph::new(text.as_str()).wrap(Wrap { trim: false });
+                let bottom = paragraph
+                    .line_count(inner.width)
+                    .saturating_sub(usize::from(inner.height));
+                frame.render_widget(
+                    paragraph.scroll((line_offset(bottom), 0)).block(block),
+                    preview,
+                );
+                transcript
+            } else {
+                area
+            };
         let block = Block::bordered().title(" Activity ");
         let block = if self.proposal_focused {
             block

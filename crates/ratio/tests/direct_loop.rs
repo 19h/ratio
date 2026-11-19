@@ -1,9 +1,8 @@
-#![cfg(unix)]
-
 use std::{
+    collections::BTreeMap,
     io::{BufRead, BufReader, Write},
-    net::{Ipv4Addr, TcpListener},
-    path::Path,
+    net::{Ipv4Addr, TcpListener, TcpStream},
+    path::{Path, PathBuf},
     process::{Command, Output},
     thread,
     time::Duration,
@@ -23,6 +22,12 @@ fn mock(
 fn mock_deferred(
     mut reply: impl FnMut(usize, Value) -> (u16, Value, bool) + Send + 'static,
 ) -> (String, thread::JoinHandle<()>) {
+    mock_transport(move |index, request, _| reply(index, request))
+}
+
+fn mock_transport(
+    mut reply: impl FnMut(usize, Value, BTreeMap<String, String>) -> (u16, Value, bool) + Send + 'static,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
@@ -40,45 +45,22 @@ fn mock_deferred(
                     Err(error) => panic!("{error}"),
                 }
             };
-            socket.set_nonblocking(false).unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut socket);
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            assert_eq!(line, "POST /v1/chat/completions HTTP/1.1\r\n");
-            let mut length = None;
-            let mut authenticated = false;
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
-                }
-                assert!(!line.is_empty(), "request ended inside the header");
-                let (name, value) = line.split_once(':').unwrap();
-                match name.to_ascii_lowercase().as_str() {
-                    "content-length" => length = Some(value.trim().parse::<usize>().unwrap()),
-                    "authorization" => authenticated = value.trim() == "Bearer test-key",
-                    _ => {}
-                }
-            }
-            assert!(authenticated);
-            let mut body = vec![0; length.unwrap()];
-            std::io::Read::read_exact(&mut reader, &mut body).unwrap();
-            let request: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(request["model"], "test-model");
-            assert_eq!(request["stream"], false);
-            assert!(request["max_completion_tokens"].is_number());
-            assert_history(&request);
-            let (status, response, defer) = reply(index, request);
+            let (request, headers) = read_mock_request(&mut socket);
+            let (status, response, defer) = reply(index, request, headers);
             let done = status == 503 || response["test_terminal"] == true;
-            deferred.push((socket, status, serde_json::to_vec(&response).unwrap()));
+            deferred.push((socket, status, response));
             if !defer {
-                for (mut socket, status, body) in deferred.drain(..) {
-                    write!(socket, "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-                    socket.write_all(&body).unwrap();
+                for (mut socket, status, response) in deferred.drain(..) {
+                    if let Some(sse) = response["test_sse"].as_str() {
+                        write!(socket, "HTTP/1.1 {status} Response\r\nContent-Type: text/event-stream; charset=utf-8\r\nConnection: close\r\n\r\n").unwrap();
+                        for part in sse.as_bytes().chunks(23) {
+                            socket.write_all(part).unwrap();
+                        }
+                    } else {
+                        let body = serde_json::to_vec(&response).unwrap();
+                        write!(socket, "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                        socket.write_all(&body).unwrap();
+                    }
                 }
             }
             if done {
@@ -87,6 +69,53 @@ fn mock_deferred(
         }
     });
     (endpoint, thread)
+}
+
+fn read_mock_request(socket: &mut TcpStream) -> (Value, BTreeMap<String, String>) {
+    socket.set_nonblocking(false).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(socket);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(line, "POST /v1/chat/completions HTTP/1.1\r\n");
+    let mut headers = BTreeMap::new();
+    loop {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        if line == "\r\n" {
+            break;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .expect("request ended inside the header");
+        headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+    }
+    assert_eq!(headers["authorization"], "Bearer test-key");
+    let mut body = vec![0; headers["content-length"].parse::<usize>().unwrap()];
+    std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(request["model"], "test-model");
+    assert!(request["stream"].is_boolean());
+    assert!(request["max_completion_tokens"].is_number());
+    assert_history(&request);
+    (request, headers)
+}
+
+fn stream_event(delta: Value, finish: Option<&str>) -> Value {
+    json!({"choices": [{"index":0, "delta":delta, "finish_reason":finish}]})
+}
+
+fn stream_response(events: &[Value], finish: bool, terminal: bool) -> (u16, Value) {
+    let mut raw = String::from(": provider heartbeat\r\n\r\n");
+    for event in events {
+        raw.push_str(&format!("data: {event}\r\n\r\n"));
+    }
+    if finish {
+        raw.push_str("data:[DONE]\r\n\r\n");
+    }
+    (200, json!({"test_sse":raw,"test_terminal":terminal}))
 }
 
 fn assert_history(request: &Value) {
@@ -112,8 +141,19 @@ fn cli_window(cwd: &Path, endpoint: &str, window: &str, args: &[&str]) -> Output
     cli_command(cwd, endpoint, window, args).output().unwrap()
 }
 
+fn ratio_binary() -> PathBuf {
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_ra"));
+    if built.is_file() {
+        return built;
+    }
+    // Cross-built integration fixtures can run alongside the target binary.
+    std::env::current_exe()
+        .unwrap()
+        .with_file_name(format!("ra{}", std::env::consts::EXE_SUFFIX))
+}
+
 fn cli_command(cwd: &Path, endpoint: &str, window: &str, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ra"));
+    let mut command = Command::new(ratio_binary());
     command
         .args([
             "-C",
@@ -146,6 +186,232 @@ fn decision(verdict: &str, assessment: &str) -> (u16, Value) {
         response["test_terminal"] = json!(true);
     }
     (status, response)
+}
+
+#[test]
+fn streamed_completions_preserve_tool_order_reasoning_and_usage() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("ratio.toml");
+    std::fs::write(
+        &config,
+        r#"
+[provider]
+temperature = 0.8
+top_p = 0.9
+seed = 42
+parallel_tool_calls = false
+[provider.headers]
+x-api-key = "provider-test"
+"#,
+    )
+    .unwrap();
+    let (endpoint, server) = mock_transport(|index, request, headers| {
+        assert_eq!(request["stream"], true);
+        assert_eq!(request["stream_options"]["include_usage"], true);
+        assert_eq!(request["temperature"], 0.2);
+        assert_eq!(request["top_p"], 0.9);
+        assert_eq!(request["seed"], -7);
+        assert_eq!(request["parallel_tool_calls"], false);
+        assert_eq!(headers["x-api-key"], "provider-test");
+        let (status, response) = match index {
+            0 => stream_response(
+                &[
+                    stream_event(json!({"role":"assistant","content":"Create"}), None),
+                    stream_event(json!({"content":" the fixture."}), Some("stop")),
+                    json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+                ],
+                true,
+                false,
+            ),
+            1 => stream_response(
+                &[
+                    stream_event(
+                        json!({"reasoning_content":"Check the order.", "tool_calls":[
+                            {"index":1,"id":"read","type":"function","function":{"name":"read_", "arguments":"{\"path\":\""}},
+                            {"index":0,"id":"create","type":"function","function":{"name":"create_file", "arguments":"{\"path\":\"fixture.txt\",\"content\":\""}}
+                        ]}),
+                        None,
+                    ),
+                    stream_event(
+                        json!({"tool_calls":[
+                            {"index":0,"function":{"arguments":"βeta\",\"explanation\":\"fixture\"}"}},
+                            {"index":1,"function":{"name":"file","arguments":"fixture.txt\"}"}}
+                        ]}),
+                        Some("tool_calls"),
+                    ),
+                    json!({"choices":[],"usage":{"prompt_tokens":40,"completion_tokens":20}}),
+                ],
+                true,
+                false,
+            ),
+            2 => {
+                let messages = request["messages"].as_array().unwrap();
+                let assistant = &messages[messages.len() - 3];
+                assert_eq!(assistant["reasoning_content"], "Check the order.");
+                assert_eq!(assistant["tool_calls"][0]["id"], "create");
+                assert_eq!(messages.last().unwrap()["tool_call_id"], "read");
+                assert!(
+                    messages.last().unwrap()["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("βeta")
+                );
+                stream_response(
+                    &[
+                        stream_event(json!({"content":"Fixture created."}), Some("stop")),
+                        json!({"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":2}}),
+                    ],
+                    true,
+                    false,
+                )
+            }
+            3 => stream_response(
+                &[
+                    stream_event(
+                        json!({"tool_calls":[{"index":0,"id":"verdict","type":"function","function":{"name":"submit_verdict","arguments":"{\"verdict\":\"approved\",\"assessment\":\"Verified streamed fixture.\"}"}}]}),
+                        Some("tool_calls"),
+                    ),
+                    json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}),
+                ],
+                true,
+                true,
+            ),
+            _ => panic!("unexpected request {index}"),
+        };
+        (status, response, false)
+    });
+    let run = cli_window(
+        temp.path(),
+        &endpoint,
+        "4096",
+        &[
+            "--goal",
+            "Create a fixture",
+            "--config",
+            config.to_str().unwrap(),
+            "--temperature",
+            "0.2",
+            "--seed",
+            "-7",
+        ],
+    );
+    succeeded(&run);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("fixture.txt")).unwrap(),
+        "βeta"
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("Verified streamed fixture."));
+    let ledger = std::fs::read_dir(temp.path().join(".ratio"))
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("budget-"))
+        .unwrap();
+    let ledger: Value = serde_json::from_slice(&std::fs::read(ledger.path()).unwrap()).unwrap();
+    assert_eq!(ledger["requests"], 4);
+    assert_eq!(ledger["tokens"], 95);
+    server.join().unwrap();
+}
+
+#[test]
+fn incomplete_stream_never_dispatches_a_tool() {
+    let temp = tempfile::tempdir().unwrap();
+    let (endpoint, server) = mock(|index, _| match index {
+        0 => text("Create a fixture."),
+        1 => stream_response(
+            &[stream_event(
+                json!({"tool_calls":[
+                    {"index":0,"id":"unsafe","type":"function","function":{
+                        "name":"create_file","arguments":"{\"path\":\"fixture.txt\",\"content\":\"partial\"}"}}
+                ]}),
+                None,
+            )],
+            false,
+            true,
+        ),
+        _ => panic!("unexpected request"),
+    });
+    let run = cli(
+        temp.path(),
+        &endpoint,
+        &["--goal", "Test incomplete stream"],
+    );
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("stream ended before completing"));
+    assert!(!temp.path().join("fixture.txt").exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn legacy_transport_omits_stream_options() {
+    let temp = tempfile::tempdir().unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        assert_eq!(request["stream"], false);
+        assert!(request.get("stream_options").is_none());
+        match index {
+            0 => text("Inspect fixture."),
+            1 => text("Inspection complete."),
+            2 => decision("approved", "Verified with JSON transport."),
+            _ => panic!("unexpected request"),
+        }
+    });
+    succeeded(&cli(
+        temp.path(),
+        &endpoint,
+        &["--goal", "Legacy transport", "--stream", "false"],
+    ));
+    server.join().unwrap();
+}
+
+#[test]
+fn truncated_output_retries_with_less_input_and_discards_partial_tools() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("large.txt"), "A".repeat(4500)).unwrap();
+    let mut previous_bytes = usize::MAX;
+    let (endpoint, server) = mock(move |index, request| {
+        let messages = &request["messages"];
+        match index {
+            0 => text("Inspect the large file."),
+            1 => calls(&[tool(
+                "large",
+                "read_file",
+                json!({"path":"large.txt","offset":0}),
+            )]),
+            2 | 3 => {
+                let bytes = messages.to_string().len();
+                assert!(bytes < previous_bytes);
+                previous_bytes = bytes;
+                stream_response(
+                    &[stream_event(
+                        json!({"tool_calls":[
+                            {"index":0,"id":"partial","function":{"name":"create_file","arguments":"{\"path\":\"partial.txt\""}}
+                        ]}),
+                        Some("length"),
+                    )],
+                    true,
+                    false,
+                )
+            }
+            4 => {
+                assert!(messages.to_string().len() <= previous_bytes);
+                assert_eq!(
+                    messages.as_array().unwrap().last().unwrap()["tool_call_id"],
+                    "large"
+                );
+                text("Inspected the file.")
+            }
+            5 => decision("approved", "Verified."),
+            _ => panic!("unexpected request {index}"),
+        }
+    });
+    let run = cli_window(
+        temp.path(),
+        &endpoint,
+        "4096",
+        &["--goal", "Test output recovery"],
+    );
+    succeeded(&run);
+    assert!(!temp.path().join("partial.txt").exists());
+    server.join().unwrap();
 }
 
 #[test]
@@ -253,6 +519,7 @@ fn provider_retry_counts_against_run_budget() {
 }
 
 #[test]
+#[cfg(unix)]
 fn parallel_result_survives_interrupt_while_another_tool_is_in_flight() {
     use ra::{
         config::Worker,
@@ -435,6 +702,14 @@ fn succeeded(run: &Output) {
     );
 }
 
+fn diagnostics_script() -> &'static str {
+    if cfg!(windows) {
+        "for /L %i in (1,1,100) do @echo abcdefghijklmnopqrstuvwxyz"
+    } else {
+        "yes abcdefghijklmnopqrstuvwxyz | head -n 100"
+    }
+}
+
 #[test]
 fn direct_tool_loop_compacts_and_reviews() {
     let temp = tempfile::tempdir().unwrap();
@@ -462,7 +737,11 @@ fn direct_tool_loop_compacts_and_reviews() {
                     tool(
                         "create",
                         "shell",
-                        json!({"command":"printf 'done\\n' > result.txt; yes abcdefghijklmnopqrstuvwxyz | head -n 100"}),
+                        json!({"command": if cfg!(windows) {
+                            format!("echo done>result.txt & {}", diagnostics_script())
+                        } else {
+                            format!("printf 'done\\n' > result.txt; {}", diagnostics_script())
+                        }}),
                     ),
                     tool("read", "read_file", json!({"path":"result.txt"})),
                 ]);
@@ -480,7 +759,7 @@ fn direct_tool_loop_compacts_and_reviews() {
                 return calls(&[tool(
                     &format!("work-{work_calls}"),
                     "shell",
-                    json!({"command":"yes abcdefghijklmnopqrstuvwxyz | head -n 100"}),
+                    json!({"command":diagnostics_script()}),
                 )]);
             }
             assert!(summaries > 0);
@@ -505,8 +784,11 @@ fn direct_tool_loop_compacts_and_reviews() {
     let run = cli(temp.path(), &endpoint, &["--goal", "test goal"]);
     succeeded(&run);
     assert_eq!(
-        std::fs::read_to_string(temp.path().join("result.txt")).unwrap(),
-        "done\n"
+        std::fs::read_to_string(temp.path().join("result.txt"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["done"]
     );
     assert!(String::from_utf8_lossy(&run.stdout).contains("VERDICT: APPROVED"));
     server.join().unwrap();
@@ -520,7 +802,7 @@ fn resume_does_not_replay_an_interrupted_tool() {
         1 => calls(&[tool(
             "write",
             "shell",
-            json!({"command":"printf 'once\\n' >> result.txt"}),
+            json!({"command":if cfg!(windows) {"echo once>>result.txt"} else {"printf 'once\\n' >> result.txt"}}),
         )]),
         _ => (
             503,
@@ -556,8 +838,11 @@ fn resume_does_not_replay_an_interrupted_tool() {
     let run = cli(temp.path(), &endpoint, &["--resume"]);
     succeeded(&run);
     assert_eq!(
-        std::fs::read_to_string(temp.path().join("result.txt")).unwrap(),
-        "once\n"
+        std::fs::read_to_string(temp.path().join("result.txt"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["once"]
     );
     server.join().unwrap();
 }
@@ -599,6 +884,15 @@ fn reported_usage_adjusts_compaction_without_blocking_the_next_request() {
 
 #[test]
 fn provider_context_limit_retries_with_compacted_history() {
+    exercise_provider_context_limit(false);
+}
+
+#[test]
+fn streamed_context_rejection_retries_with_compacted_history() {
+    exercise_provider_context_limit(true);
+}
+
+fn exercise_provider_context_limit(streamed: bool) {
     let temp = tempfile::tempdir().unwrap();
     let mut worker_requests = 0;
     let (endpoint, server) = mock(move |_, request| {
@@ -610,16 +904,17 @@ fn provider_context_limit_retries_with_compacted_history() {
         }
         if system.contains("You are the worker") {
             worker_requests += 1;
-            let command = |id| {
-                tool(
-                    id,
-                    "shell",
-                    json!({"command":"yes abcdefghijklmnopqrstuvwxyz | head -n 100"}),
-                )
-            };
+            let command = |id| tool(id, "shell", json!({"command":diagnostics_script()}));
             return match worker_requests {
                 1 => calls(&[command("old")]),
                 2 => calls(&[command("recent")]),
+                3 if streamed => stream_response(
+                    &[
+                        json!({"error":{"code":"context_length_exceeded","message":"Context window exceeded"}}),
+                    ],
+                    false,
+                    false,
+                ),
                 3 => (
                     400,
                     json!({"error":{"code":"context_length_exceeded","message":"Context window exceeded"}}),
@@ -906,7 +1201,7 @@ phases = ["planning"]
                     tool(
                         "note",
                         "remember",
-                        json!({"topic":"Vertical datum","note":"Gauge metadata needs review."}),
+                        json!({"topic":"Vertical datum","note":"Gauge metadata needs review.","source":"field notes"}),
                     ),
                     tool(
                         "ask",
@@ -937,7 +1232,7 @@ phases = ["planning"]
                     tool(
                         "reply",
                         "send_message",
-                        json!({"to":"worker_1","message":"datum: local tide gauge"}),
+                        json!({"to":"worker_1","message":"datum: local tide gauge","reason":"clarification"}),
                     ),
                 ])
             } else {
@@ -978,7 +1273,11 @@ phases = ["planning"]
                 verified[index] = true;
                 text("Worker verified the clarification and both shared memories.")
             } else {
-                calls(&[tool("recall", "recall", json!({"query":"DATUM vertical"}))])
+                calls(&[tool(
+                    "recall",
+                    "recall",
+                    json!({"query":"DATUM vertical","limit":3}),
+                )])
             }
         } else if system.starts_with("You are stakeholder Hydraulics adviser") {
             assert!(history.contains("Queued stakeholder reply for delivery to all workers"));
@@ -1128,7 +1427,11 @@ persona = "Own worker_3.txt."
                         false,
                     ),
                     _ => (
-                        calls(&[tool("ack", "ack_plan", json!({"plan_id":id}))]),
+                        calls(&[tool(
+                            "ack",
+                            "ack_plan",
+                            json!({"plan_id":id,"comment":"reviewed"}),
+                        )]),
                         false,
                     ),
                 }
@@ -1280,6 +1583,119 @@ fn resume_interrupted_parallel_worker(workspace: &Path, config: &Path) {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+static TUI_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn tui_previews_pauses_and_restarts_a_generation() {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    let _tui = TUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let (cancelled, cancellation) = mpsc::channel();
+    let server = thread::spawn(move || {
+        for index in 0..5 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "no request {index}");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            let (request, _) = read_mock_request(&mut socket);
+            assert_eq!(request["stream"], true);
+            if index == 1 {
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+                let delta = stream_event(json!({"content":"LIVE-FIRST-PACKET"}), None);
+                let first_chunk = format!("data: {delta}\n\n");
+                write!(socket, "{:X}\r\n{first_chunk}\r\n", first_chunk.len()).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(8);
+                loop {
+                    use std::io::ErrorKind::{ConnectionReset, TimedOut, WouldBlock};
+                    match socket.read(&mut [0; 1]) {
+                        Ok(0) => break,
+                        Err(error) if error.kind() == ConnectionReset => break,
+                        Err(error) if matches!(error.kind(), TimedOut | WouldBlock) => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "client did not close the cancelled stream"
+                            );
+                            // Keep the connection readable so the HTTP client can
+                            // observe that the body consumer has disappeared.
+                            if socket.write_all(b"4\r\n:x\n\n\r\n").is_err() {
+                                break;
+                            }
+                        }
+                        unexpected => panic!("unexpected socket result: {unexpected:?}"),
+                    }
+                }
+                cancelled.send(()).unwrap();
+                continue;
+            }
+            assert!(
+                !request["messages"]
+                    .to_string()
+                    .contains("LIVE-FIRST-PACKET")
+            );
+            let (_, response) = match index {
+                0 => text(
+                    r#"{"goal":"Inspect the fixture","stakeholders":[],"message":"plan-ready-marker"}"#,
+                ),
+                2 => {
+                    assert!(request["messages"].to_string().contains("use-a-new-check"));
+                    text("Inspect the workspace.")
+                }
+                3 => text("Workspace inspected."),
+                4 => decision("approved", "Verified after cancellation."),
+                _ => unreachable!(),
+            };
+            let body = serde_json::to_vec(&response).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            socket.write_all(&body).unwrap();
+        }
+    });
+    let (mut terminal, process) = launch_tui(temp.path(), &endpoint);
+    let mut display = Vec::new();
+    wait_for_screen(&mut terminal, &mut display, "Stakeholders");
+    terminal.write_all(b"Inspect fixture\r").unwrap();
+    wait_for_screen(&mut terminal, &mut display, "plan-ready-marker");
+    terminal.write_all(b"\x1b[15~").unwrap();
+    wait_for_screen(&mut terminal, &mut display, "LIVE-FIRST-PACKET");
+    terminal.write_all(b"\x03").unwrap();
+    wait_for_screen(&mut terminal, &mut display, "paused.");
+    cancellation
+        .recv_timeout(Duration::from_secs(9))
+        .unwrap_or_else(|error| {
+            panic!(
+                "generation cancellation failed: {error}\n{}",
+                String::from_utf8_lossy(&display[display.len().saturating_sub(2500)..])
+            )
+        });
+    terminal.write_all(b"use-a-new-check\r").unwrap();
+    terminal.write_all(b"\x1b[17~").unwrap();
+    wait_for_screen(&mut terminal, &mut display, "Approved");
+    terminal.write_all(b"q").unwrap();
+    wait_for_screen(&mut terminal, &mut display, "\x1b[?1049l");
+    let run = process.finish();
+    succeeded(&run);
+    assert!(String::from_utf8_lossy(&run.stdout).contains("Verified after cancellation."));
+    server.join().unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn tui_refines_and_approves_a_goal_then_displays_file_tools() {
     use std::sync::{
@@ -1287,6 +1703,9 @@ fn tui_refines_and_approves_a_goal_then_displays_file_tools() {
         atomic::{AtomicBool, Ordering},
     };
 
+    let _tui = TUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let approved = Arc::new(AtomicBool::new(false));
     let allowed = approved.clone();
@@ -1471,12 +1890,14 @@ fn launch_tui(cwd: &Path, endpoint: &str) -> (std::fs::File, TerminalChild) {
             ),
             0
         );
+        assert_eq!(libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+        assert_eq!(libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC), 0);
         (
             std::fs::File::from_raw_fd(master),
             std::fs::File::from_raw_fd(slave),
         )
     };
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ra"));
+    let mut command = Command::new(ratio_binary());
     command
         .args([
             "-C",
@@ -1520,9 +1941,13 @@ impl TerminalChild {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for TerminalChild {
     fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
+        if let Some(mut child) = self.0.take() {
             let _ = child.kill();
-            let _ = child.wait();
+            // During unwinding the PTY master may still be open. Reap the
+            // child after the test stack has closed it.
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
     }
 }

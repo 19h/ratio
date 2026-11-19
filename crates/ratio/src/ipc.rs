@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use crate::{
     api::ToolCall,
+    context::clip,
     events::{Delivery, Kind, NetworkEvent, Reporter, Traffic, TrafficKind, TrafficScope, clean},
 };
 
@@ -253,12 +254,11 @@ impl<'a> PlanGate<'a> {
 
     pub fn object(&self, call: &ToolCall, worker: usize) -> String {
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct Input {
             plan_id: String,
             reason: String,
         }
-        let input = serde_json::from_str::<Input>(&call.function.arguments);
+        let input = crate::api::tool_arguments::<Input>(&call.function.arguments);
         if let Ok(input) = input {
             if call.kind == "function"
                 && input.plan_id == self.id
@@ -297,12 +297,11 @@ impl<'a> PlanGate<'a> {
 
     pub fn execute(&self, call: &ToolCall, worker: usize) -> String {
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct Ack {
             plan_id: String,
         }
         if call.kind != "function"
-            || !serde_json::from_str::<Ack>(&call.function.arguments)
+            || !crate::api::tool_arguments::<Ack>(&call.function.arguments)
                 .is_ok_and(|ack| ack.plan_id == self.id)
         {
             return "REFUSED: ack_plan requires the exact current plan_id".into();
@@ -320,14 +319,21 @@ impl Route<'_> {
         match self.send(call, key) {
             Ok(true) => "Queued stakeholder reply for delivery to all workers.".into(),
             Ok(false) => "Queued for delivery at the recipient's next model request.".into(),
-            Err(error) => format!("REFUSED: {error}"),
+            Err(error) => {
+                let message = format!("REFUSED: {error:#}");
+                let message = match key {
+                    Some(key) => message.replace(key, "[redacted]"),
+                    None => message,
+                };
+                clip(&message, 1024)
+            }
         }
     }
 
     fn send(self, call: &ToolCall, key: Option<&str>) -> Result<bool> {
         ensure!(call.kind == "function", "expected a function tool call");
         let input: Send =
-            serde_json::from_str(&call.function.arguments).context("use to and message")?;
+            crate::api::tool_arguments(&call.function.arguments).context("use to and message")?;
         validate(&input.message)?;
         ensure!(
             key.is_none_or(|key| !input.message.contains(key)),
@@ -391,7 +397,6 @@ impl Route<'_> {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Send {
     to: String,
     message: String,

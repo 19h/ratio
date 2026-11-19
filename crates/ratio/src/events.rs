@@ -1,4 +1,4 @@
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc::UnboundedSender, watch};
 
 use crate::context::clip;
 
@@ -17,6 +17,22 @@ pub struct Event {
     pub title: String,
     pub body: String,
     pub network: Option<NetworkEvent>,
+    pub generation: Option<Generation>,
+}
+
+pub enum Generation {
+    Preview {
+        id: usize,
+        label: String,
+        text: String,
+    },
+    End(usize),
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct GenerationControl {
+    pub paused: bool,
+    pub epoch: u64,
 }
 
 pub struct AgentNode {
@@ -65,7 +81,7 @@ pub enum NetworkEvent {
 pub enum Reporter {
     Silent,
     Terminal,
-    Tui(UnboundedSender<Event>),
+    Tui(UnboundedSender<Event>, watch::Receiver<GenerationControl>),
 }
 
 impl Reporter {
@@ -80,28 +96,49 @@ impl Reporter {
             Self::Terminal => {
                 eprintln!("{title}\n{}", clip(&body, 24 * 1024));
             }
-            Self::Tui(sender) => {
+            Self::Tui(sender, _) => {
                 let _ = sender.send(Event {
                     kind,
                     title,
                     body,
                     network: None,
+                    generation: None,
                 });
             }
         }
     }
 
     pub fn observes_network(&self) -> bool {
-        matches!(self, Self::Tui(_))
+        matches!(self, Self::Tui(..))
     }
 
     pub fn network(&self, event: NetworkEvent) {
-        if let Self::Tui(sender) = self {
+        if let Self::Tui(sender, _) = self {
             let _ = sender.send(Event {
                 kind: Kind::Ipc,
                 title: String::new(),
                 body: String::new(),
                 network: Some(event),
+                generation: None,
+            });
+        }
+    }
+
+    pub fn generation_control(&self) -> Option<watch::Receiver<GenerationControl>> {
+        match self {
+            Self::Tui(_, control) => Some(control.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn generation(&self, event: Generation) {
+        if let Self::Tui(sender, _) = self {
+            let _ = sender.send(Event {
+                kind: Kind::Info,
+                title: String::new(),
+                body: String::new(),
+                network: None,
+                generation: Some(event),
             });
         }
     }
