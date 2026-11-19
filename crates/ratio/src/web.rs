@@ -317,7 +317,8 @@ fn select(reader: &RunReader, run: &str, view: &str, query: &Query) -> Result<Va
                     before: param("before").and_then(|value| value.parse().ok()),
                     after: param("after").and_then(|value| value.parse().ok()),
                     actor: param("actor"),
-                    kind: param("kind"),
+                    kind: param("kind")
+                        .or_else(|| (param("collapse_tools") == Some("1")).then_some("timeline")),
                     cycle: param("cycle").and_then(|value| value.parse().ok()),
                     phase: param("phase"),
                     query: param("q"),
@@ -393,8 +394,17 @@ fn select(reader: &RunReader, run: &str, view: &str, query: &Query) -> Result<Va
             } else {
                 Vec::new()
             };
+            let tool_key = match event.kind.as_str() {
+                "tool" => Some(key),
+                "tool_result" => event.data["call"].as_str(),
+                _ => None,
+            };
+            let tool_stages = tool_key
+                .map(|key| reader.tool_stages(run, key))
+                .transpose()?
+                .unwrap_or_default();
             Ok(
-                json!({"event":event,"outcome":outcome,"turn":turn,"origin":origin,"deliveries":transitions}),
+                json!({"event":event,"outcome":outcome,"turn":turn,"origin":origin,"deliveries":transitions,"tool_stages":tool_stages}),
             )
         }
         _ => anyhow::bail!("Endpoint not found"),

@@ -85,7 +85,7 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
         assert.ok(!tools.has("create_file"));
         if (input.messages.some(message => message.role === "tool")) output = completion("Onboarding evidence recorded.");
         else if (system.includes("incoming worker")) output = completion(null,
-          call("send_message",{to:"worker_1",message:"interface: request contract"},"mentor"),
+          call("send_message",{to:"worker_1",message:"interface: request contract "+"integration contract ".repeat(30)},"mentor"),
           call("send_message",{to:"stakeholder_1",message:"evidence: request acceptance"},"adviser"));
         else output = completion(null,call("send_message",{to:"worker_2",message:"acceptance: verify evidence"}));
       }
@@ -230,14 +230,28 @@ tools = ["inspect"]
     await page.getByRole("link",{name:"Onboarding IPC",exact:true}).click();
     await page.getByText("evidence: request acceptance",{exact:true}).first().waitFor();
     await shot("sequence");
-    const latest = await page.locator(".seq-row.selected").getAttribute("id");
-    await page.keyboard.press("ArrowUp");
+    const sequenceIds = (await page.locator(".seq-id").allTextContents()).map(Number);
+    assert.ok(sequenceIds.length > 1);
+    assert.deepEqual(sequenceIds, [...sequenceIds].sort((a, b) => b - a));
+    assert.equal(await page.locator(".seq-row:first-of-type.selected").count(), 1);
+    assert.equal(await page.locator(".view-scroll").evaluate(element => element.scrollTop), 0);
+    await page.keyboard.press("ArrowDown");
     await page.waitForURL(url => url.searchParams.has("entry"));
     await page.locator(".inspector").getByRole("link",{name:"Close selection"}).waitFor();
-    assert.notEqual(await page.locator(".seq-row.selected").getAttribute("id"),latest);
+    assert.equal(Number(await page.locator(".seq-row.selected .seq-id").textContent()), sequenceIds[1]);
     await shot("sequence-selected");
     await page.getByRole("link",{name:"Agent lanes",exact:true}).click();
     await page.getByRole("heading",{name:"Agent lanes"}).waitFor();
+    const lanes = page.getByRole("region",{name:"Agent lanes"});
+    const message = lanes.locator(".lane-message").filter({hasText:"interface: request contract"});
+    await message.waitFor();
+    const laneIds = await lanes.locator(".lane-message").evaluateAll(links =>
+      links.map(link => Number(link.getAttribute("aria-label").split(" ")[1])));
+    assert.deepEqual(laneIds, sequenceIds);
+    assert.equal(await message.count(), 1);
+    assert.ok(await message.evaluate(element =>
+      element.scrollHeight > element.clientHeight && element.clientWidth >= 240));
+    await message.locator("xpath=../..").getByText("Delivered",{exact:true}).waitFor();
     await shot("lanes");
     await page.getByRole("link",{name:"Route matrix",exact:true}).click();
     const grid = page.getByRole("region",{name:"Route matrix"});
@@ -283,12 +297,42 @@ tools = ["inspect"]
     await page.reload();
     await page.locator(".entry.selected .highlight").waitFor();
     await shot("timeline");
+    assert.equal(await page.locator('.timeline .entry[data-kind="tool_result"]').count(), 0);
+    const timeline = page.locator(".timeline");
+    const emptyTurns = timeline.locator('.entry[data-kind="chat"] .entry-body').filter({
+      has: page.locator(".call-list"), hasNot: page.locator("pre"),
+    });
+    assert.equal(await emptyTurns.count(), 0);
+    const messageCall = timeline.locator('.entry[data-kind="tool"]').filter({
+      has: page.getByRole("link",{name:"send_message",exact:true}),
+    }).first();
+    await messageCall.getByRole("link",{name:"Jump to chat"}).click();
+    await timeline.locator(".entry.selected .highlight").filter({hasText:/^send_message$/}).waitFor();
+    assert.equal(await emptyTurns.count(), 1);
+    await page.goBack();
+    await timeline.locator(".entry.selected .highlight").filter({hasText:"mcp_call"}).waitFor();
+    await page.locator(".entry.selected .highlight").click();
+    const inspection = page.locator(".inspector");
+    const running = inspection.getByRole("link",{name:"Running",exact:true});
+    await running.waitFor();
+    await running.click();
+    await page.locator('.entry.selected[data-kind="tool_result"]').getByText("Running",{exact:true}).waitFor();
+    await inspection.getByRole("link",{name:"Jump to chat",exact:true}).click();
+    await page.locator(".entry.selected .highlight").waitFor();
     await page.setViewportSize({width:480,height:845});
     await shot("narrow");
     await page.getByRole("button",{name:"Toggle navigation"}).click();
     await shot("narrow-menu");
     await page.locator("#navigation").getByRole("link",{name:"Overview"}).click();
     await page.getByRole("heading",{name:"Run overview"}).waitFor();
+    const assignment = page.getByLabel("Task details for Evidence auditor");
+    await assignment.waitFor();
+    const taskPreview = assignment.locator(".plan-task-preview");
+    assert.ok(await taskPreview.evaluate(element =>
+      element.scrollHeight > element.clientHeight && element.clientHeight < 65));
+    await assignment.click();
+    await page.getByLabel("Task description",{exact:true}).filter({hasText:"Last checkpoint."}).waitFor({state:"visible"});
+    await assignment.click();
     await page.locator("#controls").getByRole("button",{name:"Fork",exact:true}).waitFor();
     await page.waitForFunction(total => {
       const counter = document.querySelector("[data-token-usage]");

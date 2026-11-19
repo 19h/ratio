@@ -77,16 +77,16 @@ function heading(text, context, ...actions) {
     context ? node("span", { class: "context muted" }, context) : null, spacer(), actions);
 }
 
-function view(head, body, { aside = null, flush = false, follow = false } = {}) {
+function view(head, body, { aside = null, flush = false } = {}) {
   return [head, node("div", { class: "view-body" },
-    node("div", { class: `view-scroll ${flush ? "flush" : "stack"}`, "data-scroll": "body", "data-follow": follow ? "end" : undefined }, body), aside)];
+    node("div", { class: `view-scroll ${flush ? "flush" : "stack"}`, "data-scroll": "body" }, body), aside)];
 }
 
 function table(columns, rows, className = "") {
   if (!rows.length) return empty("No matching entries.");
   return node("div", { class: "table-wrap" }, node("table", { class: className },
     node("thead", {}, node("tr", {}, columns.map(text => node("th", { scope: "col" }, text)))),
-    node("tbody", {}, rows.map(cells => node("tr", { class: cells.selected ? "selected" : undefined }, cells.map(value =>
+    node("tbody", {}, rows.map(cells => node("tr", { id: cells.id, class: cells.selected ? "selected" : undefined }, cells.map(value =>
       value?.cell === undefined ? node("td", {}, value) : node(value.scope ? "th" : "td", { class: value.class, scope: value.scope }, value.cell)))))));
 }
 
@@ -290,6 +290,24 @@ function phaseRail(phase) {
     }));
 }
 
+function executionPlan(tasks, flow, data) {
+  const taskTable = table(["Task", "Worker", "State", "Depends on"], tasks.map(({ task, state: status }) => [
+    node("details", { class: "plan-task" },
+      node("summary", { "aria-label": `Task details for ${actorName(task.worker)}` },
+        node("span", { class: "plan-task-preview" }, task.description)),
+      pre(task.description, { tabindex: 0, "aria-label": "Task description" })),
+    actorLink(task.worker), pill(status), task.depends_on.length ? code(task.depends_on.join(", ")) : "—",
+  ]), "plan");
+  return section({ label: "Execution plan", meta: flow.plan_id ? code(flow.plan_id) : null, flush: true },
+    tasks.length ? taskTable : empty("Waiting for a frozen plan."),
+    (data.acceptance ?? []).length ? node("details", {}, node("summary", {}, "Acceptance criteria"),
+      node("ul", {}, data.acceptance.map(text => node("li", {}, text)))) : null,
+    data.plan?.ownership ? node("details", {}, node("summary", {}, "Write ownership"),
+      table(["Worker", "Paths"], data.plan.ownership.map((paths, index) => [
+        actorLink(`worker_${index + 1}`), paths.map(path => code(path.path + (path.directory ? "/" : ""))),
+      ]))) : null);
+}
+
 function overview() {
   const data = state.summary;
   const flow = data.event?.workflow ?? {};
@@ -308,17 +326,9 @@ function overview() {
         node("span", { class: "hero-sub" }, `cycle ${data.run.cycle}`, flow.stopped ? pill(flow.stopped) : null)),
       phaseRail(phase)),
     node("div", { class: "columns" },
-      node("div", { class: "col" },
-        section({ label: "Agents", meta: agents.length || null, flush: true }, agents.length
-          ? agents.map(agent => agentRow(agent, tasks.find(task => task.task.worker === agent.id), false))
-          : empty("The roster appears once a team is proposed.")),
-        section({ label: "Execution plan", meta: flow.plan_id ? code(flow.plan_id) : null, flush: true },
-          tasks.length ? table(["Task", "Worker", "State", "Depends on"], tasks.map(({ task, state: status }) =>
-            [task.description, actorLink(task.worker), pill(status), task.depends_on.length ? code(task.depends_on.join(", ")) : "—"]), "plan")
-            : empty("Waiting for a frozen plan."),
-          (data.acceptance ?? []).length ? node("details", {}, node("summary", {}, "Acceptance criteria"), node("ul", {}, data.acceptance.map(text => node("li", {}, text)))) : null,
-          data.plan?.ownership ? node("details", {}, node("summary", {}, "Write ownership"),
-            table(["Worker", "Paths"], data.plan.ownership.map((paths, index) => [actorLink(`worker_${index + 1}`), paths.map(path => code(path.path + (path.directory ? "/" : "")))]))) : null)),
+      section({ label: "Agents", meta: agents.length || null, flush: true }, agents.length
+        ? agents.map(agent => agentRow(agent, tasks.find(task => task.task.worker === agent.id), false))
+        : empty("The roster appears once a team is proposed.")),
       node("div", { class: "col" },
         section("Run state", facts([
           ["Acknowledged", acknowledged.length ? acknowledged.map(id => actorLink(id)) : "None yet"],
@@ -331,6 +341,7 @@ function overview() {
         section("Usage", facts(Object.entries(metrics).flatMap(([name, value]) => name === "token_breakdown"
           ? Object.entries(value).map(([flow, count]) => [title(flow) + " tokens", tokenCount(count)])
           : [[title(name), number.format(value)]])) ?? muted("Nothing metered yet.")))),
+    executionPlan(tasks, flow, data),
   ]);
 }
 
@@ -379,8 +390,14 @@ function historyCard(event, selected, call, anchor = true) {
       (data.calls ?? []).length ? node("div", { class: "call-list" }, data.calls.map(item =>
         link(item.tool, entryUrl(item.key), { class: call === item.key ? "highlight" : undefined, "data-call": item.key }))) : null];
   } else if (event.kind === "tool" || event.kind === "tool_result") {
-    body = row(link(toolName(data), entryUrl(data.call ?? event.key)), pill(data.state), data.path ? code(data.path) : null,
-      data.turn ? go("Jump to chat", entryUrl(data.turn, "history", { call: data.call ?? event.key })) : null);
+    const tool = toolName(data);
+    const key = data.call ?? event.key;
+    body = node("div", { class: "tool-event" },
+      link(tool, entryUrl(key), { class: "truncate", title: tool }),
+      node("span", { class: "tool-event-state", "data-state": data.state }, title(data.state)),
+      data.path ? node("code", { class: "truncate tool-event-path", title: data.path }, data.path) : null,
+      data.turn ? link("Chat", entryUrl(data.turn, "history", { call: key }),
+        { class: "tool-event-chat", title: "Open original chat turn", "aria-label": "Jump to chat" }) : null);
   } else if (event.kind === "ipc") {
     body = [row(caption("To"), (data.to ?? []).map(id => actorLink(id)), pill(data.delivery)), pre(data.body)];
   } else if (event.kind === "triage") {
@@ -390,9 +407,12 @@ function historyCard(event, selected, call, anchor = true) {
   } else {
     body = pre(asText(data.text) || data.label || data.reason || "");
   }
+  const kind = tag(event.kind);
+  kind.title = title(event.kind);
   return node("article", { id: anchor ? "event-" + event.key : undefined, class: `entry${event.key === selected ? " selected" : ""}`, "data-kind": event.kind },
-    node("header", {}, time(event.timestamp_ms), node("span", { class: "truncate" }, actorLink(event.actor)), tag(event.kind)),
+    node("header", {}, time(event.timestamp_ms), kind),
     node("div", { class: "entry-body" }, body),
+    node("div", { class: "entry-actor truncate", title: actorName(event.actor) }, actorLink(event.actor)),
     node("footer", {}, tag(event.phase, "phase"), link("#" + event.sequence, entryUrl(event.key))));
 }
 
@@ -449,6 +469,10 @@ function inspector(detail, close) {
       ["Tool", code(toolName(data))], ["Agent", actorLink(event.actor)], ["State", pill(outcome.state)],
       ["Time", time(event.timestamp_ms)], ["Path", data.path ? code(data.path) : null]]),
     go("Jump to chat", entryUrl(data.turn, "history", { call: data.call ?? event.key }))),
+    detail.tool_stages?.length > 1 ? node("div", { class: "inspector-section" },
+      caption("Tool lifecycle"), detail.tool_stages.map(stage => row(
+        stage.key === event.key ? pill(stage.state) : go(title(stage.state), entryUrl(stage.key, "history", { kind: stage.state === "queued" ? "tool" : "tool_result" })),
+        spacer(), time(stage.timestamp_ms)))) : null,
     data.arguments ? payload("Arguments", data.arguments, event.key) : null,
     data.legacy ? node("div", { class: "inspector-section" }, muted("Historical checkpoint. Full tool result was not recorded.")) : payload("Full result", outcome.full, event.key),
     payload("Model-visible result", outcome.output, event.key)];
@@ -477,6 +501,10 @@ function role(id) {
   const head = String(id).split("_")[0];
   return head === "worker" ? "worker" : head === "reviewer" || head === "lead" ? "reviewer" : head === "stakeholder" ? "stakeholder" : "other";
 }
+function agentBadge(id) {
+  const label = alias(id);
+  return node("abbr", { class: "alias", "data-role": role(id), title: actorName(id) }, label === "Agent" ? id : label);
+}
 function who(id) { return [node("strong", { class: "alias", "data-role": role(id) }, alias(id)), actorLink(id)]; }
 function mark(status, direction) {
   return node("b", { class: "mark", "data-state": status, "data-dir": direction, "aria-hidden": "true" },
@@ -500,7 +528,7 @@ function exchanges(rows) {
       if (data.delivery !== "queued" || !item.to.has(recipient)) item.to.set(recipient, data.delivery);
     }
   }
-  return [...found.values()];
+  return [...found.values()].reverse();
 }
 
 function sequence(items, query, focus) {
@@ -567,7 +595,6 @@ function routeMatrix(routes, query) {
   if (!routes.length) return section(head, empty("No matching routes."));
   const participants = new Set(routes.flatMap(entry => [entry.from, entry.to]));
   const ids = [...new Set([...roster().map(agent => agent.id), ...participants])].filter(id => participants.has(id));
-  const badge = id => node("abbr", { class: "alias", "data-role": role(id), title: actorName(id) }, alias(id) === "Agent" ? id : alias(id));
   const counts = new Map();
   for (const entry of routes) {
     const key = entry.from + ">" + entry.to;
@@ -577,8 +604,8 @@ function routeMatrix(routes, query) {
   }
   const total = tally => tally.delivered + tally.queued + tally.dropped;
   const peak = Math.max(1, ...[...counts.values()].map(total));
-  const grid = table(["From / To", ...ids.map(badge)], ids.map(from => [
-    { scope: "row", cell: node("span", { class: "route-source" }, badge(from), actorLink(from)) },
+  const grid = table(["From / To", ...ids.map(agentBadge)], ids.map(from => [
+    { scope: "row", cell: node("span", { class: "route-source" }, agentBadge(from), actorLink(from)) },
     ...ids.map(to => {
       const tally = counts.get(from + ">" + to);
       if (!tally) return "—";
@@ -595,20 +622,28 @@ function routeMatrix(routes, query) {
   return section(head, grid);
 }
 
-function communication(rows, route, focus) {
-  const query = route.query;
-  const selected = rows.filter(event => (!query.from || event.actor === query.from) && (!query.to || event.data.to?.includes(query.to)));
-  if (query.tab === "lanes") {
-    const agents = [...new Set(selected.flatMap(event => [event.actor, ...(event.data.to ?? [])]))];
-    return section({ label: "Agent lanes", meta: selected.length || null, flush: true }, table(["Time", ...agents.map(actorName), "Message"], [...selected].reverse().map(event => {
-      const cells = [time(event.timestamp_ms), ...agents.map(agent => agent === event.actor ? pill("Sent")
-        : event.data.to?.includes(agent) ? pill(event.data.delivery) : node("span", { class: "lane-mark", "aria-hidden": "true" }, "·")),
-      link(event.data.body, entryUrl(event.key, "ipc", query))];
-      cells.selected = event.key === query.entry;
-      return cells;
-    }), "matrix lanes"));
-  }
-  return sequence(exchanges(selected), query, focus);
+function communication(messages, query, focus) {
+  if (query.tab !== "lanes") return sequence(messages, query, focus);
+  const head = { label: "Agent lanes", meta: messages.length || null, flush: true };
+  if (!messages.length) return section(head, empty("No matching messages."));
+  const participants = new Set(messages.flatMap(({ event, to }) => [event.actor, ...to.keys()]));
+  const agents = [...new Set([...roster().map(agent => agent.id), ...participants])].filter(id => participants.has(id));
+  const grid = table(["Time", "Message", ...agents.map(agentBadge)], messages.map(({ event, keys, to }) => {
+    const messageLink = link(event.data.body, entryUrl(event.key, "ipc", query), {
+      class: "lane-message", "aria-label": `Message ${event.sequence} from ${actorName(event.actor)}`,
+    });
+    const cells = [time(event.timestamp_ms), messageLink, ...agents.map(agent => agent === event.actor ? pill("Sent")
+      : to.has(agent) ? pill(to.get(agent)) : node("span", { class: "lane-mark", "aria-hidden": "true" }, "·"))];
+    cells.selected = keys.includes(focus);
+    cells.id = "event-" + (cells.selected ? focus : event.key);
+    return cells;
+  }), "matrix lanes");
+  $("table", grid).style.setProperty("--agent-count", agents.length);
+  grid.dataset.scroll = "agent-lanes";
+  grid.tabIndex = 0;
+  grid.setAttribute("role", "region");
+  grid.setAttribute("aria-label", "Agent lanes");
+  return section(head, grid);
 }
 
 function tabs(page, options, current, query = {}) {
@@ -663,15 +698,18 @@ async function historyView(route) {
       page === "agent" && tab === "tools" ? "tool" : query.kind;
   const [historyData, chosen] = await Promise.all([
     matrix ? api(apiRun("routes", query)) : api(apiRun("history", { ...query, actor: actor ?? query.actor, kind,
+      collapse_tools: page === "history" && !kind ? 1 : undefined,
       from: actor && tab === "ipc" && query.direction === "outgoing" ? actor : query.from,
       to: actor && tab === "ipc" && query.direction === "incoming" ? actor : query.to,
       path: tab === "files" ? query.path ?? "*" : query.path })),
     query.entry ? api(apiRun("entry/" + encodeURIComponent(query.entry))).catch(() => null) : null,
   ]);
   let { rows } = historyData;
-  // Like the TUI, the sequence diagram inspects the newest message until one is chosen.
+  const messages = page === "ipc" && !matrix ? exchanges(rows.filter(event =>
+    (!query.from || event.actor === query.from) && (!query.to || event.data.to?.includes(query.to)))) : [];
+  // Inspect the first message in the sequence until the operator selects another.
   const diagram = page === "ipc" && tab === "all";
-  const focus = query.entry ?? (diagram ? rows.find(event => event.data.delivery === "queued")?.key ?? rows[0]?.key : undefined);
+  const focus = query.entry ?? (diagram ? messages[0]?.event.key : undefined);
   const detail = chosen ?? (focus && !query.entry ? await api(apiRun("entry/" + encodeURIComponent(focus))).catch(() => null) : null);
   const head = [];
   if (page === "agent") {
@@ -711,9 +749,11 @@ async function historyView(route) {
     query.from ? pill("From " + actorName(query.from)) : null, query.to ? pill("To " + actorName(query.to)) : null,
     query.worker_request ? pill("Worker request " + query.worker_request) : null, go("Clear route", runUrl("ipc", { tab: query.tab }))));
   head.push(filters(route, { actor: page !== "agent", kind: page === "history" }));
-  if (detail && page === "history" && !rows.some(entry => entry.key === detail.event.key)) rows = [detail.event, ...rows];
+  if (detail && page === "history" && !rows.some(entry => entry.key === detail.event.key)) {
+    rows = [detail.event, ...rows].sort((a, b) => b.sequence - a.sequence);
+  }
   let content;
-  if (page === "ipc") content = matrix ? routeMatrix(rows, query) : communication(rows, route, focus);
+  if (page === "ipc") content = matrix ? routeMatrix(rows, query) : communication(messages, query, focus);
   else if (page === "tools" || tab === "tools") content = section({ label: tab === "mcp" ? "MCP calls" : "Tool calls", meta: rows.length || null, flush: true }, toolTable(rows, route, local));
   else content = node("section", { class: "timeline", "aria-label": "Recorded timeline" }, rows.length
     ? rows.map(event => historyCard(event, query.entry, query.call))
@@ -726,8 +766,8 @@ async function historyView(route) {
     : pagination("History pagination",
       query.before ? link("Latest", runUrl(local, { ...query, before: undefined, entry: undefined })) : null,
       historyData.rows.length >= 60 ? link("Older entries", runUrl(local, { ...query, before: oldest, entry: undefined })) : null);
-  return view(head, matrix ? content : diagram ? [pages, content] : [content, pages], {
-    aside: inspector(detail, query.entry ? runUrl(local, { ...query, entry: undefined }) : null), flush: true, follow: diagram,
+  return view(head, matrix ? content : [content, pages], {
+    aside: inspector(detail, query.entry ? runUrl(local, { ...query, entry: undefined }) : null), flush: true,
   });
 }
 
@@ -793,16 +833,12 @@ async function load(restart = true, preserveInteraction = false) {
     const settled = spot === state.spot;
     state.spot = spot;
     const scrolls = restart && !settled ? [] : [main, ...main.querySelectorAll("[data-scroll]")].map(element =>
-      [element.dataset.scroll, element.scrollLeft, element.scrollTop, element.scrollHeight - element.scrollTop - element.clientHeight < 8]);
+      [element.dataset.scroll, element.scrollLeft, element.scrollTop]);
     fill(main, nodes);
-    for (const [key, left, top, atEnd] of scrolls) {
+    for (const [key, left, top] of scrolls) {
       const element = key ? $(`[data-scroll="${key}"]`, main) : main;
       if (!element || (restart && key === "inspector")) continue;
-      element.scrollTo(left, element.dataset.follow && atEnd && !wanted.query.entry ? element.scrollHeight : top);
-    }
-    if (!scrolls.length && !wanted.query.entry) {
-      const follower = $("[data-follow]", main);
-      follower?.scrollTo(0, follower.scrollHeight);
+      element.scrollTo(left, top);
     }
     if (restart && wanted.query.entry) {
       document.getElementById("event-" + wanted.query.entry)?.scrollIntoView({ block: settled ? "nearest" : "center" });
@@ -949,9 +985,9 @@ document.addEventListener("keydown", event => {
   const step = { ArrowUp: -1, k: -1, ArrowDown: 1, j: 1 }[event.key];
   if (step && messages.length) {
     const current = messages.findIndex(message => message.classList.contains("selected"));
-    const target = messages[Math.max(0, Math.min(messages.length - 1, (current < 0 ? messages.length - 1 : current) + step))];
+    const target = messages[current < 0 ? 0 : Math.max(0, Math.min(messages.length - 1, current + step))];
     event.preventDefault();
-    navigate(target.getAttribute("href"));
+    if (target !== messages[current]) navigate(target.getAttribute("href"));
   } else if (event.key === "/") {
     event.preventDefault();
     $("#global-search input").focus();

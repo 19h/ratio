@@ -571,7 +571,11 @@ impl RunReader {
                 ELSE data END
             FROM audit_events a WHERE run_id=?1 AND (?2 IS NULL OR sequence<?2) AND (?3 IS NULL OR sequence>?3)
             AND (?4 IS NULL OR actor=?4 OR (kind='ipc' AND EXISTS(SELECT 1 FROM json_each(data,'$.to') WHERE value=?4)))
-            AND (?5 IS NULL OR kind=?5 OR (?5='mcp' AND kind='tool' AND json_extract(data,'$.tool') IN ('mcp_list','tool_search','mcp_call')))
+            AND (?5 IS NULL OR kind=?5 OR (?5='timeline' AND kind<>'tool_result'
+                AND NOT (kind='chat' AND coalesce(json_array_length(data,'$.calls'),0)>0
+                    AND trim(coalesce(json_extract(data,'$.text.text'),json_extract(data,'$.text'),''),
+                        char(9,10,11,12,13,32))=''))
+                OR (?5='mcp' AND kind='tool' AND json_extract(data,'$.tool') IN ('mcp_list','tool_search','mcp_call')))
             AND (?6 IS NULL OR cycle=?6) AND (?7 IS NULL OR phase=?7)
             AND (?8 IS NULL OR sequence IN (SELECT rowid FROM audit_search WHERE audit_search MATCH ?8)
                 OR (kind='tool' AND EXISTS (SELECT 1 FROM audit_events result
@@ -708,6 +712,24 @@ impl RunReader {
             FROM audit_events WHERE run_id=?1 AND key IN (?2||'-running',?2||'-completed',?2||'-failed',
                 ?2||'-refused',?2||'-unknown') ORDER BY sequence DESC LIMIT 1",
             params![run,key], decode_audit).optional()
+    }
+
+    pub fn tool_stages(&self, run: &str, key: &str) -> Result<Vec<serde_json::Value>> {
+        let mut statement = self.0.prepare(
+            "SELECT key,timestamp_ms,json_extract(data,'$.state')
+             FROM audit_events WHERE run_id=?1 AND key IN
+                 (?2,?2||'-running',?2||'-completed',?2||'-failed',?2||'-refused',?2||'-unknown')
+             ORDER BY sequence",
+        )?;
+        statement
+            .query_map(params![run, key], |row| {
+                Ok(serde_json::json!({
+                    "key": row.get::<_, String>(0)?,
+                    "timestamp_ms": row.get::<_, u64>(1)?,
+                    "state": row.get::<_, String>(2)?,
+                }))
+            })?
+            .collect()
     }
 
     pub fn audit_head(&self, run: &str) -> Result<u64> {
