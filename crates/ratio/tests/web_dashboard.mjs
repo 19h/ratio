@@ -43,6 +43,8 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
   const profile = join(dir,"ratio.toml");
   let release;
   const gate = new Promise(resolve => { release = resolve; });
+  let streamMore;
+  const nextChunk = new Promise(resolve => { streamMore = resolve; });
   let finishWorker;
   const workGate = new Promise(resolve => { finishWorker = resolve; });
   let endFork;
@@ -51,6 +53,7 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
   const started = new Promise(resolve => { firstWork = resolve; });
   let workerCalled = false;
   let sawGuidance = false;
+  let reportedTotal = 0;
   const provider = createServer(async (request,response) => {
     try {
       const body = [];
@@ -94,11 +97,22 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
         if (system.includes("worker_2")) output = completion("Reviewed integration evidence.");
         else if (!workerCalled) {
           workerCalled = true;
+          assert.equal(tools.get("tool_search").properties.query.type, "array");
+          response.setHeader("content-type", "text/event-stream");
+          const delta = (data, finish = null) =>
+            response.write(`data: ${JSON.stringify({choices:[{index:0,delta:data,finish_reason:finish}]})}\n\n`);
+          delta({content:"Inspect tool metadata and evidence."});
           firstWork();
+          await nextChunk;
+          delta({reasoning_content:"evidence ".repeat(60)});
           await gate;
-          output = completion("Inspect tool metadata and evidence.",
-            call("mcp_list",{server:"fixture"}),call("tool_search",{server:"fixture",query:"spe"}),
-            call("mcp_call",{server:"fixture",name:"inspect",arguments:{subject:"interface"}}));
+          const calls = [call("mcp_list",{server:"fixture"}),call("tool_search",{server:"fixture",query:["spe","inspect"]}),
+            call("mcp_call",{server:"fixture",name:"inspect",arguments:{subject:"interface"}})];
+          delta({tool_calls:calls.map((item,index) => ({ ...item,index }))}, "tool_calls");
+          reportedTotal += 25;
+          response.write('data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":5}}\n\n');
+          response.end("data: [DONE]\n\n");
+          return;
         } else {
           sawGuidance = JSON.stringify(input.messages).includes("Additional interface evidence");
           await workGate;
@@ -106,7 +120,8 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
         }
       } else output = completion("Inspect the MCP evidence.");
       response.setHeader("content-type","application/json");
-      response.end(JSON.stringify(output));
+      reportedTotal += 1;
+      response.end(JSON.stringify({...output, usage:{total_tokens:1}}));
     } catch (error) {
       response.statusCode = 400;
       response.end(String(error));
@@ -118,8 +133,6 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
 model = "fixture-model"
 context_window = 8192
 output_tokens = 256
-[provider]
-stream = false
 [mcp_servers.fixture]
 command = ${JSON.stringify(process.execPath)}
 args = ["-e", ${JSON.stringify(mcp)}]
@@ -163,6 +176,16 @@ tools = ["inspect"]
     await page.locator("#submit-action").click();
     await page.getByRole("heading",{name:"Run overview"}).waitFor();
     await started;
+    await page.locator('[data-preview-actor="worker_1"]').filter({hasText:"Inspect tool metadata and evidence."}).waitFor();
+    const tokenCounter = page.locator("[data-token-usage]");
+    await tokenCounter.filter({hasText:/^~/}).waitFor();
+    const initialTokens = Number(await tokenCounter.getAttribute("data-token-usage"));
+    streamMore();
+    await page.waitForFunction(initial => {
+      const total = document.querySelector("[data-token-usage]");
+      const rate = total?.nextElementSibling;
+      return Number(total?.dataset.tokenUsage) > initial && Number(rate?.dataset.outputTps) > 0;
+    }, initialTokens);
     await shot("overview");
     const run = new URL(page.url()).pathname.split("/")[2];
     const response = await fetch(address.origin+`/api/run/${run}/stream?after=0`,{
@@ -235,6 +258,10 @@ tools = ["inspect"]
     await shot("narrow-menu");
     await page.locator("#navigation").getByRole("link",{name:"Overview"}).click();
     await page.getByRole("heading",{name:"Run overview"}).waitFor();
+    await page.waitForFunction(total => {
+      const counter = document.querySelector("[data-token-usage]");
+      return Number(counter?.dataset.tokenUsage) === total && !counter.textContent.startsWith("~");
+    }, reportedTotal);
     await page.setViewportSize({width:1440,height:900});
     await page.locator("#controls").getByRole("button",{name:"Fork",exact:true}).click();
     await page.getByLabel("Replacement request").fill("Inspect the forked evidence");
@@ -254,6 +281,7 @@ tools = ["inspect"]
     await controls.getByRole("button",{name:"Resume saved",exact:true}).waitFor();
     assert.deepEqual(exceptions,[]);
   } finally {
+    streamMore();
     release();
     finishWorker();
     endFork();
@@ -321,7 +349,7 @@ test("resume after restarting the dashboard preserves the run and refreshes tool
           if (!result("current")) {
             output = completion(null,
               call("mcp_call", { server: "fixture", name: "inspect", arguments: { new_subject: "current" } }, "current"),
-              call("shell", { command: "echo inspection-after-restart" }, "shell-after-restart"));
+              call("shell", { command: ["echo inspection-after-restart"], workdir: null }, "shell-after-restart"));
           } else {
             assert.match(result("current"), /accepted-current-subject/);
             assert.match(result("shell-after-restart"), /inspection-after-restart/);

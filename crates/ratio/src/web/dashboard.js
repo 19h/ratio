@@ -213,6 +213,9 @@ function renderLive() {
 function renderStatus() {
   const run = state.route.run ? state.summary?.run : null;
   const metrics = state.summary?.metrics ?? {};
+  const usage = state.live?.token_usage;
+  const tokens = usage?.tokens ?? metrics.metered_tokens ?? 0;
+  const rate = usage?.output_tokens_per_second ?? 0;
   const cell = (text, name) => node("span", { class: name }, text);
   const generating = state.live?.generations?.length ?? 0;
   const tone = !run ? "idle" : endings.includes(run.phase) ? run.phase.toLowerCase() : state.live?.paused ? "paused" : "active";
@@ -221,7 +224,10 @@ function renderStatus() {
     cell(`cycle ${run.cycle}`), cell(`run ${run.run_id}`, "wide"), cell(`${roster().length} agents`),
     state.live ? cell(`${generating} generating`, generating ? "generating" : undefined) : null,
     spacer(),
-    cell(`${number.format(metrics.metered_tokens ?? 0)} tokens`),
+    node("span", { "data-token-usage": tokens, title: usage?.estimated ? "Includes estimated in-flight tokens" : "Metered tokens" },
+      `${usage?.estimated ? "~" : ""}${number.format(tokens)} tokens`),
+    usage ? node("span", { "data-output-tps": rate, title: "Estimated streamed output tokens per second over the last 2 seconds" },
+      `${rate ? "~" : ""}${number.format(rate)} tok/s`) : null,
     cell(`${number.format(metrics.tool_receipts ?? 0)} tool calls`, "wide"),
     cell(`${number.format(metrics.ipc_deliveries ?? 0)} deliveries`, "wide"),
     cell([node("kbd", {}, "/"), " search ", node("kbd", {}, "1–6"), " views"], "keys"),
@@ -910,16 +916,32 @@ document.addEventListener("keydown", event => {
     $("#global-search input").focus();
   } else if (page && event.key.trim()) navigate(runUrl(page));
 });
-setInterval(async () => {
+let lastTriageRefresh = 0;
+async function pollLive() {
   const run = state.route.run;
-  if (!run) return;
-  const value = await api(apiRun("live")).catch(() => null);
-  if (run === state.route.run) {
-    state.live = value;
+  const version = state.version;
+  try {
+    if (!run) return;
+    const live = await api(apiRun("live"));
+    if (version !== state.version) return;
+    if (!live && state.live?.token_usage) {
+      const summary = await api(apiRun("overview"));
+      if (version !== state.version) return;
+      state.summary.metrics = summary.metrics;
+    }
+    state.live = live;
     renderLive();
-    if (state.route.page === "triage") state.refreshPending = true;
+    if (state.route.page === "triage" && performance.now() - lastTriageRefresh >= 1400) {
+      state.refreshPending = true;
+      lastTriageRefresh = performance.now();
+    }
     refreshLivePage();
+  } catch {
+    // A disconnected dashboard can resume on its next poll.
+  } finally {
+    setTimeout(pollLive, state.live?.generations?.length ? 180 : 1000);
   }
-}, 1400);
+}
 
 load();
+setTimeout(pollLive, 1000);

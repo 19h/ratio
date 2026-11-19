@@ -200,6 +200,16 @@ pub struct ControlReply {
     pub dashboard_managed: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generations: Vec<LiveGeneration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<LiveTokenUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTokenUsage {
+    pub tokens: u64,
+    pub estimated: bool,
+    #[serde(default)]
+    pub output_tokens_per_second: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -84,10 +84,26 @@ impl Connections {
 struct Request {
     server: String,
     name: Option<String>,
-    query: Option<String>,
+    query: Option<SearchQuery>,
     offset: Option<usize>,
     #[serde(default)]
     arguments: Map<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SearchQuery {
+    Terms(Vec<String>),
+    Legacy(String),
+}
+
+impl SearchQuery {
+    fn terms(&self) -> Vec<&str> {
+        match self {
+            Self::Terms(terms) => terms.iter().map(|term| term.trim()).collect(),
+            Self::Legacy(query) => query.split_whitespace().collect(),
+        }
+    }
 }
 
 enum Operation<'a> {
@@ -97,7 +113,7 @@ enum Operation<'a> {
         offset: usize,
     },
     Search {
-        query: &'a str,
+        queries: Vec<&'a str>,
         offset: usize,
     },
 }
@@ -163,8 +179,8 @@ pub(crate) fn schemas(servers: &BTreeMap<String, McpServer>, access: Access) -> 
         ),
         super::schema(
             "tool_search",
-            "Fetch current MCP tool schemas by exact name, substring, or fuzzy match. Continue with next_offset.",
-            json!({"server":server, "query":{"type":"string"}, "offset":{"type":"integer","minimum":0}}),
+            "Fetch MCP schemas. Pass one name or search term per query array item. Exact, substring, then fuzzy. Continue with next_offset.",
+            json!({"server":server, "query":{"type":"array","items":{"type":"string"},"minItems":1}, "offset":{"type":"integer","minimum":0}}),
             &["server", "query"],
         ),
         super::schema(
@@ -346,14 +362,17 @@ async fn run(
             offset: input.offset.unwrap_or(0),
         },
         "tool_search" => {
-            let query = input
+            let queries = input
                 .query
-                .as_deref()
-                .map(str::trim)
-                .filter(|query| !query.is_empty())
-                .context("tool_search requires a nonempty query")?;
+                .as_ref()
+                .context("tool_search requires query as an array of strings")?
+                .terms();
+            ensure!(
+                !queries.is_empty() && queries.iter().all(|query| !query.is_empty()),
+                "tool_search requires at least one nonempty query string"
+            );
             Operation::Search {
-                query,
+                queries,
                 offset: input.offset.unwrap_or(0),
             }
         }
@@ -416,9 +435,9 @@ async fn invoke(
             let offset = offset.min(names.len());
             Ok(Output::Names { names, offset })
         }
-        Operation::Search { query, offset } => {
+        Operation::Search { queries, offset } => {
             let catalog = discover(client, server, access, None, schema_entry).await?;
-            let (match_kind, tools) = search(catalog, query);
+            let (match_kind, tools) = search_queries(&catalog, &queries);
             let offset = offset.min(tools.len());
             Ok(Output::Schemas {
                 tools,
@@ -475,13 +494,35 @@ fn schema_entry(name: &str, tool: &Value) -> Result<Value> {
     Ok(json!({"name":name,"description":tool["description"],"inputSchema":tool["inputSchema"]}))
 }
 
-fn search(mut catalog: BTreeMap<String, Value>, query: &str) -> (&'static str, Vec<Value>) {
-    if let Some(tool) = catalog.remove(query) {
+fn search_queries(
+    catalog: &BTreeMap<String, Value>,
+    queries: &[&str],
+) -> (&'static str, Vec<Value>) {
+    let mut match_kind = "none";
+    let mut seen = BTreeSet::new();
+    let mut tools = Vec::new();
+    for query in queries {
+        let (kind, matches) = search(catalog, query);
+        if !matches.is_empty() {
+            match_kind = if queries.len() == 1 { kind } else { "multiple" };
+        }
+        tools.extend(
+            matches
+                .into_iter()
+                .filter(|tool| seen.insert(tool["name"].as_str().expect("validated MCP tool name")))
+                .cloned(),
+        );
+    }
+    (match_kind, tools)
+}
+
+fn search<'a>(catalog: &'a BTreeMap<String, Value>, query: &str) -> (&'static str, Vec<&'a Value>) {
+    if let Some(tool) = catalog.get(query) {
         return ("exact", vec![tool]);
     }
     let query = query.to_lowercase();
     let candidates = catalog
-        .into_iter()
+        .iter()
         .map(|(name, tool)| (name.to_lowercase(), tool))
         .collect::<Vec<_>>();
     if candidates.iter().any(|(name, _)| name.contains(&query)) {
@@ -743,7 +784,7 @@ mod tests {
             .map(|name| (name.to_owned(), json!({"name":name})))
             .collect::<BTreeMap<_, _>>();
         let find = |query| {
-            let (kind, tools) = search(catalog.clone(), query);
+            let (kind, tools) = search(&catalog, query);
             (
                 kind,
                 tools
@@ -765,6 +806,24 @@ mod tests {
         assert_eq!(find("segmetns").0, "fuzzy");
         assert!(find("segmetns").1.contains(&"get_segments".to_owned()));
         assert_eq!(find("unrelated_xyz"), ("none", Vec::new()));
+        for query in [
+            SearchQuery::Terms(
+                ["segments", "SEGMENT", "inspect"]
+                    .map(String::from)
+                    .to_vec(),
+            ),
+            SearchQuery::Legacy("segments SEGMENT inspect".into()),
+        ] {
+            let (kind, tools) = search_queries(&catalog, &query.terms());
+            assert_eq!(kind, "multiple");
+            assert_eq!(
+                tools
+                    .iter()
+                    .map(|tool| tool["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["segments", "segments_info", "get_segments", "inspect"]
+            );
+        }
     }
 
     #[tokio::test]

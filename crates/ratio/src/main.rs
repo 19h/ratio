@@ -259,6 +259,7 @@ async fn run() -> Result<u8> {
                 guide,
                 live_generations.clone(),
                 &store,
+                &budget,
             )
             .await
         } else {

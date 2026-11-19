@@ -151,6 +151,8 @@ Chat Completions is the default. Pass the base URL or full method URL for the se
 
 For Chat Completions gateways that reject `stream_options`, set `[provider].stream_usage = false`. Use `--stream false` for JSON-only endpoints. `--legacy-max-tokens` selects `max_tokens` for older Chat Completions gateways. `seed` is a Chat Completions setting whose effect depends on the provider. Provider tool batching controls calls within one completion. Ratio's agent concurrency is configured separately.
 
+The web dashboard shows an estimated token total while requests are in flight, including streamed text, reasoning, and tool arguments. The adjacent `tok/s` readout estimates aggregate streamed output across agents over the last two seconds. The total settles to provider-reported usage when available. If a provider omits usage, Ratio retains its conservative budget charge.
+
 Ratio sends a Bearer header when a key is configured. A custom `Authorization` header takes precedence. Standard credential header values and custom header values of at least eight UTF-8 bytes are masked in provider errors and live previews.
 
 ## Teams, communication, and review
@@ -189,9 +191,9 @@ The reviewer and stakeholders can list directories, read workspace files, and in
 | `read_file` | Returns tagged UTF-8 lines or a byte range. Binary input automatically returns a hex and ASCII preview. |
 | `edit_file` | Applies one batch against a single snapshot. Use `tag` for a line, `tag..tag` for an inclusive range, `+tag` to insert before, or `tag+` to insert after. Range edits require the latest `snapshot_id`. |
 | `create_file` | Creates a file only if its destination is absent. |
-| `shell` | Starts at the active workspace root by default. Set `workdir` to an absolute or workspace-relative directory. Runs through `/bin/sh` on Unix or `cmd.exe` on Windows, with command timeouts, bounded output, and descendant process cleanup. |
+| `shell` | Requires `workdir`, an absolute or workspace-relative directory or `null` to start at the active workspace root. Runs through `/bin/sh` on Unix or `cmd.exe` on Windows, with command timeouts, bounded output, and descendant process cleanup. |
 
-Pass a script string or an array of complete shell commands, such as `{"workdir":"src","command":["git status --short","git diff --stat"]}`. The array runs in order in one shell and shares its working directory, timeout, and output. Normal shell sequencing continues after a command returns a nonzero status.
+Pass an array of complete shell commands, such as `{"workdir":"src","command":["git status --short","git diff --stat"]}`. Commands run in order in one shell and share its working directory, timeout, and output. Normal shell sequencing continues after a command returns a nonzero status. Ratio also accepts legacy script strings.
 
 To make `shell` available during inspection, including before plan acknowledgement, opt in explicitly.
 
@@ -393,10 +395,10 @@ Tool lists accept any number of entries. Agents discover MCP tools in three step
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `mcp_list` | `server`, optional `offset` | Permitted tool names |
-| `tool_search` | `server`, `query`, optional `offset` | Matching names, descriptions, and input schemas |
+| `tool_search` | `server`, `query` array of strings, optional `offset` | Matching names, descriptions, and input schemas |
 | `mcp_call` | `server`, exact `name`, `arguments` | Tool result |
 
-`tool_search` prefers an exact name, then case-insensitive substrings, then close spellings if there are no substring matches. Pass `next_offset` as `offset` to continue a result set. `ra --check-mcp project_tools` prints the full permitted catalog for the operator and verifies that explicitly allowed names exist.
+`tool_search` searches each array entry independently by exact name, case-insensitive substring, then close spelling. For example, pass `["locate_symbol","check_interface"]` for both schemas. Results are deduplicated. Legacy string queries are split at whitespace. Pass `next_offset` as `offset` to continue a result set. `ra --check-mcp project_tools` prints the full permitted catalog for the operator and verifies that explicitly allowed names exist.
 
 Set `inspection_tools` to the server tool names reviewers, stakeholders, and workers may discover and call during inspection phases, including before plan acknowledgement. Each name must also be permitted by the server policy. Choose only observational tools for this list. Workers gain access to the full configured policy after passing the write gate. The default `lifetime = "call"` starts a new server process per invocation. Set `lifetime = "worker"` to reuse a server per agent within a phase. A call with an unknown outcome is recorded without automatic replay. Ratio also supports the explicit MCP revision `2026-07-28`.
 

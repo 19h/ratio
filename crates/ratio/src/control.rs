@@ -15,8 +15,11 @@ use tokio::{
     time::timeout,
 };
 
-use ratio_engine::events::{GenerationControl, LiveGenerations};
 use ratio_engine::session::Store;
+use ratio_engine::{
+    budget::Budget,
+    events::{GenerationControl, LiveGenerations},
+};
 
 #[cfg(unix)]
 mod unix;
@@ -140,6 +143,7 @@ pub async fn request_control(workspace: &Path, request: &ControlRequest) -> Resu
     .context("Ratio control request timed out")?
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     mut listener: Listener,
     run_id: &str,
@@ -148,6 +152,7 @@ pub async fn serve(
     guidance: SyncSender<String>,
     live: LiveGenerations,
     store: &Store,
+    budget: &Budget,
 ) -> Result<()> {
     loop {
         let mut connection = listener.accept().await?;
@@ -307,6 +312,7 @@ pub async fn serve(
             }
             if accepted && request.action == ControlAction::Status && request.run_id.is_some() {
                 response.generations = live.snapshot();
+                response.token_usage = Some(budget.live_token_usage());
             }
             response.dashboard_managed = dashboard_managed;
             let result = send_frame(
@@ -340,6 +346,7 @@ fn reply(run_id: &str, paused: bool, accepted: bool, detail: &str) -> ControlRep
         detail: detail.into(),
         dashboard_managed: false,
         generations: Vec::new(),
+        token_usage: None,
     }
 }
 

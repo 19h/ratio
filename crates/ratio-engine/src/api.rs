@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{
-    budget::Budget,
+    budget::{Budget, TokenProgress},
     config::{Config, Provider, ProviderApi},
     context::{clip, estimate},
     events::{Generation, Kind, LiveGeneration, Reporter, clean},
@@ -100,6 +100,7 @@ struct Usage {
     prompt_tokens: Option<usize>,
     #[serde(alias = "output_tokens")]
     completion_tokens: Option<usize>,
+    total_tokens: Option<u64>,
 }
 
 pub struct Completion {
@@ -242,7 +243,7 @@ impl Api {
         tools: &[Value],
         output_tokens: usize,
     ) -> Result<Completion, ApiError> {
-        let reserved = estimate(messages, tools).saturating_add(output_tokens) as u64;
+        let prompt = estimate(messages, tools);
         let mut last_http = None;
         let mut attempt = 0;
         let mut control = self.reporter.generation_control();
@@ -255,7 +256,7 @@ impl Api {
                 return Err(ApiError::Cancelled);
             }
             let epoch = state.epoch;
-            self.budget.reserve(reserved)?;
+            let tokens = self.budget.reserve_completion(prompt, output_tokens)?;
             let mut preview = Preview::new(self, actor, label);
             let cancelled = async {
                 match &mut control {
@@ -267,14 +268,7 @@ impl Api {
             };
             let result = tokio::time::timeout(
                 self.budget.remaining(),
-                self.complete_once(
-                    model,
-                    messages,
-                    tools,
-                    output_tokens,
-                    reserved,
-                    &mut preview,
-                ),
+                self.complete_once(model, messages, tools, output_tokens, &tokens, &mut preview),
             );
             let result = tokio::select! {
                 biased;
@@ -282,6 +276,7 @@ impl Api {
                 result = result => result,
             };
             drop(preview);
+            drop(tokens);
             let error = match result {
                 Ok(Ok(completion)) => return Ok(completion),
                 Ok(Err(error)) => error,
@@ -332,7 +327,7 @@ impl Api {
         messages: &[&Message],
         tools: &[Value],
         output_tokens: usize,
-        reserved: u64,
+        tokens: &TokenProgress<'_>,
         preview: &mut Preview<'_>,
     ) -> Result<Completion, ApiError> {
         let responses = self.provider.api == ProviderApi::Responses;
@@ -415,16 +410,16 @@ impl Api {
                     })
                 })
         {
-            self.read_stream(response, reserved, preview).await
+            self.read_stream(response, tokens, preview).await
         } else {
-            self.read_json(response, reserved).await
+            self.read_json(response, tokens).await
         }
     }
 
     async fn read_stream(
         &self,
         mut response: reqwest::Response,
-        reserved: u64,
+        tokens: &TokenProgress<'_>,
         preview: &mut Preview<'_>,
     ) -> Result<Completion, ApiError> {
         let status = response.status().as_u16();
@@ -460,6 +455,7 @@ impl Api {
             decoder
                 .push(&chunk)
                 .map_err(|error| self.safe_error(error))?;
+            tokens.observe(decoder.prompt_tokens(), decoder.output_tokens());
             dirty = true;
             if decoder.done() {
                 break;
@@ -468,6 +464,7 @@ impl Api {
         decoder
             .finish_input()
             .map_err(|error| self.safe_error(error))?;
+        tokens.observe(decoder.prompt_tokens(), decoder.output_tokens());
         if let Some((error, usage, choice_seen)) = decoder.take_error() {
             let code = error
                 .get("code")
@@ -481,9 +478,9 @@ impl Api {
             let context_rejection = is_context_error(code, detail);
             let detail = clean(clip(&self.redact(detail), 1024));
             if let Some(actual) = usage.as_ref().and_then(Usage::total) {
-                self.budget.reconcile(reserved, actual)?;
+                tokens.reconcile(actual)?;
             } else if context_rejection && !choice_seen {
-                self.budget.reconcile(reserved, 0)?;
+                tokens.reconcile(0)?;
             }
             return Err(if context_rejection {
                 ApiError::Context { status, detail }
@@ -492,13 +489,13 @@ impl Api {
             });
         }
         let response = decoder.finish().map_err(|error| self.safe_error(error))?;
-        self.finish(response, reserved)
+        self.finish(response, tokens)
     }
 
     async fn read_json(
         &self,
         mut response: reqwest::Response,
-        reserved: u64,
+        tokens: &TokenProgress<'_>,
     ) -> Result<Completion, ApiError> {
         let status = response.status();
         let retry_after = response.headers().get(header::RETRY_AFTER).map(|value| {
@@ -552,11 +549,11 @@ impl Api {
             let status = status.as_u16();
             let usage = serde_json::from_value::<Usage>(body["usage"].clone()).ok();
             if let Some(total) = usage.as_ref().and_then(Usage::total) {
-                self.budget.reconcile(reserved, total)?;
+                tokens.reconcile(total)?;
             } else if status == 429 || context_rejection {
                 // The provider explicitly refused admission. Keep the attempt
                 // charge, but release the token reservation.
-                self.budget.reconcile(reserved, 0)?;
+                tokens.reconcile(0)?;
             }
             return if context_rejection {
                 Err(ApiError::Context { status, detail })
@@ -578,10 +575,14 @@ impl Api {
                 .and_then(responses::decode),
         }
         .map_err(|error| self.safe_error(error))?;
-        self.finish(response, reserved)
+        self.finish(response, tokens)
     }
 
-    fn finish(&self, response: Response, reserved: u64) -> Result<Completion, ApiError> {
+    fn finish(
+        &self,
+        response: Response,
+        tokens: &TokenProgress<'_>,
+    ) -> Result<Completion, ApiError> {
         let choice = response
             .choices
             .into_iter()
@@ -592,7 +593,7 @@ impl Api {
             .as_ref()
             .and_then(|usage| usage.prompt_tokens);
         if let Some(actual) = response.usage.as_ref().and_then(Usage::total) {
-            self.budget.reconcile(reserved, actual)?;
+            tokens.reconcile(actual)?;
         }
         if self.debug {
             self.reporter.emit(
@@ -634,7 +635,9 @@ fn redact_header_value(name: &header::HeaderName, value: &str) -> bool {
 
 impl Usage {
     fn total(&self) -> Option<u64> {
-        Some((self.prompt_tokens? as u64).saturating_add(self.completion_tokens? as u64))
+        self.total_tokens.or_else(|| {
+            Some((self.prompt_tokens? as u64).saturating_add(self.completion_tokens? as u64))
+        })
     }
 }
 

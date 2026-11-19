@@ -128,13 +128,14 @@ pub async fn run(
             session
         }
     };
-    let orchestrator = Orchestrator::new(config, store, reporter, budget)?;
+    let orchestrator = Orchestrator::new(config, store, reporter, budget.clone())?;
     ui.execute(
         orchestrator,
         session,
         Store::reader(&config.cwd)?,
         store,
         &config.cwd,
+        &budget,
     )
     .await
 }
@@ -342,6 +343,7 @@ impl Ui {
         reader: RunReader,
         store: &Store,
         workspace: &std::path::Path,
+        budget: &Budget,
     ) -> Result<Outcome> {
         let (send, receive) = mpsc::sync_channel(16);
         self.view.executing = true;
@@ -357,6 +359,7 @@ impl Ui {
             send.clone(),
             self.live.clone(),
             store,
+            budget,
         );
         tokio::pin!(controls);
         let run = orchestrator.run(session, Some(receive));

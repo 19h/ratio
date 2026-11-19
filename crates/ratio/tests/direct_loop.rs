@@ -1057,7 +1057,11 @@ fn parallel_result_survives_interrupt_while_another_tool_is_in_flight() {
             )
         } else {
             assert!(system.starts_with("You are parallel worker worker_2,"));
-            tool("slow", "shell", json!({"command":"sleep 20"}))
+            tool(
+                "slow",
+                "shell",
+                json!({"command":"sleep 20","workdir":null}),
+            )
         };
         let (status, mut response) = calls(&[call]);
         response["test_terminal"] = json!(index == 1);
@@ -1561,10 +1565,13 @@ persona = "Check fixture evidence."
         let messages = request["messages"].as_array().unwrap();
         let system = messages[0]["content"].as_str().unwrap();
         let working = system.contains("Phase: execute");
+        let shell = &find("shell").unwrap()["function"]["parameters"];
+        assert_eq!(shell["properties"]["command"]["type"], "array");
         assert_eq!(
-            find("shell").unwrap()["function"]["parameters"]["properties"]["command"]["type"],
-            json!(["array", "string"])
+            shell["properties"]["workdir"]["type"],
+            json!(["string", "null"])
         );
+        assert_eq!(shell["required"], json!(["command", "workdir"]));
         assert_eq!(find("create_file").is_some(), working);
         assert_eq!(find("edit_file").is_some(), working);
         assert_eq!(system.contains("Use shell to inspect or verify"), !working);
@@ -1581,7 +1588,7 @@ persona = "Check fixture evidence."
                     tool(
                         "shell",
                         "shell",
-                        json!({"command":["echo inspection-probe", fail, "echo inspection-done"]}),
+                        json!({"command":["echo inspection-probe", fail, "echo inspection-done"],"workdir":null}),
                     ),
                     tool(
                         "create",
@@ -1883,7 +1890,7 @@ fn direct_tool_loop_compacts_and_reviews() {
                             format!("echo done>result.txt & {}", diagnostics_script())
                         } else {
                             format!("printf 'done\\n' > result.txt; {}", diagnostics_script())
-                        }}),
+                        },"workdir":null}),
                     ),
                     tool("read", "read_file", json!({"path":"result.txt"})),
                 ]);
@@ -1901,7 +1908,7 @@ fn direct_tool_loop_compacts_and_reviews() {
                 return calls(&[tool(
                     &format!("work-{work_calls}"),
                     "shell",
-                    json!({"command":diagnostics_script()}),
+                    json!({"command":diagnostics_script(),"workdir":null}),
                 )]);
             }
             assert!(summaries > 0);
@@ -1987,7 +1994,7 @@ fn resume_does_not_replay_an_interrupted_tool() {
         1 => calls(&[tool(
             "write",
             "shell",
-            json!({"command":if cfg!(windows) {"echo once>>result.txt"} else {"printf 'once\\n' >> result.txt"}}),
+            json!({"command":if cfg!(windows) {"echo once>>result.txt"} else {"printf 'once\\n' >> result.txt"},"workdir":null}),
         )]),
         _ => (
             503,
@@ -2092,7 +2099,13 @@ fn exercise_provider_context_limit(streamed: bool) {
         }
         if system.contains("You are the worker") {
             worker_requests += 1;
-            let command = |id| tool(id, "shell", json!({"command":diagnostics_script()}));
+            let command = |id| {
+                tool(
+                    id,
+                    "shell",
+                    json!({"command":diagnostics_script(),"workdir":null}),
+                )
+            };
             return match worker_requests {
                 1 => calls(&[command("old")]),
                 2 => calls(&[command("recent")]),
@@ -2631,7 +2644,7 @@ persona = "Own worker_3.txt."
                             tool(
                                 "early-shell",
                                 "shell",
-                                json!({"command":"touch premature.txt"}),
+                                json!({"command":"touch premature.txt","workdir":null}),
                             ),
                             tool(
                                 "early-create",
@@ -2838,7 +2851,7 @@ fn resume_interrupted_parallel_worker(workspace: &Path, config: &Path) {
     group[0]["tool_calls"][0] = tool(
         "write",
         "shell",
-        json!({"command":"printf replay >> worker_1.txt"}),
+        json!({"command":"printf replay >> worker_1.txt","workdir":null}),
     );
     ra::session::Store::open(workspace)
         .unwrap()

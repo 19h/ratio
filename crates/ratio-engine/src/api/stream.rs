@@ -19,6 +19,7 @@ pub(super) struct Decoder {
     provider_error: Option<Value>,
     content: Option<String>,
     reasoning: Option<String>,
+    generated_bytes: usize,
     calls: BTreeMap<usize, ToolCall>,
     finish_reason: Option<String>,
     usage: Option<Usage>,
@@ -77,6 +78,7 @@ struct Delta {
     content: Option<String>,
     #[serde(alias = "reasoning")]
     reasoning_content: Option<String>,
+    refusal: Option<String>,
     tool_calls: Option<Vec<CallDelta>>,
 }
 
@@ -186,11 +188,14 @@ impl Decoder {
                 "provider sent a choice after finishing the completion"
             );
             if let Some(text) = delta.content {
+                self.generated_bytes += text.len();
                 self.content.get_or_insert_default().push_str(&text);
             }
             if let Some(text) = delta.reasoning_content {
+                self.generated_bytes += text.len();
                 self.reasoning.get_or_insert_default().push_str(&text);
             }
+            self.generated_bytes += delta.refusal.as_ref().map_or(0, String::len);
             for fragment in delta.tool_calls.unwrap_or_default() {
                 ensure!(
                     fragment.index < 128,
@@ -214,6 +219,8 @@ impl Decoder {
                     call.kind = kind;
                 }
                 if let Some(function) = fragment.function {
+                    self.generated_bytes += function.name.as_ref().map_or(0, String::len)
+                        + function.arguments.as_ref().map_or(0, String::len);
                     call.function
                         .name
                         .push_str(function.name.as_deref().unwrap_or_default());
@@ -251,16 +258,26 @@ impl Decoder {
                 let text = packet["delta"]
                     .as_str()
                     .context("invalid Responses text delta")?;
+                self.generated_bytes += text.len();
                 self.content.get_or_insert_default().push_str(text);
                 self.choice_seen = true;
             }
             "response.function_call_arguments.delta" => {
+                self.generated_bytes += packet["delta"].as_str().map_or(0, str::len);
                 self.response_progress = Some("Receiving tool calls…");
                 self.choice_seen = true;
             }
-            "response.reasoning_summary_text.delta" => {
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                self.generated_bytes += packet["delta"].as_str().map_or(0, str::len);
                 self.response_progress = Some("Receiving reasoning…");
                 self.choice_seen = true;
+            }
+            "response.refusal.delta" => {
+                self.generated_bytes += packet["delta"].as_str().map_or(0, str::len);
+                self.choice_seen = true;
+            }
+            "response.output_item.added" if packet["item"]["type"] == "function_call" => {
+                self.generated_bytes += packet["item"]["name"].as_str().map_or(0, str::len);
             }
             _ => {}
         }
@@ -292,6 +309,15 @@ impl Decoder {
 
     pub(super) fn content(&self) -> &str {
         self.content.as_deref().unwrap_or_default()
+    }
+
+    pub(super) fn prompt_tokens(&self) -> Option<usize> {
+        self.usage.as_ref()?.prompt_tokens
+    }
+
+    pub(super) fn output_tokens(&self) -> usize {
+        // Count decoded payload bytes so network and SSE framing contribute zero.
+        self.generated_bytes.div_ceil(3)
     }
 
     pub(super) fn progress(&self) -> &'static str {

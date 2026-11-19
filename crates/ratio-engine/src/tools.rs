@@ -106,12 +106,12 @@ impl Tools<'_> {
         if self.allows_shell() {
             schemas.push(schema(
                 "shell",
-                "Run shell steps. workdir defaults to workspace.",
+                "Shell in workdir. null uses workspace.",
                 json!({
-                    "command": {"type":["array","string"],"items":{"type":"string"}},
-                    "workdir": {"type":"string"}
+                    "command": {"type":"array","items":{"type":"string"}},
+                    "workdir": {"type":["string","null"]}
                 }),
-                &["command"],
+                &["command", "workdir"],
             ));
         }
         schemas
@@ -288,18 +288,7 @@ impl Tools<'_> {
             }
             "shell" if self.allows_shell() => {
                 let args: Shell = crate::api::tool_arguments(arguments)?;
-                let script = match args.command {
-                    ShellCommand::Script(script) => script,
-                    ShellCommand::Steps(steps) => {
-                        ensure!(!steps.is_empty(), "shell command array is empty");
-                        if let Some(index) = steps.iter().position(|step| step.trim().is_empty()) {
-                            anyhow::bail!("shell command at index {index} is empty");
-                        }
-                        let separator = if cfg!(windows) { "&" } else { "\n" };
-                        steps.join(separator)
-                    }
-                };
-                ensure!(!script.trim().is_empty(), "shell command is empty");
+                let script = args.command.into_script()?;
                 let mut command = shell(&script);
                 if let Some(workdir) = args.workdir {
                     command.current_dir(self.workspace.join(workdir));
@@ -1002,6 +991,7 @@ struct Diff {
 #[derive(Deserialize)]
 struct Shell {
     command: ShellCommand,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     workdir: Option<PathBuf>,
 }
 
@@ -1010,6 +1000,31 @@ struct Shell {
 enum ShellCommand {
     Script(String),
     Steps(Vec<String>),
+}
+
+impl ShellCommand {
+    fn into_script(self) -> Result<String> {
+        let command = match self {
+            Self::Script(script) => match serde_json::from_str::<Vec<String>>(&script) {
+                Ok(steps) => Self::Steps(steps),
+                Err(_) => Self::Script(script),
+            },
+            steps => steps,
+        };
+        let script = match command {
+            Self::Script(script) => script,
+            Self::Steps(steps) => {
+                ensure!(!steps.is_empty(), "shell command array is empty");
+                if let Some(index) = steps.iter().position(|step| step.trim().is_empty()) {
+                    anyhow::bail!("shell command at index {index} is empty");
+                }
+                let separator = if cfg!(windows) { "&" } else { "\n" };
+                steps.join(separator)
+            }
+        };
+        ensure!(!script.trim().is_empty(), "shell command is empty");
+        Ok(script)
+    }
 }
 
 #[cfg(test)]
@@ -1044,6 +1059,14 @@ mod tests {
         } else {
             "cat probe.txt"
         };
+        let call = |arguments: Value| ToolCall {
+            id: "workdir-test".into(),
+            kind: "function".into(),
+            function: Function {
+                name: "shell".into(),
+                arguments: arguments.to_string(),
+            },
+        };
         for (workdir, expected) in [
             (None, "stdout:\nroot-probe"),
             (Some(Path::new("nested dir")), "stdout:\nnested-probe"),
@@ -1054,21 +1077,25 @@ mod tests {
             ),
             (Some(Path::new("probe.txt")), "Tool error: start command in"),
         ] {
-            let mut arguments = json!({"command":command});
-            if let Some(workdir) = workdir {
-                arguments["workdir"] = json!(workdir);
-            }
-            let call = ToolCall {
-                id: "workdir-test".into(),
-                kind: "function".into(),
-                function: Function {
-                    name: "shell".into(),
-                    arguments: arguments.to_string(),
-                },
-            };
-            let output = tools.execute(&call).await;
+            let output = tools
+                .execute(&call(json!({"command":command,"workdir":workdir})))
+                .await;
             assert!(output.contains(expected), "{output}");
         }
+        let steps = json!([command]);
+        for command in [steps.clone(), json!(steps.to_string())] {
+            let output = tools
+                .execute(&call(json!({"workdir":"nested dir","command":command})))
+                .await;
+            assert!(output.contains("stdout:\nnested-probe"), "{output}");
+        }
+        let script = format!("cd \"nested dir\" && {command}");
+        let output = tools
+            .execute(&call(json!({"command":[script],"workdir":null})))
+            .await;
+        assert!(output.contains("nested-probe"), "{output}");
+        let output = tools.execute(&call(json!({"command":[command]}))).await;
+        assert!(output.contains("missing field `workdir`"), "{output}");
     }
 
     #[cfg(windows)]
