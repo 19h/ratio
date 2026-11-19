@@ -1,6 +1,72 @@
 # Ratio
 
-Ratio is a local coding-agent harness with terminal and web interfaces. Give it a goal, an OpenAI-compatible endpoint, and a workspace. The lead reviewer plans the work, workers use native and stdio MCP tools, and the reviewer records a typed decision. Ratio can coordinate a team, run independent tasks in parallel, and verify a staged candidate before applying it to the live worktree.
+Ratio runs a team of coding agents on your repository and keeps a record of everything they do. Give it a goal, an OpenAI-compatible endpoint, and a workspace. A lead reviewer plans the work, workers agree on who writes which files before anything is edited, stakeholders answer questions mid-run, and a typed verdict decides whether the result reaches your worktree. Watch it live in a browser or a terminal, or run it headless in CI.
+
+![Run overview in the web dashboard, showing the goal, the phase rail, two agents generating, and token usage](docs/screenshots/overview.png)
+
+<sub>A live run in `ra --web`. Two workers are generating, a third is blocked on their tasks, and the status bar meters tokens as they stream. The screenshots in this README come from a [scripted demo run](#development).</sub>
+
+- **One request becomes a team.** Ratio proposes workers, reviewers, stakeholders, and acceptance criteria, or uses the roster you configure.
+- **Nobody writes before the plan is frozen.** The lead reviewer freezes assignments and write paths. Every worker acknowledges the exact plan ID, and one objection sends the team back to coordination.
+- **Independent work runs in parallel.** A typed task graph releases each worker as soon as its predecessors finish.
+- **Your worktree changes only after review.** In staged mode, workers edit private copies, verification commands run on the merged candidate, and publication needs a passing receipt and an approval.
+- **Everything is on the record.** Messages, tool calls, results, and budgets go to a local SQLite journal that you can search, export, resume, and fork.
+- **Any OpenAI-compatible model.** Use Chat Completions or Responses, streamed or not, with a different model per role or per agent.
+
+**Contents:** [Quick start](#quick-start) | [A run in pictures](#a-run-in-pictures) | [How a run works](#how-a-run-works) | [Running Ratio](#running-ratio) | [Provider configuration](#provider-configuration) | [Teams, communication, and review](#teams-communication-and-review) | [Workspace and publication](#workspace-and-publication) | [Interfaces and run history](#interfaces-and-run-history) | [Context, limits, and automation](#context-limits-and-automation) | [Local extensions](#local-extensions) | [Development](#development)
+
+## Quick start
+
+Build with Rust 1.85 or later. Git is required for staged execution and Git inspection tools.
+
+```sh
+cargo install --locked --path crates/ratio
+
+export RATIO_API_KEY='<provider key>'
+ra -C /path/to/project \
+  --endpoint https://provider.example/v1 \
+  --model provider-model \
+  --context-window 32768 \
+  --goal 'Fix the parser regression and verify all supported inputs.'
+```
+
+That runs in the terminal UI. Replace `--goal '...'` with `--web` to serve the dashboard and enter the request there, or add `--headless` for scripts and CI.
+
+## A run in pictures
+
+The demo run below fixes a duration parser that reads `1h30m` as 31 seconds, with a team of three workers, two reviewers, and two stakeholders.
+
+### Who told whom what
+
+![Communication view with one lane per participant, a selected stakeholder broadcast, and the message inspector](docs/screenshots/sequence.png)
+
+The Communication view draws one lane per participant and one row per message. A hollow square is the sender and a filled square is a delivery into the recipient's context. The double line is a stakeholder reply that Ratio broadcast to every worker. Select a row to read the body and see when each recipient received it.
+
+### Every tool call, with its receipt
+
+![Tools and files view with an edit_file call selected and its arguments in the inspector](docs/screenshots/tools.png)
+
+Tools & files lists each native and MCP call with its state. The inspector shows the arguments, the full captured result, and the result the model saw. **Jump to chat** opens the assistant turn that made the call.
+
+### One searchable timeline
+
+![Timeline filtered by a search for RangeError](docs/screenshots/timeline.png)
+
+The timeline merges conversations, tool calls, messages, phase changes, and operator actions. Filter it by agent, event type, cycle, or phase, or search the whole run.
+
+### A verdict you can check
+
+![Run overview after approval, showing the verification receipt, verdict, assessment, and execution plan](docs/screenshots/approved.png)
+
+The run ends with a typed verdict. In staged mode, the overview also shows the verification receipt for the exact candidate that was published.
+
+### The same run in a terminal
+
+![Terminal UI Activity tab with a grid of agent cards above the shared transcript](docs/screenshots/tui-activity.png)
+
+![Terminal UI Communication tab with the message sequence and inspector](docs/screenshots/tui-communication.png)
+
+The terminal UI shows the same run without a browser. Its sequence also draws handoffs (`CTX` rows): briefs, reports, and verdicts passed between the lead reviewer and the team.
 
 ## How a run works
 
@@ -64,6 +130,8 @@ Ratio is a local coding-agent harness with terminal and web interfaces. Give it 
 
 Planning and review panels are optional. The write gate applies when a worker roster is configured. Coordination and acknowledgement expose workspace inspection tools. After the gate opens, workers can create and edit files or run commands. The digest binds the exact plan, roster, cycle, attempt, write ownership, and task graph when present. An objection invalidates the plan and uses another planning attempt. Run budgets can stop execution independently of the verdict.
 
+### Architecture
+
 ```text
   Browser <-- loopback HTTP / SSE --> ra --web ------ start / resume / fork ---+
                                         |                                      |
@@ -95,20 +163,7 @@ Planning and review panels are optional. The write gate applies when a worker ro
 
 [`ra`](crates/ratio) owns the CLI, terminal UI, browser dashboard, and process control. [`ratio-engine`](crates/ratio-engine) owns execution and persistence. [`ratio-protocol`](crates/ratio-protocol) defines the task graph, run events, and control messages. The browser dashboard and attached TUI read the journal and send live controls through the active runner's private endpoint.
 
-## Build and run
-
-Build with Rust 1.85 or later. Git is required for staged execution and Git inspection tools.
-
-```sh
-cargo install --locked --path crates/ratio
-
-export RATIO_API_KEY='<provider key>'
-ra -C /path/to/project \
-  --endpoint https://provider.example/v1 \
-  --model provider-model \
-  --context-window 32768 \
-  --goal 'Fix the parser regression and verify all supported inputs.'
-```
+## Running Ratio
 
 For repeat use, save your provider settings in `$XDG_CONFIG_HOME/ratio/config.toml` or `~/.config/ratio/config.toml`. On Windows, use `%APPDATA%\ratio\config.toml`. An explicit `--config` selects a different file. With a provider profile and no configured worker roster, Ratio proposes workers, reviewers, stakeholders, and acceptance criteria. Use `--web` to enter a request in a browser, or supply it directly through the CLI.
 
@@ -164,6 +219,8 @@ Ratio sends a Bearer header when a key is configured. A custom `Authorization` h
 
 Plan repair identifies missing, duplicate, and unknown worker IDs. If bounded full-plan repairs fail, Ratio asks for one typed assignment per worker and validates the assembled plan before requesting acknowledgements.
 
+### Messages
+
 Agents use `send_message` with a recipient ID and a text body. The tool advertises a limit of up to 4,096 UTF-8 bytes per message. Each recipient's queued messages and their delivery metadata share a byte budget that scales with the model's context window, up to 16 KiB. Prompts recommend BWP for concise exchanges that preserve exact tool names, paths, and IDs. Flat lists use spaces, clauses use `;`, and multi-word options use `|`. BWP is optional and IPC accepts ordinary prose and code snippets.
 
 ```text
@@ -179,6 +236,8 @@ Agents use `send_message` with a recipient ID and a text body. The tool advertis
 ```
 
 A stakeholder addresses the reply to the requester. Ratio broadcasts it to all workers. Workers who already submitted a report can resume when new mail arrives. Delivery occurs at a request boundary, when the message enters the recipient's model context.
+
+### Shared memory
 
 `remember` stores author-attributed, run-scoped notes. An optional `evidence` list references up to eight tool results from the current context. Ratio checks the references and hashes the results. `recall` searches or pages through the shared notes. The checkpoint preserves up to 128 notes along with queued and delivered IPC.
 
@@ -207,6 +266,8 @@ This defaults to `false`. With the option enabled, shell commands run with the o
 Tagged reads and edits support files up to 4 MiB. Ratio uses Assist-style addressing with path-seeded 64-bit tags. Repeated lines carry occurrence information. A stale tag or overlap rejects the batch. Optional `line_hints` help locate nearby current lines when an anchor goes stale. Successful edits preserve file mode and return fresh tags. A unique substring replacement is also available via `old_text` and `new_text`.
 
 If a line read encounters binary data, `read_file` returns a hex preview from byte zero. To request a precise binary range, pass `{"path":"data/image.bin","hex":true,"offset":"0x100","length":64}`. `offset` starts at zero and `length` caps the number of source bytes. Both accept integers or `0x` strings. Hex reads default to 256 bytes. The header gives the actual half-open range and file size in hexadecimal. If the output cap shortened the range, use the displayed end as the next offset. Explicit byte ranges use byte positions only. Set `hex` to `false` to require UTF-8. `max_bytes` limits rendered output.
+
+### Staged publication
 
 By default, workers operate directly on the live worktree. To defer publication until review, enable staging at the root of a Git worktree.
 
@@ -268,9 +329,7 @@ The journal preserves tool invocations and receipts independently of conversatio
 
 Automatic triage uses the lead reviewer to classify and route information within the existing run permissions. The inbox shows the decision, recipients, and delivery receipts. Pending items are marked deferred if the run finishes before delivery. **Add worker** requests a separate, read-only onboarding phase followed by unanimous acknowledgement of the amended plan. The worker request links to its onboarding IPC.
 
-To exercise the dashboard with Playwright, build `target/debug/ra`, install Playwright in your test environment, and run `node --test crates/ratio/tests/web_dashboard.mjs`. Set `RATIO_PLAYWRIGHT` to the module path if it is installed outside this workspace. Set `RATIO_WEB_SCREENSHOTS` to an existing directory to save a screenshot of each view during the run.
-
-The dashboard embeds DM Mono and Martian Mono under the SIL Open Font License. The license texts are in [`crates/ratio/src/web/fonts`](crates/ratio/src/web/fonts).
+Press `1` to `6` to switch views and `/` to search the run. In the message sequence, the arrow keys or `j` and `k` move the selection.
 
 ### Terminal UI
 
@@ -291,6 +350,8 @@ The dashboard embeds DM Mono and Martian Mono under the SIL Open Font License. T
 
 In Communication, use arrows to navigate and Ctrl+Up or Ctrl+Down to scroll the inspector. End follows new traffic in Sequence. An IPC delivery marker records context insertion. Handoff rows show briefs, reports, and verdicts. Inline views keep the latest 512 observed exchanges. An attached live run displays generation previews over the private control endpoint. An attached historical run shows recorded IPC and tool observations from the journal.
 
+### Detached runs and control
+
 ```sh
 ra -C PROJECT --detached --config ratio.toml --goal 'Implement the solver'
 ra -C PROJECT --list-runs
@@ -307,6 +368,8 @@ ra -C PROJECT --config ratio.toml --fork RUN_ID --goal 'Evaluate a second approa
 ```
 
 Inline, foreground headless, and detached runs expose execution controls through a private Unix socket or a Windows named pipe restricted to the operator and SYSTEM. The detached launch response provides the combined progress and assessment log path and the run ID when the process is still active. `--events` emits checkpoint records as JSON Lines. `--resume` defaults to the latest run. A fork starts a new conversation and budget from the recorded roster and goal, using the current workspace as its baseline. Supply `--goal` to override the inherited goal.
+
+### Adding a worker mid-run
 
 During execution under a frozen worker plan, Ratio can queue one additional-worker request at a time. It finishes pending tool batches, proposes disjoint write paths and a new assignment, and requires read-only IPC exchanges with an incumbent worker and a stakeholder or temporary adviser. Every worker then acknowledges the amended plan ID before execution resumes. A declined request returns the incumbent team to its existing plan. The Workflow pane records the result.
 
@@ -327,6 +390,8 @@ During execution under a frozen worker plan, Ratio can queue one additional-work
           `-- declined ---> Work under plan A with the incumbent team
 ```
 
+### Run journal
+
 The SQLite WAL journal at `.ratio/runs.sqlite3` stores run state, IPC, tool outcomes, and budgets. An interrupted workspace tool is recorded as having an unknown outcome and requires inspection before relying on its effects. Interrupted IPC, memory, and acknowledgement operations can resume from their checkpoints. Ratio can import legacy format-2 JSON checkpoints and still maintains a format-2 mirror. Keep `.ratio/` private and outside version control because it contains transcripts and workspace data.
 
 Each resumed model request uses the current native tool schemas and access settings. For example, an updated `allow_inspection_shell` takes effect in inspection. For MCP, Ratio opens fresh connections and uses the current server policy. Resumed agents fetch current schemas with `tool_search` before calling external tools. Service-side handles that lived only in the previous connection may need to be reopened.
@@ -334,6 +399,8 @@ Each resumed model request uses the current native tool schemas and access setti
 ## Context, limits, and automation
 
 Ratio reserves output tokens and estimates the input cost of messages and tool definitions. Compaction summarizes earlier exchanges and retains the active task and recent call/result pairing. It targets 90% of available input space, with headroom for required content. Provider usage calibrates the target. An explicit context rejection can tighten the retry ceiling. If a reply reaches the output cap, Ratio discards partial calls and retries with a concision instruction and a smaller compaction target.
+
+### Limits
 
 Omit a limit or set it to `0` for unlimited operation. A positive value sets the cap. CLI values override TOML.
 
@@ -349,6 +416,8 @@ Omit a limit or set it to `0` for unlimited operation. A positive value sets the
 Ratio records usage for all runs. Provider attempts include retries and compaction. Token reservations use estimated input plus requested output and reconcile against usage when reported. Definite rate-limit and context rejections without usage release the token reservation. Ambiguous failures retain it. The active clock stops after an acknowledged pause reaches a request boundary and running tools settle.
 
 After a run stops at its token, provider-attempt, or active-runtime limit, update the cap and use **Resume saved** or `--resume --run-id RUN_ID`. Ratio restores the checkpoint before the stop and keeps the same run ID, history, and accumulated usage.
+
+### Metrics and evaluation
 
 | Command | Output |
 | --- | --- |
@@ -387,6 +456,8 @@ instructions = "Use locate_symbol to confirm symbol locations before checking th
 ```
 
 A configured skill directory contains `SKILL.md` and its relative references. The directory path is relative to the configuration file. Agents discover its contents through `read_skill`.
+
+### MCP servers
 
 Choose one tool policy per stdio MCP server. The policy applies to both discovery and calls.
 
@@ -427,4 +498,15 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 ```
 
-MIT
+To exercise the dashboard with Playwright, build `target/debug/ra`, install Playwright in your test environment, and run `node --test crates/ratio/tests/web_dashboard.mjs`. Set `RATIO_PLAYWRIGHT` to the module path if it is installed outside this workspace. Set `RATIO_WEB_SCREENSHOTS` to an existing directory to save a screenshot of each view during the run.
+
+The README screenshots come from [`docs/screenshots/capture.mjs`](docs/screenshots/capture.mjs). It stages a small project in a temporary directory, runs it through the dashboard and the terminal UI with a scripted local provider, and saves the images next to the script. It needs Playwright and tmux. The terminal images are rendered from `tmux capture-pane` output.
+
+```sh
+cargo build -p ra
+node docs/screenshots/capture.mjs
+```
+
+## License
+
+MIT. The dashboard embeds DM Mono and Martian Mono under the SIL Open Font License. The license texts are in [`crates/ratio/src/web/fonts`](crates/ratio/src/web/fonts).

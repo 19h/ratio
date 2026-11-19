@@ -3,8 +3,10 @@
 //   cargo build -p ra
 //   node docs/screenshots/capture.mjs [output directory]
 //
+// A third argument of `web` or `terminal` captures only that half.
 // RATIO_PLAYWRIGHT selects the Playwright module and RATIO_TEST_BINARY the `ra` binary.
-// The terminal captures also need tmux. Nothing here talks to a real provider.
+// RATIO_DEMO_TRACE=1 logs each scripted reply. The terminal captures also need tmux.
+// Nothing here talks to a real provider.
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -22,7 +24,6 @@ const bin = resolve(process.env.RATIO_TEST_BINARY || "target/debug/ra");
 const out = resolve(process.argv[2] || dirname(fileURLToPath(import.meta.url)));
 
 const REQUEST = "Fix the duration parser regression: 1h30m now parses as 31 seconds. Verify every supported input.";
-const NOTE = "The CLI passes values with padding, for example ' 2h '. Keep those valid.";
 
 const FILES = {
   "package.json": `{
@@ -102,7 +103,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { parseDuration } from "../src/duration.js";
 
-const table = JSON.parse(readFileSync(new URL("./fixtures/durations.json", import.meta.url)));
+const table = JSON.parse(readFileSync(new URL("./durations.json", import.meta.url)));
 
 for (const [input, expected] of Object.entries(table.accept)) {
   test(\`accepts \${JSON.stringify(input)}\`, () => assert.equal(parseDuration(input), expected));
@@ -140,7 +141,7 @@ const PLAN = {
     "worker_1: Use each part's own unit in parseDuration and reject input the grammar does not fully cover. Keep the signature and the RangeError.",
     "Acceptance: 1h30m => 5400000 | existing tests pass",
     "",
-    "worker_2: Add test/fixtures/durations.json and a table test covering every README form plus rejected input.",
+    "worker_2: Add test/durations.json and a table test covering every README form plus rejected input.",
     "Acceptance: one case per documented form | rejected inputs listed",
     "",
     "worker_3: After both land, run the combined suite and record the change in CHANGELOG.md.",
@@ -148,7 +149,7 @@ const PLAN = {
   ].join("\n"),
   ownership: {
     worker_1: [{ path: "src/duration.js", directory: false }],
-    worker_2: [{ path: "test/fixtures", directory: true }, { path: "test/table.test.js", directory: false }],
+    worker_2: [{ path: "test/durations.json", directory: false }, { path: "test/table.test.js", directory: false }],
     worker_3: [{ path: "CHANGELOG.md", directory: false }],
   },
   tasks: [
@@ -165,6 +166,11 @@ const THINKING = "The loop multiplies every part by UNITS.s, so the captured uni
   "Switching to UNITS[unit] restores the arithmetic. stakeholder_1 requires input without a unit to be rejected, " +
   "so the guard now compares the matched parts with the whole source instead of only checking that something matched. " +
   "Padded values stay valid because whitespace is stripped before matching. Applying both edits to src/duration.js.";
+const REPORTING = "The table is red against the unfixed parser for five accepted forms: 250ms, 5m, 1h30m, 1.5h and 1d. " +
+  "That is the regression, so the cases stay as written. '1h later' is accepted today and should be rejected. " +
+  "Telling worker_1 which rows fail so the fix can be checked against them.";
+// Replies that stream word by word and then hold until the screenshot is taken.
+const HELD = new Set([THINKING, REPORTING]);
 
 function latch() {
   let resolve;
@@ -183,27 +189,25 @@ const edit = (id, path, old_text, new_text) => call(id, "edit_file", { path, old
 
 // One provider per run. Every branch keys on the agent, its phase and the tool results already in its history.
 function provider() {
-  const gates = { replied: latch(), advised: latch(), fixtures: latch(), streaming: latch(), release: latch() };
+  const gates = { replied: latch(), advised: latch(), streaming: latch(), release: latch(), deciding: latch(), decide: latch() };
   const state = { frozen: false, inspected: false, drafts: 0, reviewed: false, known: new Set() };
 
   async function script(input, tools, system) {
     const has = id => input.messages.some(message => message.tool_call_id === id);
     const heard = text => input.messages.some(message => typeof message.content === "string" && message.content.includes(text));
-    const fresh = input.messages.at(-1).role === "tool";
+    // An agent that already reported is only being reopened by new mail.
+    const fresh = !heard("Previous assessment before new peer evidence") &&
+      !input.messages.some(message => message.role === "assistant" && message.content && !message.tool_calls?.length);
     const worker = /^You are parallel worker (worker_\d+),/.exec(system)?.[1];
     const member = /^Your ID: (\w+)$/m.exec(system)?.[1];
 
     if (tools.has("submit_team")) return ["setup", null, call("team", "submit_team", TEAM)];
-    if (tools.has("route_information")) return ["lead_reviewer", null, call("route", "route_information", {
-      category: "constraint", priority: "normal", reason: "Constrains the input the parser fix must keep accepting",
-      recipients: ["worker_1", "worker_2"],
-    })];
 
     if (worker && system.includes("Phase: coordinate")) {
       const next = { worker_1: "worker_2", worker_2: "worker_3", worker_3: "worker_1" }[worker];
       const offer = {
         worker_1: "task: parser fix; paths: src/duration.js; need: your table as red tests first",
-        worker_2: "task: fixtures; paths: test/fixtures/ test/table.test.js; you run the combined suite after both land",
+        worker_2: "task: fixtures; paths: test/durations.json test/table.test.js; you run the combined suite after both land",
         worker_3: "task: integrate; paths: CHANGELOG.md; depends: parser fixtures; no edits under src or test",
       }[worker];
       if (!has("coordinate")) return [worker, null, send("coordinate", next, offer)];
@@ -236,16 +240,15 @@ function provider() {
     if (worker === "worker_2") {
       if (!has("w2-list")) return [worker, null, call("w2-list", "list_directory", { path: "test" }), read("w2-readme", "README.md")];
       if (!has("w2-table")) return [worker, "Building the table from the README forms.",
-        call("w2-fixtures", "create_file", { path: "test/fixtures/durations.json", content: FIXTURES }),
+        call("w2-fixtures", "create_file", { path: "test/durations.json", content: FIXTURES }),
         call("w2-table", "create_file", { path: "test/table.test.js", content: TABLE })];
       if (!has("w2-run")) return [worker, null, shell("w2-run", "node --test test/table.test.js")];
-      if (!has("w2-msg")) return [worker, null, send("w2-msg", "worker_1",
-        "fixtures: test/fixtures/durations.json; 8 accept 4 reject; red until per-unit fix: 250ms 5m 1h30m 1.5h 1d")];
+      if (!has("w2-msg")) return [worker, REPORTING, send("w2-msg", "worker_1",
+        "fixtures: test/durations.json; 8 accept 4 reject; red until per-unit fix: 250ms 5m 1h30m 1.5h 1d")];
       if (heard("From stakeholder_1") && !has("w2-reject")) return [worker, "The bare-number rule needs a rejected case.",
-        edit("w2-reject", "test/fixtures/durations.json", "\"1h later\"]", "\"1h later\", \"90\"]")];
-      if (has("w2-reject") && fresh) gates.fixtures.resolve();
+        edit("w2-reject", "test/durations.json", "\"1h later\"]", "\"1h later\", \"90\"]")];
       return [worker, fresh
-        ? "Added test/fixtures/durations.json and test/table.test.js: one case per README form, padded input, and rejected input. The table is red against the unfixed parser, as expected."
+        ? "Added test/durations.json and test/table.test.js: one case per README form, padded input, and rejected input. The table is red against the unfixed parser, as expected."
         : "Fixtures unchanged after the latest message."];
     }
 
@@ -298,7 +301,7 @@ function provider() {
         reviewer_2: [read("look", "CHANGELOG.md")],
       }[member];
       if (opening && !has("look")) return [member, null, ...opening];
-      return [member, fresh || !opening ? {
+      return [member, fresh ? {
         reviewer_1: "Approve. The arithmetic uses each part's unit and the guard compares the matched parts with the whole input. The table covers every README row.",
         reviewer_2: "Approve. The signature and error type are unchanged, and the changelog names the stricter input as a change.",
         stakeholder_1: "Accept. --timeout 1h30m resolves to 5,400,000 ms and unit-less input fails early, which matches the CLI help.",
@@ -310,10 +313,14 @@ function provider() {
       state.frozen = true;
       return ["lead_reviewer", null, call("plan", "submit_plan", PLAN)];
     }
-    if (tools.has("submit_verdict")) return ["lead_reviewer", null, call("verdict", "submit_verdict", {
-      verdict: "approved",
-      assessment: "1h30m parses to 5,400,000 ms again. Every README form has a table test, unit-less input is rejected, and node --test passes on the verified candidate (15 tests).",
-    })];
+    if (tools.has("submit_verdict")) {
+      gates.deciding.resolve();
+      await gates.decide.promise;
+      return ["lead_reviewer", null, call("verdict", "submit_verdict", {
+        verdict: "approved",
+        assessment: "1h30m parses to 5,400,000 ms again. Every README form has a table test, unit-less input is rejected, and node --test passes on the verified candidate (15 tests).",
+      })];
+    }
     if (!state.frozen) {
       if (!state.inspected) {
         state.inspected = true;
@@ -338,18 +345,18 @@ function provider() {
       const tools = new Map((input.tools ?? []).map(item => [item.function.name, item.function.parameters]));
       const system = input.messages[0].content;
       const [agent, content, ...calls] = await script(input, tools, system);
+      if (process.env.RATIO_DEMO_TRACE) console.error(agent, calls.map(item => item.id).join(" ") || content.slice(0, 48));
       const prompt = Math.round(JSON.stringify(input).length / 3.4);
       const completion = Math.round(JSON.stringify([content, calls]).length / 3) + 12;
       const usage = { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion,
         prompt_tokens_details: { cached_tokens: state.known.has(agent) ? Math.round(prompt * 0.72) : 0 } };
       state.known.add(agent);
-      if (content === THINKING) {
-        await gates.fixtures.promise;
+      if (HELD.has(content)) {
         response.setHeader("content-type", "text/event-stream");
         const delta = (data, finish = null) =>
           response.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: data, finish_reason: finish }] })}\n\n`);
         gates.streaming.resolve();
-        for (const word of THINKING.split(" ")) {
+        for (const word of content.split(" ")) {
           delta({ content: word + " " });
           await sleep(90);
         }
@@ -402,13 +409,26 @@ verification_commands = ["node --test"]
   return path;
 }
 
-async function web() {
+async function web(browser) {
   const { root, project } = await workspace();
   const { gates, server } = provider();
   const config = await profile(root, server);
   const child = spawn(bin, ["-C", project, "--config", config, "--web", "--web-port=0"], { stdio: ["ignore", "pipe", "inherit"] });
-  const browser = await chromium.launch();
+  const expired = sleep(120_000, null, { ref: false }).then(() => { throw new Error("web capture timed out"); });
   try {
+    await Promise.race([expired, capture()]);
+  } finally {
+    for (const gate of Object.values(gates)) gate.resolve();
+    // The dashboard leaves its runner alive on exit, so stop that as well.
+    await once(spawn(bin, ["-C", project, "--control", "cancel"], { stdio: "ignore" }), "exit");
+    child.kill();
+    await once(child, "exit").catch(() => {});
+    server.closeAllConnections();
+    await new Promise(done => server.close(done));
+    await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
+  }
+
+  async function capture() {
     const [launch] = await once(createInterface({ input: child.stdout }), "line");
     const address = new URL(launch);
     const token = new URLSearchParams(address.hash.slice(1)).get("access");
@@ -430,12 +450,8 @@ async function web() {
     await page.locator('[data-preview-actor="worker_1"]').filter({ hasText: "stakeholder_1 requires" }).waitFor();
     await shot("overview");
 
-    await view("Triage");
-    await page.getByRole("button", { name: "Submit information" }).click();
-    await page.getByLabel("Information", { exact: true }).fill(NOTE);
-    await page.locator("#submit-action").click();
-    await page.getByText(NOTE, { exact: true }).waitFor();
     gates.release.resolve();
+    gates.decide.resolve();
 
     const run = new URL(page.url()).pathname.split("/")[2];
     for (let phase; phase !== "Approved";) {
@@ -444,42 +460,125 @@ async function web() {
       phase = listing.runs.find(item => item.run_id === run)?.phase;
       if (phase === "Rejected" || phase === "Exhausted") throw new Error("demo run ended as " + phase);
     }
-    await page.getByText("Delivered to", { exact: false }).first().waitFor();
-    await shot("triage");
-
-    await view("Overview");
-    await page.getByRole("heading", { name: "Run overview" }).waitFor();
+    await page.locator("#status").getByText("Approved").waitFor();
     await sleep(1600);
     await shot("approved");
 
     await view("Communication");
     await page.locator(".seq-row").first().waitFor();
-    await shot("sequence-latest");
     await page.locator(".seq-row").filter({ has: page.locator(".seq-kind", { hasText: "FAN" }) }).first().click();
     await page.locator(".inspector").getByRole("link", { name: "Close selection" }).waitFor();
     await shot("sequence");
 
     await view("Tools & files");
-    await page.getByRole("heading").first().waitFor();
-    await shot("tools-list");
+    await page.getByRole("row").filter({ hasText: "edit_file" }).filter({ hasText: "src/duration.js" }).last().getByRole("link").first().click();
+    await page.locator(".inspector").getByRole("link", { name: "Close selection" }).waitFor();
+    await shot("tools");
 
     await view("Timeline");
+    await page.getByRole("heading", { name: "Timeline", exact: true }).waitFor();
+    await page.getByRole("searchbox", { name: "Search entries", exact: true }).fill("RangeError");
+    await page.getByRole("button", { name: "Apply", exact: true }).click();
+    await page.waitForURL(url => url.searchParams.get("q") === "RangeError");
     await page.locator(".entry").first().waitFor();
     await shot("timeline");
+  }
+}
 
-    await page.locator("#agent-nav").getByRole("link", { name: "Parser engineer" }).click();
-    await page.locator(".entry").first().waitFor();
-    await shot("agent");
+const ANSI = ["#1a1714", "#ff4d3d", "#4ade5e", "#ffb000", "#4dc4ff", "#e85aa4", "#45d1c5", "#cfc8bd",
+  "#70685f", "#ff7a6e", "#7df08c", "#ffd166", "#8ad8ff", "#ff7fc0", "#86e8de", "#f5f1ea"];
+
+function indexed(value) {
+  if (value < 16) return ANSI[value];
+  if (value > 231) return `rgb(${Array(3).fill(8 + (value - 232) * 10)})`;
+  const level = step => (step ? 55 + step * 40 : 0);
+  return `rgb(${level(Math.floor((value - 16) / 36))},${level(Math.floor((value - 16) / 6) % 6)},${level((value - 16) % 6)})`;
+}
+
+// Turns `tmux capture-pane -e` output into HTML, one span per run of identical attributes.
+function markup(screen) {
+  let pen = {};
+  const escape = text => text.replace(/[&<>]/g, glyph => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[glyph]);
+  const span = text => {
+    if (!text) return "";
+    const [front, back] = pen.reverse ? [pen.bg ?? "#12100e", pen.fg ?? "#cfc8bd"] : [pen.fg, pen.bg];
+    const style = [front && `color:${front}`, back && `background:${back}`, pen.bold && "font-weight:700",
+      pen.dim && "opacity:.6", pen.italic && "font-style:italic", pen.underline && "text-decoration:underline"].filter(Boolean).join(";");
+    return style ? `<span style="${style}">${escape(text)}</span>` : escape(text);
+  };
+  return screen.replace(/[\x0e\x0f]|\x1b[()][0-9A-Z]/g, "").split(/\x1b\[([0-9;]*)m/).map((part, index) => {
+    if (index % 2 === 0) return span(part);
+    const codes = part ? part.split(";").map(Number) : [0];
+    for (let at = 0; at < codes.length; at++) {
+      const code = codes[at];
+      const extended = () => (codes[at + 1] === 5 ? indexed(codes[at += 2]) : `rgb(${codes[at + 2]},${codes[at + 3]},${codes[at += 4]})`);
+      if (code === 0) pen = {};
+      else if (code === 1) pen.bold = true;
+      else if (code === 2) pen.dim = true;
+      else if (code === 3) pen.italic = true;
+      else if (code === 4) pen.underline = true;
+      else if (code === 7) pen.reverse = true;
+      else if (code === 22) pen.bold = pen.dim = false;
+      else if (code === 23) pen.italic = false;
+      else if (code === 24) pen.underline = false;
+      else if (code === 27) pen.reverse = false;
+      else if (code >= 30 && code <= 37) pen.fg = ANSI[code - 30];
+      else if (code === 38) pen.fg = extended();
+      else if (code === 39) pen.fg = undefined;
+      else if (code >= 40 && code <= 47) pen.bg = ANSI[code - 40];
+      else if (code === 48) pen.bg = extended();
+      else if (code === 49) pen.bg = undefined;
+      else if (code >= 90 && code <= 97) pen.fg = ANSI[code - 82];
+      else if (code >= 100 && code <= 107) pen.bg = ANSI[code - 92];
+    }
+    return "";
+  }).join("");
+}
+
+// Runs the same scripted provider under the inline terminal UI inside a private tmux server.
+async function terminal(browser) {
+  const { root, project } = await workspace();
+  const { gates, server } = provider();
+  const config = await profile(root, server);
+  const tmux = (...args) => execFileSync("tmux", ["-L", "ratio-demo", "-f", "/dev/null", ...args], { encoding: "utf8" });
+  const page = await browser.newPage({ deviceScaleFactor: 2 });
+  const shot = async name => {
+    await sleep(1200);
+    await page.setContent(`<body style="margin:0;background:#080706"><pre style="display:inline-block;margin:0;padding:14px 18px;` +
+      `background:#12100e;color:#cfc8bd;font:14px Menlo,monospace">${markup(tmux("capture-pane", "-p", "-e", "-t", "demo").trimEnd())}</pre>`);
+    await page.locator("pre").screenshot({ path: join(out, name + ".png") });
+    console.log("saved", name);
+  };
+  const expired = sleep(120_000, null, { ref: false }).then(() => { throw new Error("terminal capture timed out"); });
+  try {
+    tmux("start-server", ";", "set", "-g", "default-terminal", "tmux-256color", ";",
+      "new-session", "-d", "-x", "150", "-y", "42", "-s", "demo", bin, "-C", project, "--config", config, REQUEST);
+    await Promise.race([expired, capture()]);
   } finally {
     for (const gate of Object.values(gates)) gate.resolve();
-    await browser.close();
-    child.kill();
-    await once(child, "exit").catch(() => {});
+    try { tmux("kill-server"); } catch {}
+    await once(spawn(bin, ["-C", project, "--control", "cancel"], { stdio: "ignore" }), "exit");
     server.closeAllConnections();
     await new Promise(done => server.close(done));
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
+  }
+
+  async function capture() {
+    await gates.streaming.promise;
+    await sleep(2500);
+    await shot("tui-activity");
+    gates.release.resolve();
+    await gates.deciding.promise;
+    tmux("send-keys", "-t", "demo", "Tab");
+    await shot("tui-communication");
   }
 }
 
 await mkdir(out, { recursive: true });
-await web();
+const browser = await chromium.launch();
+try {
+  if (process.argv[3] !== "terminal") await web(browser);
+  if (process.argv[3] !== "web") await terminal(browser);
+} finally {
+  await browser.close();
+}
