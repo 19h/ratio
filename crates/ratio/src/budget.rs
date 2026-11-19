@@ -7,8 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::config::Config;
 
@@ -22,13 +23,14 @@ struct Ledger {
 struct State {
     ledger: Ledger,
     path: Option<PathBuf>,
-    since: Instant,
+    since: Option<Instant>,
     exhausted: Option<&'static str>,
 }
 
 #[derive(Clone)]
 pub struct Budget {
     state: Rc<RefCell<State>>,
+    active: watch::Sender<bool>,
     requests: u64,
     tokens: u64,
     elapsed_ms: u64,
@@ -41,9 +43,10 @@ impl Budget {
             state: Rc::new(RefCell::new(State {
                 ledger: Ledger::default(),
                 path: None,
-                since: Instant::now(),
+                since: Some(Instant::now()),
                 exhausted: None,
             })),
+            active: watch::channel(true).0,
             requests: limits.max_requests,
             tokens: limits.max_total_tokens,
             elapsed_ms: limits.max_run_secs.saturating_mul(1000),
@@ -55,7 +58,7 @@ impl Budget {
         if resume && path.exists() {
             state.ledger =
                 serde_json::from_reader(File::open(&path)?).context("read run budget ledger")?;
-            state.since = Instant::now();
+            state.since = Some(Instant::now());
         } else if resume {
             anyhow::bail!("run budget ledger is missing");
         }
@@ -100,6 +103,41 @@ impl Budget {
         )
     }
 
+    pub(crate) fn pause(&self) -> Result<Pause<'_>> {
+        ensure!(
+            !self.remaining().is_zero(),
+            "run budget exhausted: active time"
+        );
+        let mut state = self.state.borrow_mut();
+        debug_assert!(
+            state.since.is_some(),
+            "pause requires a quiescent orchestrator"
+        );
+        state.save()?;
+        state.since = None;
+        self.active.send_replace(false);
+        Ok(Pause(self))
+    }
+
+    pub(crate) async fn until_exhausted(&self) {
+        let mut active = self.active.subscribe();
+        loop {
+            let running = *active.borrow_and_update();
+            if running {
+                let remaining = self.remaining();
+                if remaining.is_zero() {
+                    return;
+                }
+                tokio::select! {
+                    _ = active.changed() => {},
+                    _ = tokio::time::sleep(remaining) => {},
+                }
+            } else {
+                let _ = active.changed().await;
+            }
+        }
+    }
+
     pub fn exhaustion(&self) -> Option<&'static str> {
         self.state
             .borrow()
@@ -110,18 +148,39 @@ impl Budget {
     pub fn save(&self) -> Result<()> {
         self.state.borrow_mut().save()
     }
+
+    pub(crate) fn save_if_active(&self) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+        if state.since.is_some() {
+            state.save()?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct Pause<'a>(&'a Budget);
+
+impl Drop for Pause<'_> {
+    fn drop(&mut self) {
+        self.0.state.borrow_mut().since = Some(Instant::now());
+        self.0.active.send_replace(true);
+    }
 }
 
 impl State {
     fn elapsed(&self) -> u64 {
         self.ledger
             .elapsed_ms
-            .saturating_add(u64::try_from(self.since.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .saturating_add(self.since.map_or(0, |since| {
+                u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }))
     }
 
     fn save(&mut self) -> Result<()> {
         self.ledger.elapsed_ms = self.elapsed();
-        self.since = Instant::now();
+        if self.since.is_some() {
+            self.since = Some(Instant::now());
+        }
         if let Some(path) = &self.path {
             let mut file =
                 tempfile::NamedTempFile::new_in(path.parent().context("budget ledger directory")?)?;

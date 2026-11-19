@@ -62,7 +62,7 @@ impl<'a> Orchestrator<'a> {
             .bind(self.store.budget_path(&session)?, session.budget_started)?;
         session.budget_started = true;
         self.store.save(&session)?;
-        let deadline = tokio::time::sleep(self.budget.remaining());
+        let deadline = self.budget.until_exhausted();
         let run = self.run_inner(session, guidance);
         tokio::pin!(run, deadline);
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -70,7 +70,7 @@ impl<'a> Orchestrator<'a> {
             tokio::select! {
                 result = &mut run => break result,
                 _ = &mut deadline => break Err(anyhow::anyhow!("run budget exhausted: active time")),
-                _ = tick.tick() => self.budget.save()?,
+                _ = tick.tick() => self.budget.save_if_active()?,
             }
         };
         self.budget.save()?;

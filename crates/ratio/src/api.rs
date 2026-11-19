@@ -162,10 +162,10 @@ impl Api {
             let mut encoded = header::HeaderValue::from_str(value)
                 .with_context(|| format!("invalid value for provider header {name}"))?;
             encoded.set_sensitive(true);
-            headers.insert(name, encoded);
-            if !value.is_empty() {
+            if redact_header_value(&name, value) {
                 secrets.push(value.clone());
             }
+            headers.insert(name, encoded);
         }
         secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
         let client = Client::builder()
@@ -200,14 +200,15 @@ impl Api {
     }
 
     pub(crate) async fn wait_for_generation(&self) -> Result<()> {
-        if let Some(mut control) = self.reporter.generation_control() {
-            tokio::time::timeout(
-                self.budget.remaining(),
-                control.wait_for(|state| !state.paused),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("run budget exhausted: active time"))?
-            .context("generation controls closed")?;
+        let Some(mut control) = self.reporter.generation_control() else {
+            return Ok(());
+        };
+        if control.borrow().paused {
+            let _pause = self.budget.pause()?;
+            control
+                .wait_for(|state| !state.paused)
+                .await
+                .context("generation controls closed")?;
         }
         Ok(())
     }
@@ -434,6 +435,9 @@ impl Api {
                 break;
             }
         }
+        decoder
+            .finish_input()
+            .map_err(|error| self.safe_error(error))?;
         if let Some((error, usage, choice_seen)) = decoder.take_error() {
             let code = error
                 .get("code")
@@ -588,6 +592,15 @@ impl Api {
     fn safe_error(&self, error: anyhow::Error) -> ApiError {
         anyhow::anyhow!("{}", clean(clip(&self.redact(&format!("{error:#}")), 1024))).into()
     }
+}
+
+fn redact_header_value(name: &header::HeaderName, value: &str) -> bool {
+    !value.is_empty()
+        && (value.len() >= 8
+            || matches!(
+                name.as_str(),
+                "authorization" | "proxy-authorization" | "x-api-key" | "api-key"
+            ))
 }
 
 impl Usage {

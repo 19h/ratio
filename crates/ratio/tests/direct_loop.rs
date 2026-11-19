@@ -118,6 +118,17 @@ fn stream_response(events: &[Value], finish: bool, terminal: bool) -> (u16, Valu
     (200, json!({"test_sse":raw,"test_terminal":terminal}))
 }
 
+fn stream_response_at_eof(events: &[Value], terminal: bool) -> (u16, Value) {
+    let (status, mut response) = stream_response(events, false, terminal);
+    response["test_sse"] = json!(
+        response["test_sse"]
+            .as_str()
+            .unwrap()
+            .trim_end_matches("\r\n")
+    );
+    (status, response)
+}
+
 fn assert_history(request: &Value) {
     let mut calls = std::collections::VecDeque::new();
     for message in request["messages"].as_array().unwrap() {
@@ -256,26 +267,22 @@ x-api-key = "provider-test"
                         .unwrap()
                         .contains("βeta")
                 );
-                stream_response(
+                stream_response_at_eof(
                     &[
                         stream_event(json!({"content":"Fixture created."}), Some("stop")),
                         json!({"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":2}}),
                     ],
-                    true,
                     false,
                 )
             }
-            3 => stream_response(
-                &[
-                    stream_event(
-                        json!({"tool_calls":[{"index":0,"id":"verdict","type":"function","function":{"name":"submit_verdict","arguments":"{\"verdict\":\"approved\",\"assessment\":\"Verified streamed fixture.\"}"}}]}),
-                        Some("tool_calls"),
-                    ),
-                    json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}),
-                ],
-                true,
-                true,
-            ),
+            3 => {
+                let mut packet = stream_event(
+                    json!({"tool_calls":[{"index":0,"id":"verdict","type":"function","function":{"name":"submit_verdict","arguments":"{\"verdict\":\"approved\",\"assessment\":\"Verified streamed fixture.\"}"}}]}),
+                    Some("tool_calls"),
+                );
+                packet["usage"] = json!({"prompt_tokens":10,"completion_tokens":5});
+                stream_response_at_eof(&[packet], true)
+            }
             _ => panic!("unexpected request {index}"),
         };
         (status, response, false)
@@ -317,7 +324,7 @@ fn incomplete_stream_never_dispatches_a_tool() {
     let temp = tempfile::tempdir().unwrap();
     let (endpoint, server) = mock(|index, _| match index {
         0 => text("Create a fixture."),
-        1 => stream_response(
+        1 => stream_response_at_eof(
             &[stream_event(
                 json!({"tool_calls":[
                     {"index":0,"id":"unsafe","type":"function","function":{
@@ -325,7 +332,6 @@ fn incomplete_stream_never_dispatches_a_tool() {
                 ]}),
                 None,
             )],
-            false,
             true,
         ),
         _ => panic!("unexpected request"),
@@ -359,6 +365,67 @@ fn legacy_transport_omits_stream_options() {
         &endpoint,
         &["--goal", "Legacy transport", "--stream", "false"],
     ));
+    server.join().unwrap();
+}
+
+#[test]
+fn provider_diagnostics_preserve_short_metadata_and_redact_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("ratio.toml");
+    std::fs::write(
+        &config,
+        "[provider.headers]\nx-tenant = '1'\nx-api-key = 'keyZ'\n",
+    )
+    .unwrap();
+    let (endpoint, server) = mock_transport(|index, _, headers| {
+        assert_eq!(index, 0);
+        assert_eq!(headers["x-tenant"], "1");
+        assert_eq!(headers["x-api-key"], "keyZ");
+        (
+            400,
+            json!({"error":{"message":"tenant 1, credential keyZ"},"test_terminal":true}),
+            false,
+        )
+    });
+    let run = cli(
+        temp.path(),
+        &endpoint,
+        &[
+            "--goal",
+            "Inspect workspace",
+            "--config",
+            config.to_str().unwrap(),
+        ],
+    );
+    assert!(!run.status.success());
+    let diagnostics = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        diagnostics.contains("tenant 1, credential [redacted]"),
+        "{diagnostics}"
+    );
+    assert!(!diagnostics.contains("keyZ"));
+    server.join().unwrap();
+}
+
+#[test]
+fn active_time_budget_still_interrupts_a_stalled_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (finished, stopped) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        read_mock_request(&mut socket);
+        stopped.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    let run = cli(
+        temp.path(),
+        &endpoint,
+        &["--goal", "Inspect workspace", "--max-run-secs", "2"],
+    );
+    finished.send(()).unwrap();
+    assert_eq!(run.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&run.stdout).contains("Run budget exhausted: active time"));
     server.join().unwrap();
 }
 
@@ -1667,7 +1734,7 @@ fn tui_previews_pauses_and_restarts_a_generation() {
             socket.write_all(&body).unwrap();
         }
     });
-    let (mut terminal, process) = launch_tui(temp.path(), &endpoint);
+    let (mut terminal, process) = launch_tui(temp.path(), &endpoint, &["--max-run-secs", "3"]);
     let mut display = Vec::new();
     wait_for_screen(&mut terminal, &mut display, "Stakeholders");
     terminal.write_all(b"Inspect fixture\r").unwrap();
@@ -1684,6 +1751,7 @@ fn tui_previews_pauses_and_restarts_a_generation() {
                 String::from_utf8_lossy(&display[display.len().saturating_sub(2500)..])
             )
         });
+    thread::sleep(Duration::from_millis(3250));
     terminal.write_all(b"use-a-new-check\r").unwrap();
     terminal.write_all(b"\x1b[17~").unwrap();
     wait_for_screen(&mut terminal, &mut display, "Approved");
@@ -1824,7 +1892,7 @@ fn tui_refines_and_approves_a_goal_then_displays_file_tools() {
         }
         text("Inspect and verify the status file.")
     });
-    let (mut terminal, process) = launch_tui(temp.path(), &endpoint);
+    let (mut terminal, process) = launch_tui(temp.path(), &endpoint, &[]);
     let mut display = Vec::new();
     wait_for_screen(&mut terminal, &mut display, "Stakeholders");
     terminal.write_all(b"Write a status file\r").unwrap();
@@ -1867,7 +1935,7 @@ fn tui_refines_and_approves_a_goal_then_displays_file_tools() {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn launch_tui(cwd: &Path, endpoint: &str) -> (std::fs::File, TerminalChild) {
+fn launch_tui(cwd: &Path, endpoint: &str, args: &[&str]) -> (std::fs::File, TerminalChild) {
     use std::{
         os::{fd::FromRawFd, unix::process::CommandExt},
         process::Stdio,
@@ -1913,6 +1981,7 @@ fn launch_tui(cwd: &Path, endpoint: &str) -> (std::fs::File, TerminalChild) {
             "--endpoint",
             endpoint,
         ])
+        .args(args)
         .env("TERM", "xterm-256color")
         .stdin(slave.try_clone().unwrap())
         .stderr(slave)

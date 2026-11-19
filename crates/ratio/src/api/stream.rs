@@ -214,6 +214,19 @@ impl Decoder {
         self.done || self.provider_error.is_some()
     }
 
+    pub(super) fn finish_input(&mut self) -> Result<()> {
+        if !self.done() {
+            // Some gateways close after the final data field without the
+            // normal SSE separator. finish still requires a terminal marker.
+            if !self.line.is_empty() {
+                self.line()?;
+                self.line.clear();
+            }
+            self.dispatch()?;
+        }
+        Ok(())
+    }
+
     pub(super) fn take_error(&mut self) -> Option<(Value, Option<Usage>, bool)> {
         self.provider_error
             .take()
