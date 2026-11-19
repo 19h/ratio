@@ -13,6 +13,7 @@ impl RunReader {
         let mut metrics = RunMetrics {
             provider_attempts: ledger.requests,
             metered_tokens: ledger.tokens,
+            token_breakdown: ledger.token_breakdown(0),
             active_ms: ledger.elapsed_ms,
             ..RunMetrics::default()
         };

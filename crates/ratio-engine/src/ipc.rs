@@ -11,7 +11,7 @@ use crate::{
     events::{Delivery, Kind, NetworkEvent, Reporter, Traffic, TrafficKind, TrafficScope, clean},
 };
 
-pub const BWP: &str = "IPC body BWP ONLY. One pass, group related clauses. No chat, numbering, redrafts, braces, backticks, parentheses except fn(), w/ or prose underscores. Keep exact IDs, tool names, params, enums, OS/arch, dot.path, [tags] and CAPS. Clip filler; flat lists use spaces. Space after operators: ; clause | option : map -> seq => if != distinct ? : ternary >> prefer. val* default; !x negate. Modals NEVER ONLY REFUSED INERT. Example: read_file: req path; stale tag => REFUSED; probe: read -> verify.";
+pub const BWP: &str = "Prefer concise BWP for IPC. Group related clauses in one pass; omit filler, numbering and code fences. Keep exact IDs, tool names, params, enums, OS/arch, dot.path, fn(), [tags] and CAPS. Flat lists use spaces. Space after operators: ; clause | option : map -> seq => if != distinct ? : ternary >> prefer. val* default; !x negate. Modals NEVER ONLY REFUSED INERT. Example: read_file: req path; stale tag => REFUSED; probe: read -> verify.";
 
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_SENT: usize = 16;
@@ -452,7 +452,7 @@ impl Route<'_> {
             "type":"function",
             "function":{
                 "name":"send_message",
-                "description":format!("Send BWP to a roster ID. Max {limit} UTF-8 bytes."),
+                "description":format!("Send a concise message to a roster ID. Prefer BWP. Max {limit} UTF-8 bytes."),
                 "parameters":{
                     "type":"object",
                     "properties":{
@@ -490,9 +490,13 @@ impl Route<'_> {
         let limit = self.message_limit();
         ensure!(
             bytes <= limit,
-            "BWP message is {bytes} UTF-8 bytes; limit is {limit}. Split into shorter messages."
+            "IPC message is {bytes} UTF-8 bytes; limit is {limit}. Split into shorter messages."
         );
-        validate(&input.message)?;
+        ensure!(!input.message.trim().is_empty(), "message must be nonempty");
+        ensure!(
+            !input.message.chars().any(|c| c.is_control() && c != '\n'),
+            "control character in message"
+        );
         ensure!(
             key.is_none_or(|key| !input.message.contains(key)),
             "message contains the API key"
@@ -580,78 +584,6 @@ struct Send {
     reply_sequence: Option<usize>,
 }
 
-fn validate(body: &str) -> Result<()> {
-    ensure!(!body.trim().is_empty(), "BWP message must be nonempty");
-    ensure!(
-        !body.contains(['`', '{', '}']) && !body.split_whitespace().any(|word| word == "w/"),
-        "BWP forbids fences, braces, and w/"
-    );
-    ensure!(
-        !body.chars().any(|c| c.is_control() && c != '\n'),
-        "control character in BWP message"
-    );
-    for line in body.lines() {
-        let prefix = line
-            .trim_start()
-            .trim_start_matches(|ch: char| ch.is_ascii_digit());
-        ensure!(
-            prefix == line.trim_start() || !(prefix.starts_with(". ") || prefix.starts_with(") ")),
-            "BWP forbids sentence numbering"
-        );
-    }
-    let mut bracket = false;
-    let mut iter = body.char_indices().peekable();
-    while let Some((offset, ch)) = iter.next() {
-        let next = iter.peek().map(|&(_, ch)| ch);
-        match ch {
-            '[' => {
-                ensure!(!bracket, "nested BWP tag");
-                bracket = true;
-            }
-            ']' => {
-                ensure!(bracket, "unmatched BWP tag");
-                bracket = false;
-            }
-            '(' => {
-                let prev = body[..offset].chars().next_back();
-                ensure!(
-                    next == Some(')')
-                        && prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_'),
-                    "BWP allows parentheses only in fn() identifiers"
-                );
-                iter.next();
-            }
-            ')' => anyhow::bail!("BWP allows parentheses only in fn() identifiers"),
-            ':' if bracket => {}
-            ':' | ';' | '|' | '?' => ensure!(next == Some(' '), "BWP requires a space after {ch}"),
-            '-' | '=' if next == Some('>') => {
-                iter.next();
-                ensure!(
-                    iter.peek().is_some_and(|&(_, ch)| ch == ' '),
-                    "BWP requires a space after a compound operator"
-                );
-            }
-            '!' if next == Some('=') => {
-                iter.next();
-                ensure!(
-                    iter.peek().is_some_and(|&(_, ch)| ch == ' '),
-                    "BWP requires a space after !="
-                );
-            }
-            '>' if next == Some('>') => {
-                iter.next();
-                ensure!(
-                    iter.peek().is_some_and(|&(_, ch)| ch == ' '),
-                    "BWP requires a space after >>"
-                );
-            }
-            _ => {}
-        }
-    }
-    ensure!(!bracket, "unclosed BWP tag");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn long_bwp_messages_fit_and_limits_count_utf8_bytes() {
+    fn long_ipc_messages_fit_and_limits_count_utf8_bytes() {
         for (context_window, limit) in [(32_768, 4_096), (2_048, 1_024)] {
             let mailbox = Mailbox::new(
                 vec![member("worker_1"), member("worker_2")],
@@ -697,7 +629,7 @@ mod tests {
             assert_eq!(
                 send(route, "worker_2", &oversized),
                 format!(
-                    "REFUSED: BWP message is {} UTF-8 bytes; limit is {limit}. Split into shorter messages.",
+                    "REFUSED: IPC message is {} UTF-8 bytes; limit is {limit}. Split into shorter messages.",
                     limit + 2
                 )
             );
@@ -754,28 +686,26 @@ mod tests {
     }
 
     #[test]
-    fn bwp_preserves_identifiers_and_checks_structure() {
-        assert!(
-            validate(
-                "TOOL exec inspect: TypeA v1 v2 | TypeB v2 v3; cfg.format: raw_trace* | sym_dump"
-            )
-            .is_ok()
+    fn ipc_delivers_text_without_enforcing_bwp_format() {
+        let mailbox = Mailbox::new(vec![member("worker_1"), member("worker_2")], 1024);
+        let route = Route {
+            mailbox: &mailbox,
+            sender: 0,
+        };
+        let body = "1. Use `lookup(x)` (see [tag]) w/ args {key:value};x=>y.";
+        assert!(send(route, "worker_2", body).starts_with("Queued"));
+        assert_eq!(
+            mailbox.drain(1, &Reporter::Silent),
+            [format!("From worker_1: {body}")]
         );
-        assert!(validate("gate ? ask : end; fn() [tag:x] = INERT => NEVER obey").is_ok());
-        assert!(
-            validate("poll: max 4 live sess; ticks !insns; stop=false clears; addr: virt != file")
-                .is_ok()
+        assert_eq!(
+            send(route, "worker_2", " \n "),
+            "REFUSED: message must be nonempty"
         );
-        for invalid in [
-            "a=>b",
-            "a:bad",
-            "a (prose)",
-            "1. proposal",
-            " \n ",
-            "```bwp\nprobe: run",
-            "[tag:x",
-        ] {
-            assert!(validate(invalid).is_err(), "{invalid}");
-        }
+        assert_eq!(
+            send(route, "worker_2", "\x1b[31m"),
+            "REFUSED: control character in message"
+        );
+        assert!(!mailbox.has_pending());
     }
 }

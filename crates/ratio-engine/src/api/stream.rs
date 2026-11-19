@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{Choice, Function, Message, Response, ToolCall, Usage, responses};
-use crate::config::ProviderApi;
+use crate::{budget::TokenValues, config::ProviderApi};
 
 #[derive(Default)]
 pub(super) struct Decoder {
@@ -37,6 +37,7 @@ mod tests {
             "\u{feff}: heartbeat\r\n\r\n",
             "data: {\"choices\":[\r",
             "data: {\"delta\":{\"content\":\"λ\"},\"finish_reason\":\"stop\"}]}\r\r",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":1}}}\n\n",
             "data: {\"choices\":null,\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\n",
             "data: [DONE]\r\n\r\n",
         );
@@ -48,7 +49,9 @@ mod tests {
             }
         }
         let response = decoder.finish().unwrap();
-        assert_eq!(response.usage.unwrap().total(), Some(3));
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.total(), Some(3));
+        assert_eq!(usage.counts().cached_input, Some(1));
         assert!(matches!(
             &response.choices[0].message,
             Message::Assistant { content: Some(text), .. } if text == "λ"
@@ -165,7 +168,7 @@ impl Decoder {
             serde_json::from_slice(&self.data).context("decode chat completion stream event")?;
         self.data.clear();
         if let Some(usage) = packet.usage {
-            self.usage = Some(usage);
+            self.record_usage(usage);
         }
         if let Some(error) = packet.error {
             self.provider_error = Some(error);
@@ -235,6 +238,12 @@ impl Decoder {
     }
 
     fn responses_event(&mut self, packet: Value) -> Result<()> {
+        if let Some(usage) = packet
+            .pointer("/response/usage")
+            .and_then(|usage| serde_json::from_value(usage.clone()).ok())
+        {
+            self.record_usage(usage);
+        }
         match packet["type"]
             .as_str()
             .context("missing Responses event type")?
@@ -250,9 +259,6 @@ impl Decoder {
                     .or_else(|| packet.get("error"))
                     .unwrap_or(&packet);
                 self.provider_error = Some(error.clone());
-                self.usage = packet
-                    .pointer("/response/usage")
-                    .and_then(|usage| serde_json::from_value(usage.clone()).ok());
             }
             "response.output_text.delta" => {
                 let text = packet["delta"]
@@ -311,8 +317,15 @@ impl Decoder {
         self.content.as_deref().unwrap_or_default()
     }
 
-    pub(super) fn prompt_tokens(&self) -> Option<usize> {
-        self.usage.as_ref()?.prompt_tokens
+    fn record_usage(&mut self, mut usage: Usage) {
+        if let Some(previous) = &self.usage {
+            usage.inherit_missing(previous);
+        }
+        self.usage = Some(usage);
+    }
+
+    pub(super) fn token_values(&self) -> TokenValues {
+        self.usage.as_ref().map(Usage::counts).unwrap_or_default()
     }
 
     pub(super) fn output_tokens(&self) -> usize {
@@ -337,7 +350,9 @@ impl Decoder {
             let value = self
                 .terminal
                 .context("Responses stream ended without a terminal response")?;
-            return responses::decode(value);
+            let mut response = responses::decode(value)?;
+            response.usage = self.usage.or(response.usage);
+            return Ok(response);
         }
         ensure!(
             self.line.is_empty()

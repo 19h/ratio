@@ -214,24 +214,37 @@ function renderStatus() {
   const run = state.route.run ? state.summary?.run : null;
   const metrics = state.summary?.metrics ?? {};
   const usage = state.live?.token_usage;
+  const breakdown = usage?.breakdown ?? metrics.token_breakdown;
   const tokens = usage?.tokens ?? metrics.metered_tokens ?? 0;
   const rate = usage?.output_tokens_per_second ?? 0;
   const cell = (text, name) => node("span", { class: name }, text);
-  const generating = state.live?.generations?.length ?? 0;
   const tone = !run ? "idle" : endings.includes(run.phase) ? run.phase.toLowerCase() : state.live?.paused ? "paused" : "active";
   const mode = node("span", { class: "status-mode", "data-tone": tone }, run ? title(run.phase) : "Workspace");
   fill($("#status"), mode, run ? [
-    cell(`cycle ${run.cycle}`), cell(`run ${run.run_id}`, "wide"), cell(`${roster().length} agents`),
-    state.live ? cell(`${generating} generating`, generating ? "generating" : undefined) : null,
+    cell(`cycle ${run.cycle}`), cell(`run ${run.run_id}`, "wide"),
     spacer(),
     node("span", { "data-token-usage": tokens, title: usage?.estimated ? "Includes estimated in-flight tokens" : "Metered tokens" },
       `${usage?.estimated ? "~" : ""}${number.format(tokens)} tokens`),
+    tokenFlow("input", "↑", "Outgoing input tokens, including cache hits", breakdown?.input),
+    tokenFlow("cached_input", "↑", "Cached outgoing input tokens", breakdown?.cached_input),
+    tokenFlow("output", "↓", "Incoming output tokens", breakdown?.output),
     usage ? node("span", { "data-output-tps": rate, title: "Estimated streamed output tokens per second over the last 2 seconds" },
       `${rate ? "~" : ""}${number.format(rate)} tok/s`) : null,
     cell(`${number.format(metrics.tool_receipts ?? 0)} tool calls`, "wide"),
     cell(`${number.format(metrics.ipc_deliveries ?? 0)} deliveries`, "wide"),
     cell([node("kbd", {}, "/"), " search ", node("kbd", {}, "1–6"), " views"], "keys"),
   ] : [cell(`${state.runs.length} runs`), spacer()]);
+}
+
+function tokenFlow(kind, arrow, label, count) {
+  const known = count?.tokens != null;
+  const text = known ? `${count.estimated ? "~" : ""}${number.format(count.tokens)}${count.partial ? "+" : ""}` : "—";
+  const value = known ? `${count.estimated ? "approximately " : ""}${number.format(count.tokens)}${count.partial ? " with some requests missing data" : ""}` : "unavailable";
+  const description = `${label} · ${value}`;
+  return node("span", { class: "token-flow", "data-token-flow": kind, "data-token-count": count?.tokens, title: description, "aria-label": description },
+    node("span", { class: "token-arrow", "aria-hidden": "true" }, arrow,
+      kind === "cached_input" ? node("span", { class: "token-cache" }) : null),
+    text);
 }
 
 function workspace() {
@@ -530,7 +543,7 @@ function messageInspector(detail) {
   for (const item of detail.deliveries ?? []) recipients.set(item.recipient, item);
   const count = status => [...recipients.values()].filter(item => item.state === status).length;
   return [node("div", { class: "inspector-section" },
-    node("strong", { class: "message-title" }, `#${event.sequence}  ${data.reply_to ? "Stakeholder broadcast" : "Direct BWP IPC"}`),
+    node("strong", { class: "message-title" }, `#${event.sequence}  ${data.reply_to ? "Stakeholder broadcast" : "Direct IPC"}`),
     muted(`Cycle ${event.cycle} / attempt ${data.attempt ?? 1} / ${title(event.phase)}`),
     data.worker_request ? muted(`Worker request ${data.worker_request}`) : null,
     facts([["From", who(event.actor)], ["Reply to", data.reply_to ? who(data.reply_to) : null], ["Sent", time(event.timestamp_ms)]]),
@@ -647,7 +660,8 @@ async function historyView(route) {
       node("div", { class: "hero" }, caption("Agent"), node("h1", { class: "hero-title" }, agent.name),
         node("span", { class: "hero-sub" }, node("span", { class: `dot${active ? " live" : ""}`, "data-agent-dot": actor }), code(actor), task ? pill(task.state) : null)),
       task?.task ? node("div", { class: "hero-field wide" }, caption("Task"), node("p", {}, task.task.description)) : null,
-      persona ? node("details", { class: "hero-field wide" }, node("summary", {}, "Persona"), pre(persona)) : null,
+      persona ? node("div", { class: "hero-field wide" }, caption("Persona"),
+        pre(persona, { class: "persona", tabindex: 0, "aria-label": "Persona" })) : null,
       pre(active?.text || "", { class: "preview", hidden: !active, "data-preview-actor": actor })),
     tabs(local, [["all", "Conversation"], ["ipc", "Incoming & outgoing IPC"], ["tools", "Tools"]], tab, query));
     if (tab === "ipc") head.push(node("nav", { class: "tabs sub", "aria-label": "Message direction" },

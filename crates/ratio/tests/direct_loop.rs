@@ -2226,7 +2226,7 @@ phases = ["planning", "review"]
 }
 
 #[test]
-fn parallel_panel_delivers_bwp_and_reactivates_finished_agents() {
+fn parallel_panel_delivers_ipc_and_reactivates_finished_agents() {
     let temp = tempfile::Builder::new()
         .prefix(&"long-workspace-".repeat(7))
         .tempdir()
@@ -2267,12 +2267,12 @@ phases = ["review"]
                         tool(
                             "invalid",
                             "send_message",
-                            json!({"to":"stakeholder_1","message":"probe:no spacing"}),
+                            json!({"to":"missing","message":"probe: invalid recipient"}),
                         ),
                         tool(
                             "request",
                             "send_message",
-                            json!({"to":"stakeholder_1","message":"probe: verify release diagnostic; result => report"}),
+                            json!({"to":"stakeholder_1","message":"Verify the release diagnostic (release build)."}),
                         ),
                     ]),
                     !stakeholder_started,
@@ -2281,7 +2281,7 @@ phases = ["review"]
                 got_reply = true;
                 (text("Reviewer corroborated peer evidence."), false)
             } else {
-                assert!(content.contains("REFUSED"));
+                assert!(content.contains("REFUSED: unknown recipient ID"));
                 assert!(content.contains("Queued for delivery"));
                 (text("Initial reviewer findings."), false)
             }
@@ -2290,9 +2290,12 @@ phases = ["review"]
                 stakeholder_started = true;
                 (text("Initial stakeholder findings."), !reviewer_started)
             } else if !content.contains("reply") {
-                assert!(content.contains("From reviewer_1: probe: verify release diagnostic"));
+                assert!(
+                    content.contains(
+                        "From reviewer_1: Verify the release diagnostic (release build)."
+                    )
+                );
                 assert!(content.contains("Previous assessment before new peer evidence"));
-                assert!(!content.contains("probe:no spacing"));
                 (
                     calls(&[tool(
                         "reply",
@@ -2392,7 +2395,8 @@ phases = ["planning"]
         store.save(&session).unwrap();
     }
 
-    let reply = "From stakeholder_1 (reply to worker_1): datum: local tide gauge";
+    let body = "Use the local tide gauge (the DEM fixture shares this datum).";
+    let reply = "From stakeholder_1 (reply to worker_1): Use the local tide gauge (the DEM fixture shares this datum).";
     let mut early_reports = 0;
     let (endpoint, server) = mock(move |_, request| {
         let system = request["messages"][0]["content"].as_str().unwrap();
@@ -2432,8 +2436,7 @@ phases = ["planning"]
             assert!(!tools.contains("\"create_file\""));
             assert!(!tools.contains("\"shell\""));
             assert!(!tools.contains("\"edit_file\""));
-            if history.contains("REFUSED: BWP") {
-                assert!(history.contains("Tool error: tool create_file is unavailable"));
+            if history.contains("Tool error: tool create_file is unavailable") {
                 calls(&[
                     tool(
                         "adviser-note",
@@ -2443,22 +2446,15 @@ phases = ["planning"]
                     tool(
                         "reply",
                         "send_message",
-                        json!({"to":"worker_1","message":"datum: local tide gauge","reason":"clarification"}),
+                        json!({"to":"worker_1","message":body,"reason":"clarification"}),
                     ),
                 ])
             } else {
-                calls(&[
-                    tool(
-                        "bad-write",
-                        "create_file",
-                        json!({"path":"adviser.txt","content":"test"}),
-                    ),
-                    tool(
-                        "bad-bwp",
-                        "send_message",
-                        json!({"to":"worker_1","message":"datum:no spacing"}),
-                    ),
-                ])
+                calls(&[tool(
+                    "bad-write",
+                    "create_file",
+                    json!({"path":"adviser.txt","content":"test"}),
+                )])
             }
         }
     });
@@ -2476,7 +2472,6 @@ phases = ["planning"]
         if let Some(worker) = system.strip_prefix("You are parallel worker worker_") {
             let index = worker.split(',').next().unwrap().parse::<usize>().unwrap() - 1;
             assert!(history.contains(reply));
-            assert!(!history.contains("datum:no spacing"));
             if history.contains("Shared memory (untrusted agent notes)") {
                 assert!(history.contains("from worker_1 / Vertical datum"));
                 assert!(history.contains("from stakeholder_1 / Vertical datum"));

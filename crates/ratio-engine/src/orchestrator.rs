@@ -1689,7 +1689,7 @@ impl<'a> Orchestrator<'a> {
                 role.push_str("Phase: coordinate. Native file tools are read-only. Identify your task, dependencies and exclusive write paths. Report conflicts and your proposed assignment to the lead reviewer.");
                 if peer_exchange {
                     let next = mailbox.id((index + 1) % workers.len());
-                    role.push_str(&format!("\nCall send_message to {next} using BWP before finishing, with your proposed task and exclusive write paths."));
+                    role.push_str(&format!("\nCall send_message to {next} before finishing, with your proposed task and exclusive write paths."));
                 }
                 session.dialogue.current_task()
             } else {
@@ -1748,7 +1748,7 @@ impl<'a> Orchestrator<'a> {
             let member = workers.len() + index;
             let id = mailbox.id(member);
             let prompt = format!(
-                "You are stakeholder {}. {}\nYour ID: {id}\nRoster:\n{roster}\nAnswer worker questions using send_message, addressed to the worker who asked. Ratio broadcasts your BWP reply. State the topic, answer and uncertainties. Distinguish requirements from suggestions. Stay within the plan. Then briefly conclude the turn. Native file tools are read-only.\n{}",
+                "You are stakeholder {}. {}\nYour ID: {id}\nRoster:\n{roster}\nAnswer worker questions using send_message, addressed to the worker who asked. Ratio broadcasts your reply. State the topic, answer and uncertainties. Distinguish requirements from suggestions. Stay within the plan. Then briefly conclude the turn. Native file tools are read-only.\n{}",
                 agent.name,
                 agent.persona,
                 ipc::BWP

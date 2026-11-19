@@ -146,8 +146,11 @@ main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: colu
 .status-bar > span.status-mode[data-tone="paused"], .status-bar > span.status-mode[data-tone="exhausted"] { background: var(--sig-warn); }
 .status-bar > span.status-mode[data-tone="approved"] { background: var(--sig-ok); }
 .status-bar > span.status-mode[data-tone="rejected"] { background: var(--sig-err); }
-.status-bar .generating { color: var(--accent); }
 .status-bar .keys { color: var(--text-muted); }
+.status-bar > span.token-flow { display: inline-flex; flex-shrink: 0; align-items: center; gap: .3rem; }
+.token-arrow { display: inline-flex; align-items: center; gap: .08rem; }
+.token-cache { width: .5rem; height: .5rem; border: 1px solid currentColor; border-radius: 45% / 22%; position: relative; }
+.token-cache::after { content: ""; position: absolute; inset: 40% 0 auto; border-top: 1px solid currentColor; }
 
 /* panels and tables */
 .panel { border: 0.0625rem solid var(--line-default); background: var(--surface-page); min-width: 0; display: flex; flex-direction: column; }
@@ -252,8 +255,7 @@ details[open] > summary { margin-bottom: 0.375rem; }
 .preview { display: flex; flex-direction: column-reverse; max-height: 7rem; overflow: auto; border-left: 0.125rem solid var(--accent); background: var(--surface-inset); padding: 0.375rem 0.625rem; color: var(--text-secondary); }
 .agent > .preview { grid-column: 2 / -1; }
 .band > .preview { flex: 1 0 100%; border-top: 0.0625rem solid var(--line-hairline); }
-.band > details { flex: 1 0 100%; padding: 0.4375rem 1rem; border-top: 0.0625rem solid var(--line-hairline); font-size: 0.75rem; }
-.band > details > pre { max-height: 14rem; overflow: auto; }
+.hero-field > .persona { max-height: min(14rem, 25vh); overflow: auto; }
 .empty-drop { display: flex; flex-direction: column; gap: 0.375rem; padding: 1.75rem 1.5rem; border: 0.0625rem dashed var(--line-default); text-align: left; text-transform: none; white-space: normal; max-width: 44rem; font-size: 0.8125rem; }
 .empty-drop strong { font: 500 1rem/1.3 var(--font-display); color: var(--text-primary); }
 .empty-drop:hover:not(:disabled) { background: var(--surface-panel); color: var(--text-secondary); }

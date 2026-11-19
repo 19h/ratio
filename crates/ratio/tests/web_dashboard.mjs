@@ -45,6 +45,8 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
   const gate = new Promise(resolve => { release = resolve; });
   let streamMore;
   const nextChunk = new Promise(resolve => { streamMore = resolve; });
+  let finishStream;
+  const usageGate = new Promise(resolve => { finishStream = resolve; });
   let finishWorker;
   const workGate = new Promise(resolve => { finishWorker = resolve; });
   let endFork;
@@ -106,6 +108,8 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
           await nextChunk;
           delta({reasoning_content:"evidence ".repeat(60)});
           await gate;
+          response.write('data: {"choices":[],"usage":{"prompt_tokens":20,"prompt_tokens_details":{"cached_tokens":7}}}\n\n');
+          await usageGate;
           const calls = [call("mcp_list",{server:"fixture"}),call("tool_search",{server:"fixture",query:["spe","inspect"]}),
             call("mcp_call",{server:"fixture",name:"inspect",arguments:{subject:"interface"}})];
           delta({tool_calls:calls.map((item,index) => ({ ...item,index }))}, "tool_calls");
@@ -121,7 +125,7 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
       } else output = completion("Inspect the MCP evidence.");
       response.setHeader("content-type","application/json");
       reportedTotal += 1;
-      response.end(JSON.stringify({...output, usage:{total_tokens:1}}));
+      response.end(JSON.stringify({...output, usage:{prompt_tokens:1,completion_tokens:0,total_tokens:1}}));
     } catch (error) {
       response.statusCode = 400;
       response.end(String(error));
@@ -177,15 +181,23 @@ tools = ["inspect"]
     await page.getByRole("heading",{name:"Run overview"}).waitFor();
     await started;
     await page.locator('[data-preview-actor="worker_1"]').filter({hasText:"Inspect tool metadata and evidence."}).waitFor();
+    assert.match(await page.locator("#connection").innerText(), /\b1 generating\b/i);
+    assert.match(await page.locator("#agent-count").innerText(), /^[1-9]\d*$/);
+    assert.doesNotMatch(await page.locator("#status").innerText(), /\b(?:agents|generating)\b/);
     const tokenCounter = page.locator("[data-token-usage]");
     await tokenCounter.filter({hasText:/^~/}).waitFor();
     const initialTokens = Number(await tokenCounter.getAttribute("data-token-usage"));
+    const incoming = page.locator('[data-token-flow="output"]');
+    const initialIncoming = Number(await incoming.getAttribute("data-token-count"));
+    assert.equal(await page.locator('[data-token-flow="cached_input"]').getAttribute("data-token-count"), null);
     streamMore();
-    await page.waitForFunction(initial => {
+    await page.waitForFunction(({ initialTokens, initialIncoming }) => {
       const total = document.querySelector("[data-token-usage]");
-      const rate = total?.nextElementSibling;
-      return Number(total?.dataset.tokenUsage) > initial && Number(rate?.dataset.outputTps) > 0;
-    }, initialTokens);
+      const output = document.querySelector('[data-token-flow="output"]');
+      const rate = document.querySelector("[data-output-tps]");
+      return Number(total?.dataset.tokenUsage) > initialTokens &&
+        Number(output?.dataset.tokenCount) > initialIncoming && Number(rate?.dataset.outputTps) > 0;
+    }, {initialTokens, initialIncoming});
     await shot("overview");
     const run = new URL(page.url()).pathname.split("/")[2];
     const response = await fetch(address.origin+`/api/run/${run}/stream?after=0`,{
@@ -204,6 +216,8 @@ tools = ["inspect"]
     await page.locator("#submit-action").click();
     await page.getByText("Additional interface evidence",{exact:true}).waitFor();
     release();
+    await page.locator('[data-token-flow="cached_input"][data-token-count="7"]').waitFor();
+    finishStream();
     await page.getByText("Relevant to observation",{exact:true}).waitFor();
     await page.getByText("Delivered to",{exact:false}).waitFor();
     await page.getByRole("button",{name:"Request worker",exact:true}).click();
@@ -226,9 +240,12 @@ tools = ["inspect"]
     await page.getByRole("heading",{name:"Agent lanes"}).waitFor();
     await shot("lanes");
     await page.locator("#agent-nav").getByRole("link",{name:"Evidence auditor"}).click();
+    const persona = page.locator('pre[aria-label="Persona"]').filter({hasText:"Check integration evidence"});
+    await persona.waitFor({state:"visible"});
     await page.getByRole("link",{name:"Incoming & outgoing IPC"}).click();
     await page.getByRole("link",{name:"Incoming",exact:true}).click();
     await page.getByText("acceptance: verify evidence",{exact:true}).first().waitFor();
+    assert.equal(await persona.isVisible(), true);
     await shot("agent");
     await page.locator("#navigation").getByRole("link",{name:"Tools & files"}).click();
     await page.getByRole("link",{name:"MCP",exact:true}).click();
@@ -258,10 +275,16 @@ tools = ["inspect"]
     await shot("narrow-menu");
     await page.locator("#navigation").getByRole("link",{name:"Overview"}).click();
     await page.getByRole("heading",{name:"Run overview"}).waitFor();
+    await page.locator("#controls").getByRole("button",{name:"Fork",exact:true}).waitFor();
     await page.waitForFunction(total => {
       const counter = document.querySelector("[data-token-usage]");
       return Number(counter?.dataset.tokenUsage) === total && !counter.textContent.startsWith("~");
     }, reportedTotal);
+    assert.equal(await incoming.getAttribute("data-token-count"), "5");
+    assert.equal(await page.locator('[data-token-flow="input"]').getAttribute("data-token-count"), String(reportedTotal - 5));
+    const cache = page.locator('[data-token-flow="cached_input"]');
+    assert.equal(await cache.getAttribute("data-token-count"), "7");
+    assert.match(await cache.textContent(), /7\+$/);
     await page.setViewportSize({width:1440,height:900});
     await page.locator("#controls").getByRole("button",{name:"Fork",exact:true}).click();
     await page.getByLabel("Replacement request").fill("Inspect the forked evidence");
@@ -283,6 +306,7 @@ tools = ["inspect"]
   } finally {
     streamMore();
     release();
+    finishStream();
     finishWorker();
     endFork();
     if (browser) await browser.close();

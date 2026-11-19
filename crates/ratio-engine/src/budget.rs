@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use ratio_protocol::LiveTokenUsage;
+use ratio_protocol::{LiveTokenUsage, TokenBreakdown, TokenCount};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
@@ -23,6 +23,22 @@ pub(crate) struct Ledger {
     pub(crate) requests: u64,
     pub(crate) tokens: u64,
     pub(crate) elapsed_ms: u64,
+    #[serde(default)]
+    token_breakdown: TokenBreakdown,
+    #[serde(default)]
+    breakdown_attempts: u64,
+}
+
+impl Ledger {
+    pub(crate) fn token_breakdown(&self, active: u64) -> TokenBreakdown {
+        let mut breakdown = self.token_breakdown;
+        if self.requests > self.breakdown_attempts.saturating_add(active) {
+            breakdown.input.partial = true;
+            breakdown.cached_input.partial = true;
+            breakdown.output.partial = true;
+        }
+        breakdown
+    }
 }
 
 struct State {
@@ -37,8 +53,54 @@ struct State {
 
 struct AttemptTokens {
     reserved: u64,
-    observed: u64,
-    output: usize,
+    input_estimate: u64,
+    streamed: u64,
+    reported: TokenValues,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TokenValues {
+    pub input: Option<u64>,
+    pub cached_input: Option<u64>,
+    pub output: Option<u64>,
+}
+
+impl AttemptTokens {
+    fn update_reported(&mut self, values: TokenValues) {
+        self.reported.input = values.input.or(self.reported.input);
+        self.reported.cached_input = values.cached_input.or(self.reported.cached_input);
+        self.reported.output = values.output.or(self.reported.output);
+    }
+
+    fn breakdown(&self, output_estimate: u64) -> TokenBreakdown {
+        let count = |reported: Option<u64>, estimated: Option<u64>| TokenCount {
+            tokens: reported.or(estimated),
+            estimated: reported.is_none() && estimated.is_some(),
+            partial: reported.is_none() && estimated.is_none(),
+        };
+        TokenBreakdown {
+            input: count(self.reported.input, Some(self.input_estimate)),
+            cached_input: count(self.reported.cached_input, None),
+            output: count(
+                self.reported.output,
+                Some(self.streamed.max(output_estimate)),
+            ),
+        }
+    }
+}
+
+fn add_breakdown(total: &mut TokenBreakdown, counts: TokenBreakdown) {
+    for (total, count) in [
+        (&mut total.input, counts.input),
+        (&mut total.cached_input, counts.cached_input),
+        (&mut total.output, counts.output),
+    ] {
+        if let Some(tokens) = count.tokens {
+            total.tokens = Some(total.tokens.unwrap_or_default().saturating_add(tokens));
+        }
+        total.estimated |= count.estimated;
+        total.partial |= count.partial;
+    }
 }
 
 #[derive(Default)]
@@ -151,11 +213,7 @@ impl Budget {
 
     pub fn reconcile(&self, reserved: u64, actual: u64) -> Result<()> {
         let mut state = self.state.borrow_mut();
-        state.ledger.tokens = state
-            .ledger
-            .tokens
-            .saturating_sub(reserved)
-            .saturating_add(actual);
+        state.charge_actual(reserved, actual);
         state.save()
     }
 
@@ -172,24 +230,28 @@ impl Budget {
             id,
             AttemptTokens {
                 reserved,
-                observed: prompt as u64,
-                output: 0,
+                input_estimate: prompt as u64,
+                streamed: 0,
+                reported: TokenValues::default(),
             },
         );
-        Ok(TokenProgress {
-            budget: self,
-            id,
-            prompt,
-        })
+        Ok(TokenProgress { budget: self, id })
     }
 
     pub fn live_token_usage(&self) -> LiveTokenUsage {
         let state = self.state.borrow();
         let mut reserved = 0u64;
         let mut estimated = 0u64;
+        let mut breakdown = state
+            .ledger
+            .token_breakdown(state.token_progress.len() as u64);
         for attempt in state.token_progress.values() {
             reserved = reserved.saturating_add(attempt.reserved);
-            estimated = estimated.saturating_add(attempt.observed);
+            let counts = attempt.breakdown(0);
+            estimated = estimated
+                .saturating_add(counts.input.tokens.unwrap_or_default())
+                .saturating_add(counts.output.tokens.unwrap_or_default());
+            add_breakdown(&mut breakdown, counts);
         }
         LiveTokenUsage {
             tokens: state
@@ -198,6 +260,7 @@ impl Budget {
                 .saturating_sub(reserved)
                 .saturating_add(estimated),
             estimated: !state.token_progress.is_empty(),
+            breakdown,
             output_tokens_per_second: state.output_rate.per_second(Instant::now()),
         }
     }
@@ -267,32 +330,54 @@ impl Budget {
 pub(crate) struct TokenProgress<'a> {
     budget: &'a Budget,
     id: u64,
-    prompt: usize,
 }
 
 impl TokenProgress<'_> {
-    pub(crate) fn observe(&self, reported_prompt: Option<usize>, output: usize) {
+    pub(crate) fn observe(&self, reported: TokenValues, output: usize) {
         let mut state = self.budget.state.borrow_mut();
         let Some(attempt) = state.token_progress.get_mut(&self.id) else {
             return;
         };
-        attempt.observed = reported_prompt
-            .unwrap_or(self.prompt)
-            .saturating_add(output) as u64;
-        let received = output.saturating_sub(attempt.output) as u64;
-        attempt.output = output;
+        attempt.update_reported(reported);
+        let output = output as u64;
+        let received = output.saturating_sub(attempt.streamed);
+        attempt.streamed = output;
         state.output_rate.record(Instant::now(), received);
     }
 
-    pub(crate) fn reconcile(&self, actual: u64) -> Result<()> {
-        let attempt = self
-            .budget
-            .state
-            .borrow_mut()
+    pub(crate) fn finish(
+        &self,
+        reported: TokenValues,
+        actual: Option<u64>,
+        output_estimate: u64,
+    ) -> Result<()> {
+        let mut state = self.budget.state.borrow_mut();
+        let mut attempt = state
             .token_progress
             .remove(&self.id)
             .context("model attempt is already reconciled")?;
-        self.budget.reconcile(attempt.reserved, actual)
+        attempt.update_reported(reported);
+        add_breakdown(
+            &mut state.ledger.token_breakdown,
+            attempt.breakdown(output_estimate),
+        );
+        state.ledger.breakdown_attempts += 1;
+        if let Some(actual) = actual {
+            state.charge_actual(attempt.reserved, actual);
+        }
+        state.save()
+    }
+
+    pub(crate) fn reject(&self) -> Result<()> {
+        self.finish(
+            TokenValues {
+                input: Some(0),
+                cached_input: Some(0),
+                output: Some(0),
+            },
+            Some(0),
+            0,
+        )
     }
 }
 
@@ -316,6 +401,14 @@ impl Drop for Pause<'_> {
 }
 
 impl State {
+    fn charge_actual(&mut self, reserved: u64, actual: u64) {
+        self.ledger.tokens = self
+            .ledger
+            .tokens
+            .saturating_sub(reserved)
+            .saturating_add(actual);
+    }
+
     fn elapsed(&self) -> u64 {
         self.ledger
             .elapsed_ms
@@ -382,25 +475,47 @@ mod tests {
 
         let first = budget.reserve_completion(30, 40).unwrap();
         let second = budget.reserve_completion(20, 60).unwrap();
-        assert_eq!(
-            budget.live_token_usage(),
-            LiveTokenUsage {
-                tokens: 150,
-                estimated: true,
-                output_tokens_per_second: 0,
-            }
+        let usage = budget.live_token_usage();
+        assert_eq!(usage.tokens, 150);
+        assert_eq!(usage.breakdown.input.tokens, Some(50));
+        assert!(usage.breakdown.input.estimated && usage.breakdown.input.partial);
+        assert_eq!(usage.breakdown.cached_input.tokens, None);
+        first.observe(TokenValues::default(), 5);
+        second.observe(
+            TokenValues {
+                input: Some(15),
+                cached_input: Some(8),
+                output: None,
+            },
+            2,
         );
-        first.observe(None, 5);
-        second.observe(Some(15), 2);
-        assert_eq!(budget.live_token_usage().tokens, 152);
+        let usage = budget.live_token_usage();
+        assert_eq!(usage.tokens, 152);
+        assert_eq!(usage.breakdown.output.tokens, Some(7));
+        assert_eq!(usage.breakdown.cached_input.tokens, Some(8));
+        assert!(usage.breakdown.cached_input.partial);
         assert_eq!(budget.state.borrow().ledger.tokens, 250);
 
-        first.reconcile(32).unwrap();
+        first
+            .finish(
+                TokenValues {
+                    input: Some(28),
+                    cached_input: Some(2),
+                    output: Some(4),
+                },
+                Some(32),
+                0,
+            )
+            .unwrap();
         assert_eq!(budget.live_token_usage().tokens, 149);
         drop(first);
         drop(second);
         let usage = budget.live_token_usage();
         assert_eq!(usage.tokens, 212);
         assert!(!usage.estimated);
+        assert_eq!(usage.breakdown.input.tokens, Some(28));
+        assert_eq!(usage.breakdown.cached_input.tokens, Some(2));
+        assert_eq!(usage.breakdown.output.tokens, Some(4));
+        assert!(usage.breakdown.output.partial);
     }
 }

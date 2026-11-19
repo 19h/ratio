@@ -132,6 +132,8 @@ pub struct RunSummary {
 pub struct RunMetrics {
     pub provider_attempts: u64,
     pub metered_tokens: u64,
+    #[serde(default)]
+    pub token_breakdown: TokenBreakdown,
     pub active_ms: u64,
     pub tool_intents: usize,
     pub tool_receipts: usize,
@@ -209,7 +211,23 @@ pub struct LiveTokenUsage {
     pub tokens: u64,
     pub estimated: bool,
     #[serde(default)]
+    pub breakdown: TokenBreakdown,
+    #[serde(default)]
     pub output_tokens_per_second: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenBreakdown {
+    pub input: TokenCount,
+    pub cached_input: TokenCount,
+    pub output: TokenCount,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenCount {
+    pub tokens: Option<u64>,
+    pub estimated: bool,
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

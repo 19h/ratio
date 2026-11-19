@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{
-    budget::{Budget, TokenProgress},
+    budget::{Budget, TokenProgress, TokenValues},
     config::{Config, Provider, ProviderApi},
     context::{clip, estimate},
     events::{Generation, Kind, LiveGeneration, Reporter, clean},
@@ -101,6 +101,14 @@ struct Usage {
     #[serde(alias = "output_tokens")]
     completion_tokens: Option<usize>,
     total_tokens: Option<u64>,
+    prompt_tokens_details: Option<UsageDetails>,
+    input_tokens_details: Option<UsageDetails>,
+    prompt_cache_hit_tokens: Option<u64>,
+}
+
+#[derive(Clone, Deserialize)]
+struct UsageDetails {
+    cached_tokens: Option<u64>,
 }
 
 pub struct Completion {
@@ -455,7 +463,7 @@ impl Api {
             decoder
                 .push(&chunk)
                 .map_err(|error| self.safe_error(error))?;
-            tokens.observe(decoder.prompt_tokens(), decoder.output_tokens());
+            tokens.observe(decoder.token_values(), decoder.output_tokens());
             dirty = true;
             if decoder.done() {
                 break;
@@ -464,7 +472,7 @@ impl Api {
         decoder
             .finish_input()
             .map_err(|error| self.safe_error(error))?;
-        tokens.observe(decoder.prompt_tokens(), decoder.output_tokens());
+        tokens.observe(decoder.token_values(), decoder.output_tokens());
         if let Some((error, usage, choice_seen)) = decoder.take_error() {
             let code = error
                 .get("code")
@@ -477,10 +485,10 @@ impl Api {
                 .unwrap_or("unknown error");
             let context_rejection = is_context_error(code, detail);
             let detail = clean(clip(&self.redact(detail), 1024));
-            if let Some(actual) = usage.as_ref().and_then(Usage::total) {
-                tokens.reconcile(actual)?;
+            if let Some(usage) = usage.filter(|usage| usage.total().is_some()) {
+                tokens.finish(usage.counts(), usage.total(), 0)?;
             } else if context_rejection && !choice_seen {
-                tokens.reconcile(0)?;
+                tokens.reject()?;
             }
             return Err(if context_rejection {
                 ApiError::Context { status, detail }
@@ -548,12 +556,12 @@ impl Api {
                 .collect();
             let status = status.as_u16();
             let usage = serde_json::from_value::<Usage>(body["usage"].clone()).ok();
-            if let Some(total) = usage.as_ref().and_then(Usage::total) {
-                tokens.reconcile(total)?;
+            if let Some(usage) = usage.filter(|usage| usage.total().is_some()) {
+                tokens.finish(usage.counts(), usage.total(), 0)?;
             } else if status == 429 || context_rejection {
                 // The provider explicitly refused admission. Keep the attempt
                 // charge, but release the token reservation.
-                tokens.reconcile(0)?;
+                tokens.reject()?;
             }
             return if context_rejection {
                 Err(ApiError::Context { status, detail })
@@ -592,9 +600,21 @@ impl Api {
             .usage
             .as_ref()
             .and_then(|usage| usage.prompt_tokens);
-        if let Some(actual) = response.usage.as_ref().and_then(Usage::total) {
-            tokens.reconcile(actual)?;
-        }
+        let counts = response
+            .usage
+            .as_ref()
+            .map(Usage::counts)
+            .unwrap_or_default();
+        let output_estimate = if counts.output.is_none() {
+            estimate_output(&choice.message)
+        } else {
+            0
+        };
+        tokens.finish(
+            counts,
+            response.usage.as_ref().and_then(Usage::total),
+            output_estimate,
+        )?;
         if self.debug {
             self.reporter.emit(
                 Kind::Info,
@@ -633,7 +653,55 @@ fn redact_header_value(name: &header::HeaderName, value: &str) -> bool {
             ))
 }
 
+fn estimate_output(message: &Message) -> u64 {
+    let Message::Assistant {
+        content,
+        reasoning_content,
+        tool_calls,
+        ..
+    } = message
+    else {
+        return 0;
+    };
+    let bytes = content.as_ref().map_or(0, String::len)
+        + reasoning_content.as_ref().map_or(0, String::len)
+        + tool_calls
+            .iter()
+            .map(|call| call.function.name.len() + call.function.arguments.len())
+            .sum::<usize>();
+    bytes.div_ceil(3) as u64
+}
+
 impl Usage {
+    fn counts(&self) -> TokenValues {
+        TokenValues {
+            input: self.prompt_tokens.map(|tokens| tokens as u64),
+            cached_input: self.cached_input(),
+            output: self.completion_tokens.map(|tokens| tokens as u64),
+        }
+    }
+
+    fn cached_input(&self) -> Option<u64> {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens)
+            .or_else(|| {
+                self.input_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens)
+            })
+            .or(self.prompt_cache_hit_tokens)
+    }
+
+    fn inherit_missing(&mut self, previous: &Self) {
+        if self.prompt_tokens.is_none() && self.completion_tokens.is_none() {
+            self.total_tokens = self.total_tokens.or(previous.total_tokens);
+        }
+        self.prompt_tokens = self.prompt_tokens.or(previous.prompt_tokens);
+        self.completion_tokens = self.completion_tokens.or(previous.completion_tokens);
+        self.prompt_cache_hit_tokens = self.cached_input().or_else(|| previous.cached_input());
+    }
+
     fn total(&self) -> Option<u64> {
         self.total_tokens.or_else(|| {
             Some((self.prompt_tokens? as u64).saturating_add(self.completion_tokens? as u64))

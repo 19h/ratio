@@ -245,7 +245,7 @@ impl Orchestrator<'_> {
             .await?;
             ensure!(
                 mailbox.exchanged(0, 1) && mailbox.exchanged(0, 2),
-                "incoming worker did not exchange delivered BWP messages with both mentors"
+                "incoming worker did not exchange delivered IPC messages with both mentors"
             );
             let incoming = panel[0].snapshot();
             session

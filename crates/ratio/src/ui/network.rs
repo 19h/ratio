@@ -40,7 +40,7 @@ impl Filter {
     fn label(self) -> &'static str {
         match self {
             Self::All => "All traffic",
-            Self::Ipc => "BWP IPC",
+            Self::Ipc => "IPC",
             Self::Handoffs => "Handoffs",
         }
     }
@@ -129,7 +129,7 @@ impl Network {
                 let label = if reply_to.is_some() {
                     "Stakeholder broadcast"
                 } else {
-                    "Direct BWP IPC"
+                    "Direct IPC"
                 };
                 (
                     Some(sequence),

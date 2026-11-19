@@ -151,7 +151,7 @@ Chat Completions is the default. Pass the base URL or full method URL for the se
 
 For Chat Completions gateways that reject `stream_options`, set `[provider].stream_usage = false`. Use `--stream false` for JSON-only endpoints. `--legacy-max-tokens` selects `max_tokens` for older Chat Completions gateways. `seed` is a Chat Completions setting whose effect depends on the provider. Provider tool batching controls calls within one completion. Ratio's agent concurrency is configured separately.
 
-The web dashboard shows an estimated token total while requests are in flight, including streamed text, reasoning, and tool arguments. The adjacent `tok/s` readout estimates aggregate streamed output across agents over the last two seconds. The total settles to provider-reported usage when available. If a provider omits usage, Ratio retains its conservative budget charge.
+The web dashboard footer shows outgoing input, cached input, and incoming output. Cached input is included in the outgoing count. `~` marks an estimate, `+` marks a subtotal with missing records, and a dash indicates unavailable data. Incoming usage updates as chunks arrive. The `tok/s` readout estimates aggregate streamed output across agents over the last two seconds. The total settles to provider-reported usage when available. If a provider omits usage, Ratio retains its conservative budget charge.
 
 Ratio sends a Bearer header when a key is configured. A custom `Authorization` header takes precedence. Standard credential header values and custom header values of at least eight UTF-8 bytes are masked in provider errors and live previews.
 
@@ -164,7 +164,7 @@ Ratio sends a Bearer header when a key is configured. A custom `Authorization` h
 
 Plan repair identifies missing, duplicate, and unknown worker IDs. If bounded full-plan repairs fail, Ratio asks for one typed assignment per worker and validates the assembled plan before requesting acknowledgements.
 
-Agents use `send_message` with a recipient ID and a BWP body. The tool advertises a limit of up to 4,096 UTF-8 bytes per message. Each recipient's queued messages and their delivery metadata share a byte budget that scales with the model's context window, up to 16 KiB. BWP keeps exact tool names, paths, and IDs. Flat lists use spaces, clauses use `;`, and multi-word options use `|`. Braces, code fences, and prose parentheses are refused. Function names may use `fn()` notation.
+Agents use `send_message` with a recipient ID and a text body. The tool advertises a limit of up to 4,096 UTF-8 bytes per message. Each recipient's queued messages and their delivery metadata share a byte budget that scales with the model's context window, up to 16 KiB. Prompts recommend BWP for concise exchanges that preserve exact tool names, paths, and IDs. Flat lists use spaces, clauses use `;`, and multi-word options use `|`. BWP is optional and IPC accepts ordinary prose and code snippets.
 
 ```text
   Worker 1 -- BWP question --> Mailbox --> Stakeholder
@@ -308,7 +308,7 @@ ra -C PROJECT --config ratio.toml --fork RUN_ID --goal 'Evaluate a second approa
 
 Inline, foreground headless, and detached runs expose execution controls through a private Unix socket or a Windows named pipe restricted to the operator and SYSTEM. The detached launch response provides the combined progress and assessment log path and the run ID when the process is still active. `--events` emits checkpoint records as JSON Lines. `--resume` defaults to the latest run. A fork starts a new conversation and budget from the recorded roster and goal, using the current workspace as its baseline. Supply `--goal` to override the inherited goal.
 
-During execution under a frozen worker plan, Ratio can queue one additional-worker request at a time. It finishes pending tool batches, proposes disjoint write paths and a new assignment, and requires read-only BWP exchanges with an incumbent worker and a stakeholder or temporary adviser. Every worker then acknowledges the amended plan ID before execution resumes. A declined request returns the incumbent team to its existing plan. The Workflow pane records the result.
+During execution under a frozen worker plan, Ratio can queue one additional-worker request at a time. It finishes pending tool batches, proposes disjoint write paths and a new assignment, and requires read-only IPC exchanges with an incumbent worker and a stakeholder or temporary adviser. Every worker then acknowledges the amended plan ID before execution resumes. A declined request returns the incumbent team to its existing plan. The Workflow pane records the result.
 
 ```text
   Work under plan A
