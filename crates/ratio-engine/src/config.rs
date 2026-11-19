@@ -191,6 +191,9 @@ pub struct McpServer {
     #[serde(default)]
     pub allow_all: bool,
     pub deny_tools: Option<BTreeSet<String>>,
+    #[serde(default)]
+    pub inspection_tools: BTreeSet<String>,
+    pub instructions: Option<String>,
     #[serde(default = "default_mcp_protocol")]
     pub protocol: String,
     #[serde(default)]
@@ -200,23 +203,31 @@ pub struct McpServer {
 impl McpServer {
     fn validate_policy(&self) -> Result<()> {
         let names = match (&self.tools, self.allow_all, &self.deny_tools) {
-            (None, true, None) => return Ok(()),
+            (None, true, None) => None,
             (Some(names), false, None) => {
                 ensure!(
                     !names.is_empty(),
                     "tools must name at least one permitted tool"
                 );
-                names
+                Some(names)
             }
-            (None, false, Some(names)) => names,
+            (None, false, Some(names)) => Some(names),
             _ => anyhow::bail!("choose exactly one of tools, allow_all = true, or deny_tools"),
         };
         ensure!(
             names
-                .iter()
+                .into_iter()
+                .flatten()
+                .chain(&self.inspection_tools)
                 .all(|name| !name.trim().is_empty() && name.len() <= 128),
             "tool lists must contain names of 1 to 128 bytes"
         );
+        for name in &self.inspection_tools {
+            ensure!(
+                self.permits(name),
+                "inspection_tools contains {name:?}, blocked by the server tool policy"
+            );
+        }
         Ok(())
     }
 
@@ -249,6 +260,7 @@ mod mcp_policy_tests {
         assert!(load(&format!("deny_tools = [{names}]")).is_ok());
         assert!(load("deny_tools = []").is_ok());
         assert!(load("allow_all = true").is_ok());
+        assert!(load("allow_all = true\ninspection_tools = [\"inspect\"]").is_ok());
         for invalid in [
             "",
             "tools = []",
@@ -256,6 +268,8 @@ mod mcp_policy_tests {
             "allow_all = true\ntools = [\"inspect\"]",
             "allow_all = true\ndeny_tools = [\"inspect\"]",
             "tools = [\"inspect\"]\ndeny_tools = [\"change\"]",
+            "deny_tools = [\"change\"]\ninspection_tools = [\"change\"]",
+            "tools = [\"inspect\"]\ninspection_tools = [\"unlisted\"]",
         ] {
             assert!(load(invalid).is_err(), "accepted {invalid:?}");
         }
@@ -328,6 +342,7 @@ pub struct Orchestration {
     pub max_tool_rounds: usize,
     pub request_timeout_secs: u64,
     pub command_timeout_secs: u64,
+    pub allow_inspection_shell: bool,
     pub parallel_stakeholders: bool,
     pub max_parallel_agents: usize,
     pub require_task_graph: bool,
@@ -348,6 +363,7 @@ impl Default for Orchestration {
             max_tool_rounds: 100,
             request_timeout_secs: 180,
             command_timeout_secs: 120,
+            allow_inspection_shell: false,
             parallel_stakeholders: true,
             max_parallel_agents: 8,
             require_task_graph: false,

@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -16,6 +17,7 @@ use tokio::{
     time::timeout,
 };
 
+use super::Access;
 use crate::{
     api::ToolCall,
     config::{Config, McpLifetime, McpServer},
@@ -82,15 +84,48 @@ enum Output {
     },
 }
 
-pub(crate) fn schemas(servers: &BTreeMap<String, McpServer>) -> Vec<Value> {
-    if servers.is_empty() {
+fn available(server: &McpServer, access: Access) -> bool {
+    matches!(access, Access::Work) || !server.inspection_tools.is_empty()
+}
+
+fn permitted(server: &McpServer, access: Access, name: &str) -> bool {
+    server.permits(name)
+        && (matches!(access, Access::Work) || server.inspection_tools.contains(name))
+}
+
+pub(crate) fn with_instructions<'a>(
+    system: &'a str,
+    servers: &BTreeMap<String, McpServer>,
+    access: Access,
+) -> Cow<'a, str> {
+    let mut prompt = Cow::Borrowed(system);
+    for (name, server) in servers {
+        if available(server, access)
+            && let Some(instructions) = server.instructions.as_deref().map(str::trim)
+            && !instructions.is_empty()
+        {
+            prompt
+                .to_mut()
+                .push_str(&format!("\nMCP {name}: {instructions}"));
+        }
+    }
+    prompt
+}
+
+pub(crate) fn schemas(servers: &BTreeMap<String, McpServer>, access: Access) -> Vec<Value> {
+    let available = servers
+        .iter()
+        .filter(|(_, server)| available(server, access))
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    if available.is_empty() {
         return Vec::new();
     }
-    let server = json!({"type":"string","enum":servers.keys().collect::<Vec<_>>()});
+    let server = json!({"type":"string","enum":available});
     vec![
         super::schema(
             "mcp_list",
-            "Discover allowed MCP tools. For large catalogs, continue with next_offset. Supply name for its schema.",
+            "Discover allowed MCP tools for this phase. Use this first when the goal calls for an external service. Supply name for its schema, or next_offset to continue.",
             json!({"server":server, "name":{"type":"string"}, "offset":{"type":"integer","minimum":0}}),
             &["server"],
         ),
@@ -108,6 +143,7 @@ pub(crate) async fn dispatch(
     sessions: &Connections,
     actor: &str,
     servers: &BTreeMap<String, McpServer>,
+    access: Access,
     call: &ToolCall,
     workspace: &Path,
     time_limit: Duration,
@@ -115,49 +151,54 @@ pub(crate) async fn dispatch(
     key: Option<&str>,
 ) -> (String, String) {
     let same = |text: String| (text.clone(), text);
-    let (visible, full) =
-        match timeout(time_limit, run(sessions, actor, servers, call, workspace)).await {
-            Ok(Ok(Output::Response(value))) => same(format!("{OUTPUT_HEADER}{value}")),
-            Ok(Ok(Output::Catalog { tools, offset })) => {
-                let full = offset.is_none().then(|| {
-                    let listing = json!({"tools":tools.values().collect::<Vec<_>>()});
-                    format!("{OUTPUT_HEADER}{listing}")
-                });
-                let visible = match &full {
-                    Some(output) if output.len() <= output_limit => output.clone(),
-                    _ => format!(
-                        "{OUTPUT_HEADER}{}",
-                        catalog_page(&tools, offset.unwrap_or(0), output_limit)
-                    ),
-                };
-                let full = full.unwrap_or_else(|| visible.clone());
-                (visible, full)
+    let (visible, full) = match timeout(
+        time_limit,
+        run(sessions, actor, servers, access, call, workspace),
+    )
+    .await
+    {
+        Ok(Ok(Output::Response(value))) => same(format!("{OUTPUT_HEADER}{value}")),
+        Ok(Ok(Output::Catalog { tools, offset })) => {
+            let full = offset.is_none().then(|| {
+                let listing = json!({"tools":tools.values().collect::<Vec<_>>()});
+                format!("{OUTPUT_HEADER}{listing}")
+            });
+            let visible = match &full {
+                Some(output) if output.len() <= output_limit => output.clone(),
+                _ => format!(
+                    "{OUTPUT_HEADER}{}",
+                    catalog_page(&tools, offset.unwrap_or(0), output_limit)
+                ),
+            };
+            let full = full.unwrap_or_else(|| visible.clone());
+            (visible, full)
+        }
+        Ok(Err(error)) if error.to_string().starts_with("REFUSED") => same(format!("{error:#}")),
+        Ok(Err(error)) => {
+            sessions
+                .0
+                .borrow_mut()
+                .retain(|(_, owner, path), _| owner != actor || path != workspace);
+            if error.to_string().starts_with(UNKNOWN_CALL) {
+                same(format!("{error:#}"))
+            } else {
+                same(format!("Tool error: {error:#}"))
             }
-            Ok(Err(error)) => {
-                sessions
-                    .0
-                    .borrow_mut()
-                    .retain(|(_, owner, path), _| owner != actor || path != workspace);
-                if error.to_string().starts_with(UNKNOWN_CALL) {
-                    same(format!("{error:#}"))
-                } else {
-                    same(format!("Tool error: {error:#}"))
-                }
+        }
+        Err(_) => {
+            sessions
+                .0
+                .borrow_mut()
+                .retain(|(_, owner, path), _| owner != actor || path != workspace);
+            if call.function.name == "mcp_call" {
+                same(format!(
+                    "{UNKNOWN_CALL}server timed out after possible dispatch"
+                ))
+            } else {
+                same("Tool error: MCP server timed out".into())
             }
-            Err(_) => {
-                sessions
-                    .0
-                    .borrow_mut()
-                    .retain(|(_, owner, path), _| owner != actor || path != workspace);
-                if call.function.name == "mcp_call" {
-                    same(format!(
-                        "{UNKNOWN_CALL}server timed out after possible dispatch"
-                    ))
-                } else {
-                    same("Tool error: MCP server timed out".into())
-                }
-            }
-        };
+        }
+    };
     let redact = |output: String| match key {
         Some(key) => output.replace(key, "[redacted]"),
         None => output,
@@ -169,6 +210,7 @@ async fn run(
     sessions: &Connections,
     actor: &str,
     servers: &BTreeMap<String, McpServer>,
+    access: Access,
     call: &ToolCall,
     workspace: &Path,
 ) -> Result<Output> {
@@ -181,11 +223,16 @@ async fn run(
     let server = servers
         .get(&input.server)
         .context("unknown configured MCP server")?;
+    ensure!(
+        available(server, access),
+        "REFUSED: MCP server {:?} has no tools configured for inspection",
+        input.server
+    );
     if let Some(name) = input.name.as_deref() {
         ensure!(!name.trim().is_empty(), "MCP tool name is empty");
         ensure!(
-            server.permits(name),
-            "MCP tool {name:?} is blocked by the configured tool policy"
+            permitted(server, access, name),
+            "REFUSED: MCP tool {name:?} is blocked by the configured tool policy for this phase. Use mcp_list for available tools."
         );
     }
     let operation = if call.function.name == "mcp_call" {
@@ -217,18 +264,20 @@ async fn run(
         invoke(
             connection.as_mut().expect("client initialized"),
             server,
+            access,
             operation,
         )
         .await
     } else {
         let mut client = Client::open(server, workspace).await?;
-        invoke(&mut client, server, operation).await
+        invoke(&mut client, server, access, operation).await
     }
 }
 
 async fn invoke(
     client: &mut Client,
     server: &McpServer,
+    access: Access,
     operation: Operation<'_>,
 ) -> Result<Output> {
     match operation {
@@ -247,7 +296,7 @@ async fn invoke(
             result.map(Output::Response)
         }
         Operation::List { name, offset } => {
-            let mut catalog = discover(client, server, name).await?;
+            let mut catalog = discover(client, server, access, name).await?;
             if let Some(name) = name {
                 let entry = catalog
                     .remove(name)
@@ -266,6 +315,7 @@ async fn invoke(
 async fn discover(
     client: &mut Client,
     server: &McpServer,
+    access: Access,
     name: Option<&str>,
 ) -> Result<BTreeMap<String, Value>> {
     let mut selected = BTreeMap::new();
@@ -279,7 +329,9 @@ async fn discover(
             .context("MCP list result is missing tools")?
         {
             let advertised = tool["name"].as_str().context("MCP tool is missing name")?;
-            if server.permits(advertised) && name.is_none_or(|requested| requested == advertised) {
+            if permitted(server, access, advertised)
+                && name.is_none_or(|requested| requested == advertised)
+            {
                 ensure!(
                     tool["inputSchema"].is_object(),
                     "MCP tool is missing an input schema"
@@ -329,12 +381,17 @@ pub async fn check(config: &Config, name: &str) -> Result<Value> {
         Duration::from_secs(config.orchestration.command_timeout_secs),
         async {
             let mut client = Client::open(server, &config.cwd).await?;
-            discover(&mut client, server, None).await
+            discover(&mut client, server, Access::Work, None).await
         },
     )
     .await
     .context("MCP check timed out")??;
-    for tool in server.tools.iter().flatten() {
+    for tool in server
+        .tools
+        .iter()
+        .flatten()
+        .chain(&server.inspection_tools)
+    {
         ensure!(
             listing.contains_key(tool),
             "configured MCP tool {tool:?} was not advertised"
@@ -510,6 +567,8 @@ mod tests {
             tools: Some(BTreeSet::from(["query".into()])),
             allow_all: false,
             deny_tools: None,
+            inspection_tools: BTreeSet::from(["query".into()]),
+            instructions: None,
             protocol: "2025-11-25".into(),
             lifetime: McpLifetime::Call,
         };
@@ -526,6 +585,7 @@ mod tests {
             &Connections::default(),
             "fixture",
             &servers,
+            Access::Inspect,
             &call("mcp_list", json!({"server":"fixture"})),
             directory.path(),
             Duration::from_secs(5),
@@ -540,6 +600,7 @@ mod tests {
             &Connections::default(),
             "fixture",
             &servers,
+            Access::Inspect,
             &call("mcp_call", json!({"server":"fixture","name":"unlisted"})),
             directory.path(),
         )
@@ -571,6 +632,8 @@ mod tests {
             tools: Some(BTreeSet::from(["query".into()])),
             allow_all: false,
             deny_tools: None,
+            inspection_tools: BTreeSet::from(["query".into()]),
+            instructions: None,
             protocol: "2025-11-25".into(),
             lifetime: McpLifetime::Worker,
         };
@@ -585,20 +648,31 @@ mod tests {
             },
         };
         for (actor, expected) in [("worker_1", 2), ("worker_1", 3), ("worker_2", 2)] {
-            let Output::Response(result) = run(&sessions, actor, &servers, &call, directory.path())
-                .await
-                .unwrap()
-            else {
+            let Output::Response(result) = run(
+                &sessions,
+                actor,
+                &servers,
+                Access::Inspect,
+                &call,
+                directory.path(),
+            )
+            .await
+            .unwrap() else {
                 panic!("expected a tool result")
             };
             assert_eq!(result["count"], expected);
         }
         sessions.clear();
-        let Output::Response(result) =
-            run(&sessions, "worker_1", &servers, &call, directory.path())
-                .await
-                .unwrap()
-        else {
+        let Output::Response(result) = run(
+            &sessions,
+            "worker_1",
+            &servers,
+            Access::Inspect,
+            &call,
+            directory.path(),
+        )
+        .await
+        .unwrap() else {
             panic!("expected a tool result")
         };
         assert_eq!(result["count"], 2);
@@ -632,6 +706,8 @@ mod tests {
             tools: None,
             allow_all: true,
             deny_tools: None,
+            inspection_tools: BTreeSet::from(["inspect_098".into()]),
+            instructions: None,
             protocol: "2025-11-25".into(),
             lifetime: McpLifetime::Call,
         };
@@ -643,7 +719,7 @@ mod tests {
                 server.deny_tools = Some(BTreeSet::from([excluded.into()]));
             }
             let servers = BTreeMap::from([("fixture".into(), server)]);
-            let execute = |tool: &str, arguments: Value| {
+            let execute = |access, tool: &str, arguments: Value| {
                 let call = ToolCall {
                     id: "fixture".into(),
                     kind: "function".into(),
@@ -659,6 +735,7 @@ mod tests {
                         &Connections::default(),
                         "worker_1",
                         servers,
+                        access,
                         &call,
                         workspace,
                         Duration::from_secs(5),
@@ -668,7 +745,8 @@ mod tests {
                     .await
                 }
             };
-            let (first, full) = execute("mcp_list", json!({"server":"fixture"})).await;
+            let (first, full) =
+                execute(Access::Work, "mcp_list", json!({"server":"fixture"})).await;
             let json_from = |output: &str| {
                 serde_json::from_str::<Value>(output.strip_prefix(OUTPUT_HEADER).unwrap()).unwrap()
             };
@@ -685,25 +763,56 @@ mod tests {
                 let Some(offset) = page["next_offset"].as_u64() else {
                     break;
                 };
-                let (visible, _) =
-                    execute("mcp_list", json!({"server":"fixture","offset":offset})).await;
+                let (visible, _) = execute(
+                    Access::Work,
+                    "mcp_list",
+                    json!({"server":"fixture","offset":offset}),
+                )
+                .await;
                 page = json_from(&visible);
             }
             assert_eq!(names.len(), expected);
             assert_eq!(names.contains(&json!(excluded)), !deny);
-            let (schema, _) =
-                execute("mcp_list", json!({"server":"fixture","name":"inspect_098"})).await;
+            let (schema, _) = execute(
+                Access::Inspect,
+                "mcp_list",
+                json!({"server":"fixture","name":"inspect_098"}),
+            )
+            .await;
             assert_eq!(
                 json_from(&schema)["tools"][0]["inputSchema"]["type"],
                 "object"
             );
-            let (called, _) =
-                execute("mcp_call", json!({"server":"fixture","name":excluded})).await;
+            let (called, _) = execute(
+                Access::Work,
+                "mcp_call",
+                json!({"server":"fixture","name":excluded}),
+            )
+            .await;
             if deny {
                 assert!(called.contains("blocked by the configured tool policy"));
             } else {
                 assert_eq!(json_from(&called)["called"], true);
             }
+            let (inspection, _) =
+                execute(Access::Inspect, "mcp_list", json!({"server":"fixture"})).await;
+            let tools = json_from(&inspection)["tools"].as_array().unwrap().clone();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0]["name"], "inspect_098");
+            let (called, _) = execute(
+                Access::Inspect,
+                "mcp_call",
+                json!({"server":"fixture","name":"inspect_098"}),
+            )
+            .await;
+            assert_eq!(json_from(&called)["called"], true);
+            let (refused, _) = execute(
+                Access::Inspect,
+                "mcp_call",
+                json!({"server":"fixture","name":excluded}),
+            )
+            .await;
+            assert!(refused.starts_with("REFUSED"), "{refused}");
         }
     }
 }

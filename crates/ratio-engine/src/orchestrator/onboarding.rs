@@ -141,7 +141,7 @@ impl Orchestrator<'_> {
             },
         ]));
         let memory = session.memory.clone();
-        let limit = (self.config.context_window / 2).clamp(256, 8192);
+        let limit = ipc::inbox_limit(self.config.context_window);
         let mut brief = format!(
             "Operator request:\n{request}\n\nProposed plan:\n{}\n\nOwnership:\n{}",
             candidate.plan.text,

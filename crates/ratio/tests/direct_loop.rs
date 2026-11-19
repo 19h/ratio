@@ -1539,6 +1539,317 @@ fn diagnostics_script() -> &'static str {
 }
 
 #[test]
+fn inspection_shell_opt_in_keeps_native_edits_gated() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("ratio.toml");
+    std::fs::write(temp.path().join("fixture.txt"), "original").unwrap();
+    std::fs::write(
+        &config,
+        r#"
+[orchestration]
+allow_inspection_shell = true
+[[workers]]
+name = "Inspector"
+persona = "Check fixture evidence."
+"#,
+    )
+    .unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        assert_history(&request);
+        let tools = request["tools"].as_array().unwrap();
+        let find = |name: &str| tools.iter().find(|tool| tool["function"]["name"] == name);
+        let messages = request["messages"].as_array().unwrap();
+        let system = messages[0]["content"].as_str().unwrap();
+        let working = system.contains("Phase: execute");
+        assert_eq!(
+            find("shell").unwrap()["function"]["parameters"]["properties"]["command"]["type"],
+            json!(["array", "string"])
+        );
+        assert_eq!(find("create_file").is_some(), working);
+        assert_eq!(find("edit_file").is_some(), working);
+        assert_eq!(system.contains("Use shell to inspect or verify"), !working);
+        match index {
+            0 => text("Check the fixture."),
+            1 => {
+                assert!(system.contains("Phase: coordinate"));
+                let fail = if cfg!(windows) {
+                    "cmd /D /C exit /B 7"
+                } else {
+                    "(exit 7)"
+                };
+                calls(&[
+                    tool(
+                        "shell",
+                        "shell",
+                        json!({"command":["echo inspection-probe", fail, "echo inspection-done"]}),
+                    ),
+                    tool(
+                        "create",
+                        "create_file",
+                        json!({"path":"forbidden.txt","content":"bad"}),
+                    ),
+                    tool(
+                        "edit",
+                        "edit_file",
+                        json!({"path":"fixture.txt","old_text":"original","new_text":"bad"}),
+                    ),
+                ])
+            }
+            2 => {
+                let output = messages
+                    .iter()
+                    .find(|message| message["tool_call_id"] == "shell")
+                    .unwrap()["content"]
+                    .as_str()
+                    .unwrap();
+                let lines = output.lines().collect::<Vec<_>>();
+                assert!(
+                    lines
+                        .windows(3)
+                        .any(|lines| lines == ["stdout:", "inspection-probe", "inspection-done"]),
+                    "{output}"
+                );
+                let history = request["messages"].to_string();
+                for tool in ["create_file", "edit_file"] {
+                    assert!(history.contains(&format!("Tool error: tool {tool} is unavailable")));
+                }
+                text("The fixture was inspected.")
+            }
+            3 => calls(&[tool(
+                "plan",
+                "submit_plan",
+                json!({
+                    "plan":"Check the fixture.","ownership":{"worker_1":[]}
+                }),
+            )]),
+            4 => {
+                let ack = find("ack_plan").unwrap();
+                let id = &ack["function"]["parameters"]["properties"]["plan_id"]["enum"][0];
+                calls(&[tool("ack", "ack_plan", json!({"plan_id":id}))])
+            }
+            5 => text("The fixture is intact."),
+            6 => decision("approved", "Verified the fixture."),
+            _ => panic!("unexpected request {index}"),
+        }
+    });
+    let run = cli_window(
+        temp.path(),
+        &endpoint,
+        "8192",
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--goal",
+            "Verify fixture",
+        ],
+    );
+    succeeded(&run);
+    server.join().unwrap();
+    assert!(!temp.path().join("forbidden.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("fixture.txt")).unwrap(),
+        "original"
+    );
+}
+
+#[test]
+fn binary_line_read_delivers_hex_to_the_model_on_the_first_call() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("image.bin"),
+        [0x7f, b'E', b'L', b'F', 0, 0xff],
+    )
+    .unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        let system = request["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("Binary reads: read_file with hex:true, offset, length."));
+        match index {
+            0 => calls(&[tool(
+                "binary",
+                "read_file",
+                json!({"path":"image.bin","start_line":1}),
+            )]),
+            1 => {
+                assert_history(&request);
+                let result = request["messages"].as_array().unwrap().last().unwrap();
+                assert_eq!(result["tool_call_id"], "binary");
+                let content = result["content"].as_str().unwrap();
+                assert!(content.contains("Hex (auto) 0x0..0x6 / 0x6"), "{content}");
+                assert!(content.contains("7f 45 4c 46 00 ff"), "{content}");
+                text("The fixture starts with the expected byte sequence.")
+            }
+            2 => text("Inspection complete."),
+            3 => decision("approved", "Verified the binary preview."),
+            _ => panic!("unexpected request {index}"),
+        }
+    });
+    succeeded(&cli(
+        temp.path(),
+        &endpoint,
+        &["--goal", "Inspect the binary fixture"],
+    ));
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_inspection_is_available_to_the_team_before_acknowledgement() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("ratio.toml");
+    std::fs::write(
+        &config,
+        r#"
+[[workers]]
+name = "Builder"
+persona = "Implement the assigned work."
+[[reviewers]]
+name = "Verifier"
+persona = "Inspect evidence."
+phases = ["planning"]
+[[stakeholders]]
+name = "Adviser"
+persona = "Check requirements."
+phases = ["planning"]
+[mcp_servers.fixture]
+command = "/bin/sh"
+args = ["-c", '''
+    IFS= read -r frame
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}}'
+    IFS= read -r frame
+    id=1
+    while IFS= read -r frame; do
+        id=$((id + 1))
+        case "$frame" in
+            *tools/list*) result='{"tools":[{"name":"inspect","inputSchema":{}},{"name":"change","inputSchema":{}}]}' ;;
+            *'"name":"inspect"'*) result='{"fixture_observed":true}' ;;
+            *'"name":"change"'*) result='{"fixture_changed":true}' ;;
+            *) exit 1 ;;
+        esac
+        printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+    done
+''']
+allow_all = true
+inspection_tools = ["inspect"]
+lifetime = "worker"
+instructions = "Use inspect to verify the fixture."
+[mcp_servers.work_only]
+command = "/bin/sh"
+allow_all = true
+instructions = "Use the work-only server during execution."
+"#,
+    )
+    .unwrap();
+    let mut observed = std::collections::BTreeSet::new();
+    let (endpoint, server) = mock(move |_, request| {
+        let messages = request["messages"].as_array().unwrap();
+        let system = messages[0]["content"].as_str().unwrap();
+        let task = messages[1]["content"].as_str().unwrap();
+        assert!(system.contains("MCP fixture: Use inspect to verify the fixture."));
+        let schemas = request["tools"].as_array().unwrap();
+        let schema = |name: &str| {
+            schemas
+                .iter()
+                .find(|schema| schema["function"]["name"] == name)
+        };
+        assert!(schema("mcp_list").is_some());
+        assert!(schema("mcp_call").is_some());
+        let mcp = |name| tool(name, "mcp_call", json!({"server":"fixture","name":name}));
+        let history = request["messages"].to_string();
+        let working = system.contains("Phase: execute");
+        assert_eq!(schema("edit_file").is_some(), working);
+        assert_eq!(system.contains("MCP work_only:"), working);
+        if working {
+            assert!(observed.contains("acknowledgement"));
+            if history.contains("fixture_changed") {
+                return text("Completed the work.");
+            }
+            return calls(&[mcp("change")]);
+        }
+        let role = if schema("ack_plan").is_some() {
+            "acknowledgement"
+        } else if system.contains("Phase: coordinate") {
+            "coordination"
+        } else if system.contains("You are stakeholder Adviser") {
+            "stakeholder"
+        } else if system.contains("You are reviewer Verifier") {
+            "panel reviewer"
+        } else if schema("submit_plan").is_some() {
+            "freeze"
+        } else if schema("submit_verdict").is_some() {
+            "review"
+        } else if task.starts_with("Finalize the work instructions") {
+            "synthesis"
+        } else {
+            "planning"
+        };
+        if !history.contains("fixture_observed") {
+            return if role == "planning" {
+                calls(&[mcp("change"), mcp("inspect")])
+            } else {
+                calls(&[mcp("inspect")])
+            };
+        }
+        observed.insert(role);
+        match role {
+            "planning" => {
+                assert!(history.contains("REFUSED: MCP tool"));
+                assert!(!history.contains("fixture_changed"));
+                text("Use the fixture to inspect evidence.")
+            }
+            "freeze" => calls(&[tool(
+                "plan",
+                "submit_plan",
+                json!({"plan":"Check evidence.","ownership":{"worker_1":[]}}),
+            )]),
+            "acknowledgement" => {
+                let id = &schema("ack_plan").unwrap()["function"]["parameters"]["properties"]["plan_id"]
+                    ["enum"][0];
+                calls(&[tool("ack", "ack_plan", json!({"plan_id":id}))])
+            }
+            "review" => {
+                for role in [
+                    "planning",
+                    "panel reviewer",
+                    "stakeholder",
+                    "coordination",
+                    "synthesis",
+                ] {
+                    assert!(observed.contains(role), "missing inspection by {role}");
+                }
+                decision("approved", "Evidence verified.")
+            }
+            _ => text("Fixture inspected."),
+        }
+    });
+    let run = cli_window(
+        temp.path(),
+        &endpoint,
+        "8192",
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--goal",
+            "Use the fixture MCP.",
+        ],
+    );
+    succeeded(&run);
+    server.join().unwrap();
+
+    let reader = ra::session::Store::reader(temp.path()).unwrap();
+    let run = reader.runs().unwrap().remove(0);
+    let events = reader.audit(&run.run_id, Default::default(), 500).unwrap();
+    for actor in ["lead_reviewer", "reviewer_1", "stakeholder_1", "worker_1"] {
+        assert!(
+            events.iter().any(|event| event.actor == actor
+                && event.kind == "tool_result"
+                && event.data["tool"] == "mcp_call"
+                && event.data["state"] == "completed"),
+            "missing MCP audit for {actor}"
+        );
+    }
+}
+
+#[test]
 fn direct_tool_loop_compacts_and_reviews() {
     let temp = tempfile::tempdir().unwrap();
     let mut work_calls = 0;

@@ -192,6 +192,12 @@ tools = ["inspect"]
     await page.getByRole("link",{name:"Onboarding IPC",exact:true}).click();
     await page.getByText("evidence: request acceptance",{exact:true}).first().waitFor();
     await shot("sequence");
+    const latest = await page.locator(".seq-row.selected").getAttribute("id");
+    await page.keyboard.press("ArrowUp");
+    await page.waitForURL(url => url.searchParams.has("entry"));
+    await page.locator(".inspector").getByRole("link",{name:"Close selection"}).waitFor();
+    assert.notEqual(await page.locator(".seq-row.selected").getAttribute("id"),latest);
+    await shot("sequence-selected");
     await page.getByRole("link",{name:"Agent lanes",exact:true}).click();
     await page.getByRole("heading",{name:"Agent lanes"}).waitFor();
     await shot("lanes");

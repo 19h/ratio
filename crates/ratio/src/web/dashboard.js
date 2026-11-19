@@ -77,9 +77,9 @@ function heading(text, context, ...actions) {
     context ? node("span", { class: "context muted" }, context) : null, spacer(), actions);
 }
 
-function view(head, body, { aside = null, flush = false } = {}) {
+function view(head, body, { aside = null, flush = false, follow = false } = {}) {
   return [head, node("div", { class: "view-body" },
-    node("div", { class: `view-scroll ${flush ? "flush" : "stack"}`, "data-scroll": "body" }, body), aside)];
+    node("div", { class: `view-scroll ${flush ? "flush" : "stack"}`, "data-scroll": "body", "data-follow": follow ? "end" : undefined }, body), aside)];
 }
 
 function table(columns, rows, className = "") {
@@ -415,7 +415,9 @@ function inspector(detail, close) {
   const data = event.data;
   const outcome = detail.outcome?.data ?? data;
   let rows;
-  if (event.kind === "tool" || event.kind === "tool_result") {
+  if (event.kind === "ipc") {
+    rows = messageInspector(detail);
+  } else if (event.kind === "tool" || event.kind === "tool_result") {
     rows = [node("div", { class: "inspector-section" }, facts([
       ["Tool", code(toolName(data))], ["Agent", actorLink(event.actor)], ["State", pill(outcome.state)],
       ["Time", time(event.timestamp_ms)], ["Path", data.path ? code(data.path) : null]]),
@@ -432,13 +434,108 @@ function inspector(detail, close) {
       actorLink(item.recipient), link(title(item.state), entryUrl(item.key, "ipc")), time(item.timestamp_ms)])) : null];
   }
   return node("aside", { class: "inspector", "aria-label": "Inspector", "data-scroll": "inspector" },
-    node("header", { class: "bar" }, node("h2", {}, hush("[ "), "Inspector", hush(" ]")), spacer(),
-      button("Copy link", () => navigator.clipboard.writeText(location.href).catch(captureError)),
-      go("×", close, { "aria-label": "Close selection", title: "Close selection" })),
+    node("header", { class: "bar" }, node("h2", {}, hush("[ "), event.kind === "ipc" ? "Message inspector" : "Inspector", hush(" ]")), spacer(),
+      close ? [button("Copy link", () => navigator.clipboard.writeText(location.href).catch(captureError)),
+        go("×", close, { "aria-label": "Close selection", title: "Close selection" })] : node("span", { class: "muted" }, "latest")),
     rows);
 }
 
-function communication(rows, route, routes) {
+function alias(id) {
+  for (const [prefix, letter] of [["worker_", "W"], ["reviewer_", "R"], ["stakeholder_", "S"]]) {
+    if (String(id).startsWith(prefix)) return letter + id.slice(prefix.length);
+  }
+  return id === "lead_reviewer" ? "Lead" : id === "user" ? "You" : "Agent";
+}
+function role(id) {
+  const head = String(id).split("_")[0];
+  return head === "worker" ? "worker" : head === "reviewer" || head === "lead" ? "reviewer" : head === "stakeholder" ? "stakeholder" : "other";
+}
+function who(id) { return [node("strong", { class: "alias", "data-role": role(id) }, alias(id)), actorLink(id)]; }
+function mark(status, direction) {
+  return node("b", { class: "mark", "data-state": status, "data-dir": direction, "aria-hidden": "true" },
+    status === "queued" ? "?" : status === "dropped" ? "×" : "");
+}
+function place(element, column) {
+  element.style.gridColumn = column;
+  return element;
+}
+
+// One exchange per sender and wire sequence: later transitions update each recipient's state.
+function exchanges(rows) {
+  const found = new Map();
+  for (const event of [...rows].reverse()) {
+    const data = event.data;
+    const id = JSON.stringify([event.phase, event.cycle, data.attempt, data.worker_request, event.actor, data.sequence]);
+    let item = found.get(id);
+    if (!item) found.set(id, item = { event, keys: [], to: new Map() });
+    item.keys.push(event.key);
+    for (const recipient of data.to ?? []) {
+      if (data.delivery !== "queued" || !item.to.has(recipient)) item.to.set(recipient, data.delivery);
+    }
+  }
+  return [...found.values()];
+}
+
+function sequence(items, query, focus) {
+  if (!items.length) return section({ label: "Message sequence", flush: true }, empty("Waiting for agent traffic."));
+  const ids = [...new Set([...(state.summary?.event?.workflow?.agents ?? []).map(agent => agent.id),
+    ...items.flatMap(item => [item.event.actor, ...item.to.keys()])])];
+  const tally = { delivered: 0, queued: 0, dropped: 0 };
+  for (const item of items) for (const status of item.to.values()) tally[status] += 1;
+  const lanes = (...content) => node("span", { class: "seq-lanes", "aria-hidden": "true" }, content);
+  const diagram = node("div", { class: "seq" },
+    node("div", { class: "seq-head" }, node("span", {}, "Message"), node("span"),
+      lanes(ids.map((id, index) => place(node("span", { class: "alias", "data-role": role(id), title: actorName(id) }, alias(id)), `${index * 2 + 1} / span 2`))),
+      node("span")),
+    items.map(item => {
+      const { event } = item;
+      const from = ids.indexOf(event.actor);
+      const ends = [...item.to.keys()].map(id => ids.indexOf(id));
+      const fan = Boolean(event.data.reply_to) || item.to.size > 1;
+      const selected = item.keys.includes(focus);
+      const [left, right] = [Math.min(from, ...ends), Math.max(from, ...ends)];
+      return link([node("span", { class: "seq-id" }, event.sequence), node("span", { class: "seq-kind" }, fan ? "FAN" : "IPC"),
+        lanes(left < right ? place(node("i", { class: `wire${fan ? " fan" : ""}` }), `${left * 2 + 2} / ${right * 2 + 2}`) : null,
+          [...item.to].map(([id, status]) => place(mark(status, ids.indexOf(id) > from ? "right" : "left"), `${ids.indexOf(id) * 2 + 1} / span 2`)),
+          place(mark("sender"), `${from * 2 + 1} / span 2`)),
+        node("span", { class: "seq-body truncate" }, event.data.body)],
+      entryUrl(item.keys[0], "ipc", query), {
+        id: "event-" + (selected ? focus : item.keys[0]), class: `seq-row${selected ? " selected" : ""}`, "data-role": role(event.actor),
+        "aria-label": `Message ${event.sequence} from ${actorName(event.actor)} to ${[...item.to].map(([id, status]) => `${actorName(id)} (${status})`).join(", ")}`,
+      });
+    }));
+  diagram.style.setProperty("--lanes", ids.length);
+  return section({ label: "Message sequence", meta: `${ids.length} participants | ${items.length} messages`, flush: true },
+    node("div", { class: "seq-summary" },
+      node("span", { "data-state": "delivered" }, mark("delivered"), `${tally.delivered} delivered`),
+      node("span", { "data-state": "queued" }, mark("queued"), `${tally.queued} queued`),
+      node("span", { "data-state": "dropped" }, mark("dropped"), `${tally.dropped} dropped`)),
+    diagram,
+    node("div", { class: "seq-legend" }, node("span", {}, mark("sender"), "sender"), node("span", {}, mark("delivered"), "delivered"),
+      node("span", {}, mark("queued"), "queued"), node("span", {}, mark("dropped"), "dropped"),
+      node("span", {}, node("i", { class: "wire fan" }), "fan-out"), spacer(),
+      node("span", {}, node("kbd", {}, "↑/↓"), "select")));
+}
+
+function messageInspector(detail) {
+  const { event } = detail;
+  const data = event.data;
+  const recipients = new Map((data.to ?? []).map(id => [id, { recipient: id, state: data.delivery, timestamp_ms: event.timestamp_ms }]));
+  for (const item of detail.deliveries ?? []) recipients.set(item.recipient, item);
+  const count = status => [...recipients.values()].filter(item => item.state === status).length;
+  return [node("div", { class: "inspector-section" },
+    node("strong", { class: "message-title" }, `#${event.sequence}  ${data.reply_to ? "Stakeholder broadcast" : "Direct BWP IPC"}`),
+    muted(`Cycle ${event.cycle} / attempt ${data.attempt ?? 1} / ${title(event.phase)}`),
+    data.worker_request ? muted(`Worker request ${data.worker_request}`) : null,
+    facts([["From", who(event.actor)], ["Reply to", data.reply_to ? who(data.reply_to) : null], ["Sent", time(event.timestamp_ms)]]),
+    muted(`${count("delivered")} delivered / ${count("queued")} queued / ${count("dropped")} dropped`),
+    detail.origin ? go("Open original message", entryUrl(detail.origin.key, "ipc")) : null),
+  node("div", { class: "inspector-section" }, pre(data.body)),
+  node("div", { class: "inspector-section" }, caption(`Recipients (${recipients.size})`),
+    [...recipients.values()].map(item => row(mark(item.state), who(item.recipient), spacer(), time(item.timestamp_ms))))];
+}
+
+function communication(rows, route, routes, focus) {
   const query = route.query;
   if (query.tab === "matrix") {
     const ids = [...new Set(routes.flatMap(entry => [entry.from, entry.to]))];
@@ -468,13 +565,7 @@ function communication(rows, route, routes) {
       return cells;
     }), "matrix lanes"));
   }
-  return section({ label: "Message sequence", meta: selected.length || null, flush: true }, table(["Time", "Sender", "Recipients", "State", "BWP message"], selected.map(event => {
-    const data = event.data;
-    const cells = [time(event.timestamp_ms), actorLink(event.actor), (data.to ?? []).map(id => node("div", {}, actorLink(id))),
-      pill(data.delivery), link(data.body, entryUrl(event.key, "ipc", query))];
-    cells.selected = event.key === query.entry;
-    return cells;
-  }), "sequence"));
+  return sequence(exchanges(selected), query, focus);
 }
 
 function tabs(page, options, current, query = {}) {
@@ -526,7 +617,7 @@ async function historyView(route) {
   const kind = page === "ipc" || (page === "agent" && tab === "ipc") ? "ipc" :
     page === "tools" ? tab === "mcp" ? "mcp" : "tool" :
       page === "agent" && tab === "tools" ? "tool" : query.kind;
-  const [historyData, detail] = await Promise.all([
+  const [historyData, chosen] = await Promise.all([
     api(apiRun("history", { ...query, actor: actor ?? query.actor, kind,
       from: actor && tab === "ipc" && query.direction === "outgoing" ? actor : query.from,
       to: actor && tab === "ipc" && query.direction === "incoming" ? actor : query.to,
@@ -534,6 +625,10 @@ async function historyView(route) {
     query.entry ? api(apiRun("entry/" + encodeURIComponent(query.entry))).catch(() => null) : null,
   ]);
   let { rows } = historyData;
+  // Like the TUI, the sequence diagram inspects the newest message until one is chosen.
+  const diagram = page === "ipc" && tab === "all";
+  const focus = query.entry ?? (diagram ? rows.find(event => event.data.delivery === "queued")?.key ?? rows[0]?.key : undefined);
+  const detail = chosen ?? (focus && !query.entry ? await api(apiRun("entry/" + encodeURIComponent(focus))).catch(() => null) : null);
   const head = [];
   if (page === "agent") {
     const flow = state.summary.event?.workflow;
@@ -573,7 +668,7 @@ async function historyView(route) {
   head.push(filters(route, { actor: page !== "agent", kind: page === "history" }));
   if (detail && page === "history" && !rows.some(entry => entry.key === detail.event.key)) rows = [detail.event, ...rows];
   let content;
-  if (page === "ipc") content = communication(rows, route, query.tab === "matrix" ? (await api(apiRun("routes", query))).rows : []);
+  if (page === "ipc") content = communication(rows, route, query.tab === "matrix" ? (await api(apiRun("routes", query))).rows : [], focus);
   else if (page === "tools" || tab === "tools") content = section({ label: tab === "mcp" ? "MCP calls" : "Tool calls", meta: rows.length || null, flush: true }, toolTable(rows, route, local));
   else content = node("section", { class: "timeline", "aria-label": "Recorded timeline" }, rows.length
     ? rows.map(event => historyCard(event, query.entry, query.call))
@@ -586,7 +681,9 @@ async function historyView(route) {
     : pagination("History pagination",
       query.before ? link("Latest", runUrl(local, { ...query, before: undefined, entry: undefined })) : null,
       historyData.rows.length >= 60 ? link("Older entries", runUrl(local, { ...query, before: oldest, entry: undefined })) : null);
-  return view(head, [content, pages], { aside: inspector(detail, runUrl(local, { ...query, entry: undefined })), flush: true });
+  return view(head, diagram ? [pages, content] : [content, pages], {
+    aside: inspector(detail, query.entry ? runUrl(local, { ...query, entry: undefined }) : null), flush: true, follow: diagram,
+  });
 }
 
 async function archive(route) {
@@ -646,11 +743,24 @@ async function load(restart = true, preserveInteraction = false) {
       state.refreshPending = true;
       return;
     }
-    const scrolls = restart ? [] : [main, ...main.querySelectorAll("[data-scroll]")].map(element => [element.dataset.scroll, element.scrollLeft, element.scrollTop]);
+    // Choosing another entry in the same list keeps the list where it is.
+    const spot = location.pathname + "?" + new URLSearchParams(Object.entries(wanted.query).filter(([key]) => key !== "entry" && key !== "call"));
+    const settled = spot === state.spot;
+    state.spot = spot;
+    const scrolls = restart && !settled ? [] : [main, ...main.querySelectorAll("[data-scroll]")].map(element =>
+      [element.dataset.scroll, element.scrollLeft, element.scrollTop, element.scrollHeight - element.scrollTop - element.clientHeight < 8]);
     fill(main, nodes);
-    for (const [key, left, top] of scrolls) (key ? $(`[data-scroll="${key}"]`, main) : main)?.scrollTo(left, top);
+    for (const [key, left, top, atEnd] of scrolls) {
+      const element = key ? $(`[data-scroll="${key}"]`, main) : main;
+      if (!element || (restart && key === "inspector")) continue;
+      element.scrollTo(left, element.dataset.follow && atEnd && !wanted.query.entry ? element.scrollHeight : top);
+    }
+    if (!scrolls.length && !wanted.query.entry) {
+      const follower = $("[data-follow]", main);
+      follower?.scrollTo(0, follower.scrollHeight);
+    }
     if (restart && wanted.query.entry) {
-      document.getElementById("event-" + wanted.query.entry)?.scrollIntoView({ block: "center" });
+      document.getElementById("event-" + wanted.query.entry)?.scrollIntoView({ block: settled ? "nearest" : "center" });
     }
     if (restart && wanted.page === "triage" && wanted.query.item) {
       document.getElementById("inbox-" + wanted.query.item)?.scrollIntoView({ block: "center" });
@@ -788,7 +898,14 @@ document.addEventListener("keydown", event => {
   if ($("#action-dialog").open || event.metaKey || event.ctrlKey || event.altKey
     || event.target.matches?.("input, textarea, select") || !state.route.run) return;
   const page = Object.keys(views)[Number(event.key) - 1];
-  if (event.key === "/") {
+  const messages = [...document.querySelectorAll(".seq-row")];
+  const step = { ArrowUp: -1, k: -1, ArrowDown: 1, j: 1 }[event.key];
+  if (step && messages.length) {
+    const current = messages.findIndex(message => message.classList.contains("selected"));
+    const target = messages[Math.max(0, Math.min(messages.length - 1, (current < 0 ? messages.length - 1 : current) + step))];
+    event.preventDefault();
+    navigate(target.getAttribute("href"));
+  } else if (event.key === "/") {
     event.preventDefault();
     $("#global-search input").focus();
   } else if (page && event.key.trim()) navigate(runUrl(page));

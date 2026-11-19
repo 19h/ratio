@@ -162,7 +162,7 @@ Ratio sends a Bearer header when a key is configured. A custom `Authorization` h
 
 Plan repair identifies missing, duplicate, and unknown worker IDs. If bounded full-plan repairs fail, Ratio asks for one typed assignment per worker and validates the assembled plan before requesting acknowledgements.
 
-Agents use `send_message` with a recipient ID and a BWP body. Ratio validates syntax and bounds the payload before enqueueing it. BWP keeps exact tool names, paths, and IDs. Flat lists use spaces, clauses use `;`, and multi-word options use `|`. Braces, code fences, and prose parentheses are refused. Function names may use `fn()` notation.
+Agents use `send_message` with a recipient ID and a BWP body. The tool advertises a limit of up to 4,096 UTF-8 bytes per message. Each recipient's queued messages and their delivery metadata share a byte budget that scales with the model's context window, up to 16 KiB. BWP keeps exact tool names, paths, and IDs. Flat lists use spaces, clauses use `;`, and multi-word options use `|`. Braces, code fences, and prose parentheses are refused. Function names may use `fn()` notation.
 
 ```text
   Worker 1 -- BWP question --> Mailbox --> Stakeholder
@@ -186,12 +186,25 @@ The reviewer and stakeholders can list directories, read workspace files, and in
 
 | Operation | Behavior |
 | --- | --- |
-| `read_file` | Returns UTF-8 lines as `number tag\|text`. Supports inclusive 1-based line ranges or byte offsets. |
+| `read_file` | Returns tagged UTF-8 lines or a byte range. Binary input automatically returns a hex and ASCII preview. |
 | `edit_file` | Applies one batch against a single snapshot. Use `tag` for a line, `tag..tag` for an inclusive range, `+tag` to insert before, or `tag+` to insert after. Range edits require the latest `snapshot_id`. |
 | `create_file` | Creates a file only if its destination is absent. |
-| `shell` | Starts in the active workspace, with command timeouts and bounded output. Runs through `/bin/sh` on Unix or `cmd.exe` on Windows, with descendant process cleanup. |
+| `shell` | Starts at the active workspace root by default. Set `workdir` to an absolute or workspace-relative directory. Runs through `/bin/sh` on Unix or `cmd.exe` on Windows, with command timeouts, bounded output, and descendant process cleanup. |
+
+Pass a script string or an array of complete shell commands, such as `{"workdir":"src","command":["git status --short","git diff --stat"]}`. The array runs in order in one shell and shares its working directory, timeout, and output. Normal shell sequencing continues after a command returns a nonzero status.
+
+To make `shell` available during inspection, including before plan acknowledgement, opt in explicitly.
+
+```toml
+[orchestration]
+allow_inspection_shell = true
+```
+
+This defaults to `false`. With the option enabled, shell commands run with the operator's host permissions and can modify files. Native `create_file` and `edit_file` still require work access.
 
 Tagged reads and edits support files up to 4 MiB. Ratio uses Assist-style addressing with path-seeded 64-bit tags. Repeated lines carry occurrence information. A stale tag or overlap rejects the batch. Optional `line_hints` help locate nearby current lines when an anchor goes stale. Successful edits preserve file mode and return fresh tags. A unique substring replacement is also available via `old_text` and `new_text`.
+
+If a line read encounters binary data, `read_file` returns a hex preview from byte zero. To request a precise binary range, pass `{"path":"data/image.bin","hex":true,"offset":"0x100","length":64}`. `offset` starts at zero and `length` caps the number of source bytes. Both accept integers or `0x` strings. Hex reads default to 256 bytes. The header gives the actual half-open range and file size in hexadecimal. If the output cap shortened the range, use the displayed end as the next offset. Explicit byte ranges use byte positions only. Set `hex` to `false` to require UTF-8. `max_bytes` limits rendered output.
 
 By default, workers operate directly on the live worktree. To defer publication until review, enable staging at the root of a Git worktree.
 
@@ -357,8 +370,10 @@ description = "Read before changing numerical kernels or reference fixtures."
 command = "/absolute/path/to/project-mcp"
 args = []
 tools = ["locate_symbol", "check_interface"]
+inspection_tools = ["locate_symbol", "check_interface"]
 protocol = "2025-11-25"
 lifetime = "call"
+instructions = "Use locate_symbol to confirm symbol locations before checking the interface."
 ```
 
 A configured skill directory contains `SKILL.md` and its relative references. The directory path is relative to the configuration file. Agents discover its contents through `read_skill`.
@@ -373,9 +388,11 @@ Choose one tool policy per stdio MCP server. The policy applies to both discover
 
 Tool lists accept any number of entries. `ra --check-mcp project_tools` prints the full permitted catalog and verifies that explicitly allowed names exist. For large catalogs, `mcp_list` returns a page of tool names. Pass the returned `next_offset` as `offset` for the next page. Supply `name` to inspect a single tool's schema.
 
-Workers gain access after the write gate. The default `lifetime = "call"` starts a new server process per invocation. Set `lifetime = "worker"` to reuse a server for a worker during execution. A call with an unknown outcome is recorded without automatic replay. Ratio also supports the explicit MCP revision `2026-07-28`.
+Set `inspection_tools` to the server tool names reviewers, stakeholders, and workers may discover and call during inspection phases, including before plan acknowledgement. Each name must also be permitted by the server policy. Choose only observational tools for this list. Workers gain access to the full configured policy after passing the write gate. The default `lifetime = "call"` starts a new server process per invocation. Set `lifetime = "worker"` to reuse a server per agent within a phase. A call with an unknown outcome is recorded without automatic replay. Ratio also supports the explicit MCP revision `2026-07-28`.
 
-The [MorphLLM + Assist example](examples/morph-assist.toml) uses `morph-dsv41flash-abliterated` and launches `/Users/int/.idapro/plugins/assist/bin/assist --mcp` over stdio. It sets `allow_all = true` and reuses an Assist process per worker. Open a database in IDA and set `RATIO_API_KEY` to your MorphLLM credential before starting the run. Run these commands from the Ratio checkout.
+Optional `instructions` give agents a short workflow in their system prompt during phases where the server is available. Tool access still follows the configured policy.
+
+The [MorphLLM + Assist example](examples/morph-assist.toml) uses `morph-dsv41flash-abliterated` and launches `/Users/int/.idapro/plugins/assist/bin/assist --mcp` over stdio. It sets `allow_all = true` for work and exposes file and database inspection throughout the run. For an unloaded binary, `file_load_facts` takes an absolute `path` and reports format and load evidence directly from the file. Assist controls permission to access the file. For database queries, open the relevant database in IDA. Set `RATIO_API_KEY` to your MorphLLM credential and run these commands from the Ratio checkout.
 
 ```sh
 ra --config examples/morph-assist.toml --check-mcp assist

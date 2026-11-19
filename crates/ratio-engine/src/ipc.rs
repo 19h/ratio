@@ -13,9 +13,13 @@ use crate::{
 
 pub const BWP: &str = "IPC body BWP ONLY. One pass, group related clauses. No chat, numbering, redrafts, braces, backticks, parentheses except fn(), w/ or prose underscores. Keep exact IDs, tool names, params, enums, OS/arch, dot.path, [tags] and CAPS. Clip filler; flat lists use spaces. Space after operators: ; clause | option : map -> seq => if != distinct ? : ternary >> prefer. val* default; !x negate. Modals NEVER ONLY REFUSED INERT. Example: read_file: req path; stale tag => REFUSED; probe: read -> verify.";
 
-const MAX_BYTES: usize = 1024;
+const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_SENT: usize = 16;
 const MAX_QUEUED: usize = 32;
+
+pub(crate) fn inbox_limit(context_window: usize) -> usize {
+    (context_window / 2).clamp(256, 16 * 1024)
+}
 
 pub struct Member {
     pub id: String,
@@ -114,6 +118,10 @@ impl Mailbox {
     pub fn for_workers(mut self, count: usize) -> Self {
         self.worker_count = Some(count);
         self
+    }
+
+    pub(crate) fn inbox_bytes(&self) -> usize {
+        self.inbox_bytes
     }
 
     pub(crate) fn observe(mut self, reporter: &Reporter, scope: TrafficScope) -> Self {
@@ -434,6 +442,31 @@ impl<'a> PlanGate<'a> {
 }
 
 impl Route<'_> {
+    fn message_limit(self) -> usize {
+        MAX_MESSAGE_BYTES.min(self.mailbox.inbox_bytes)
+    }
+
+    pub fn schema(self) -> Value {
+        let limit = self.message_limit();
+        json!({
+            "type":"function",
+            "function":{
+                "name":"send_message",
+                "description":format!("Send BWP to a roster ID. Max {limit} UTF-8 bytes."),
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "to":{"type":"string"},
+                        "message":{"type":"string","maxLength":limit},
+                        "reply_sequence":{"type":"integer"}
+                    },
+                    "required":["to","message"],
+                    "additionalProperties":false
+                }
+            }
+        })
+    }
+
     pub fn execute(self, call: &ToolCall, key: Option<&str>) -> String {
         match self.send(call, key) {
             Ok(true) => "Queued stakeholder reply for delivery to all workers.".into(),
@@ -453,6 +486,12 @@ impl Route<'_> {
         ensure!(call.kind == "function", "expected a function tool call");
         let input: Send =
             crate::api::tool_arguments(&call.function.arguments).context("use to and message")?;
+        let bytes = input.message.len();
+        let limit = self.message_limit();
+        ensure!(
+            bytes <= limit,
+            "BWP message is {bytes} UTF-8 bytes; limit is {limit}. Split into shorter messages."
+        );
         validate(&input.message)?;
         ensure!(
             key.is_none_or(|key| !input.message.contains(key)),
@@ -541,31 +580,8 @@ struct Send {
     reply_sequence: Option<usize>,
 }
 
-pub fn schema() -> Value {
-    json!({
-        "type":"function",
-        "function":{
-            "name":"send_message",
-            "description":"Send a BWP message to a roster ID. Replies arrive automatically.",
-            "parameters":{
-                "type":"object",
-                "properties":{
-                    "to":{"type":"string"},
-                    "message":{"type":"string","maxLength":MAX_BYTES},
-                    "reply_sequence":{"type":"integer"}
-                },
-                "required":["to","message"],
-                "additionalProperties":false
-            }
-        }
-    })
-}
-
 fn validate(body: &str) -> Result<()> {
-    ensure!(
-        !body.trim().is_empty() && body.len() <= MAX_BYTES,
-        "BWP message must be 1–1024 bytes"
-    );
+    ensure!(!body.trim().is_empty(), "BWP message must be nonempty");
     ensure!(
         !body.contains(['`', '{', '}']) && !body.split_whitespace().any(|word| word == "w/"),
         "BWP forbids fences, braces, and w/"
@@ -641,34 +657,83 @@ mod tests {
     use super::*;
     use crate::api::Function;
 
+    fn member(id: &str) -> Member {
+        Member {
+            id: id.into(),
+            name: id.into(),
+        }
+    }
+
+    fn send(route: Route<'_>, to: &str, message: &str) -> String {
+        route.execute(
+            &ToolCall {
+                id: "send".into(),
+                kind: "function".into(),
+                function: Function {
+                    name: "send_message".into(),
+                    arguments: json!({"to":to,"message":message}).to_string(),
+                },
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn long_bwp_messages_fit_and_limits_count_utf8_bytes() {
+        for (context_window, limit) in [(32_768, 4_096), (2_048, 1_024)] {
+            let mailbox = Mailbox::new(
+                vec![member("worker_1"), member("worker_2")],
+                inbox_limit(context_window),
+            );
+            let route = Route {
+                mailbox: &mailbox,
+                sender: 0,
+            };
+            assert_eq!(
+                route.schema()["function"]["parameters"]["properties"]["message"]["maxLength"],
+                limit
+            );
+            let oversized = "é".repeat(limit / 2 + 1);
+            assert_eq!(
+                send(route, "worker_2", &oversized),
+                format!(
+                    "REFUSED: BWP message is {} UTF-8 bytes; limit is {limit}. Split into shorter messages.",
+                    limit + 2
+                )
+            );
+            assert!(!mailbox.has_pending());
+            if limit == MAX_MESSAGE_BYTES {
+                let body = "é".repeat(limit / 2);
+                for _ in 0..2 {
+                    assert!(send(route, "worker_2", &body).starts_with("Queued"));
+                }
+                let delivered = format!("From worker_1: {body}");
+                assert_eq!(
+                    mailbox.drain(1, &Reporter::Silent),
+                    [delivered.clone(), delivered]
+                );
+            }
+        }
+    }
+
     #[test]
     fn stakeholder_broadcast_is_atomic_and_does_not_count_as_worker_coordination() {
         let mailbox = Mailbox::new(
             ["worker_1", "worker_2", "stakeholder_1"]
                 .into_iter()
-                .map(|id| Member {
-                    id: id.into(),
-                    name: id.into(),
-                })
+                .map(member)
                 .collect(),
             128,
         )
         .for_workers(2);
         let send = |sender, to, message: &str| {
-            Route {
-                mailbox: &mailbox,
-                sender,
-            }
-            .execute(
-                &ToolCall {
-                    id: "send".into(),
-                    kind: "function".into(),
-                    function: Function {
-                        name: "send_message".into(),
-                        arguments: json!({"to":to,"message":message}).to_string(),
-                    },
+            send(
+                Route {
+                    mailbox: &mailbox,
+                    sender,
                 },
-                None,
+                to,
+                message,
             )
         };
         let reporter = Reporter::Silent;
@@ -706,6 +771,7 @@ mod tests {
             "a:bad",
             "a (prose)",
             "1. proposal",
+            " \n ",
             "```bwp\nprobe: run",
             "[tag:x",
         ] {

@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    io::{Read, Write},
+    fmt::Write as _,
+    io::{Read, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -11,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
     process::Command,
     time::timeout,
 };
@@ -33,20 +34,27 @@ pub struct Tools<'a> {
     pub ownership: Option<&'a [crate::session::WritePath]>,
     pub workspace: &'a Path,
     pub access: Access,
+    pub allow_inspection_shell: bool,
     pub timeout: Duration,
     pub output_bytes: usize,
     pub key: Option<&'a str>,
 }
 
 impl Tools<'_> {
+    fn allows_shell(&self) -> bool {
+        matches!(self.access, Access::Work) || self.allow_inspection_shell
+    }
+
     pub fn schemas(&self) -> Vec<Value> {
         let mut schemas = vec![
             schema(
                 "read_file",
-                "Read a UTF-8 workspace file. Each line is number tag|text. Quote tags in edit_file. Use start_line to continue, or offset for a raw byte range.",
+                "Tagged UTF-8 or hex bytes. Byte ranges accept integers or 0x strings.",
                 json!({
                     "path": {"type":"string"},
-                    "offset": {"type":"integer","minimum":0},
+                    "hex": {"type":"boolean"},
+                    "offset": {"type":["integer","string"],"minimum":0},
+                    "length": {"type":["integer","string"],"minimum":0},
                     "start_line": {"type":"integer","minimum":1},
                     "end_line": {"type":"integer","minimum":1},
                     "max_bytes": {"type":"integer","minimum":128}
@@ -94,19 +102,29 @@ impl Tools<'_> {
                 "old_text": {"type":"string"},
                 "new_text": {"type":"string"}
             }), &["path"]));
-            schemas.push(schema("shell", "Run a shell command from the workspace directory for tasks such as building, searching and testing.", json!({
-                "command": {"type":"string"}
-            }), &["command"]));
+        }
+        if self.allows_shell() {
+            schemas.push(schema(
+                "shell",
+                "Run shell steps. workdir defaults to workspace.",
+                json!({
+                    "command": {"type":["array","string"],"items":{"type":"string"}},
+                    "workdir": {"type":"string"}
+                }),
+                &["command"],
+            ));
         }
         schemas
     }
 
     pub fn label(&self, call: &ToolCall) -> String {
         let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-        let detail = args
-            .get("path")
-            .or_else(|| args.get("command"))
-            .and_then(Value::as_str);
+        let detail = args.get("path").and_then(Value::as_str).or_else(|| {
+            let command = args.get("command")?;
+            command
+                .as_str()
+                .or_else(|| command.as_array()?.first()?.as_str())
+        });
         let title = match detail {
             Some(detail) => format!(
                 "{} · {}",
@@ -268,10 +286,25 @@ impl Tools<'_> {
                     _ => anyhow::bail!("provide edits or both old_text and new_text"),
                 }
             }
-            "shell" if matches!(self.access, Access::Work) => {
+            "shell" if self.allows_shell() => {
                 let args: Shell = crate::api::tool_arguments(arguments)?;
-                ensure!(!args.command.trim().is_empty(), "shell command is empty");
-                let (_, output, full) = self.command_result(&mut shell(&args.command)).await?;
+                let script = match args.command {
+                    ShellCommand::Script(script) => script,
+                    ShellCommand::Steps(steps) => {
+                        ensure!(!steps.is_empty(), "shell command array is empty");
+                        if let Some(index) = steps.iter().position(|step| step.trim().is_empty()) {
+                            anyhow::bail!("shell command at index {index} is empty");
+                        }
+                        let separator = if cfg!(windows) { "&" } else { "\n" };
+                        steps.join(separator)
+                    }
+                };
+                ensure!(!script.trim().is_empty(), "shell command is empty");
+                let mut command = shell(&script);
+                if let Some(workdir) = args.workdir {
+                    command.current_dir(self.workspace.join(workdir));
+                }
+                let (_, output, full) = self.command_result(&mut command).await?;
                 *audit = Some(full);
                 Ok(format!("Untrusted command output\n{output}"))
             }
@@ -324,9 +357,6 @@ impl Tools<'_> {
     }
 
     async fn read(&self, args: &ReadFile, audit: &mut Option<String>) -> Result<String> {
-        use std::io::SeekFrom;
-        use tokio::io::AsyncSeekExt;
-
         let path = self.resolve(&args.path).await?;
         let metadata = fs::metadata(&path).await?;
         ensure!(metadata.is_file(), "expected a regular file");
@@ -335,65 +365,104 @@ impl Tools<'_> {
             .unwrap_or(self.output_bytes)
             .min(self.output_bytes);
         ensure!(limit >= 128, "max_bytes must be at least 128");
-        let Some(offset) = args.offset else {
+        let audit_limit = args.max_bytes.unwrap_or(AUDIT_LIMIT).min(AUDIT_LIMIT);
+        let line_mode = args.offset.is_none() && args.length.is_none() && args.hex != Some(true);
+        let auto = args.hex.is_none();
+        if line_mode {
+            let tagged_path = path.clone();
             let start = args.start_line.unwrap_or(1);
             let end = args.end_line;
             let output_limit = self.output_bytes;
-            let audit_limit = args.max_bytes.unwrap_or(AUDIT_LIMIT).min(AUDIT_LIMIT);
-            let (visible, full) = tokio::task::spawn_blocking(move || {
-                let text = read_edit_file(&path)?;
+            let tagged = tokio::task::spawn_blocking(move || {
+                let text = match read_text_snapshot(&tagged_path, auto) {
+                    Ok(Some(text)) => text,
+                    Ok(None) => return Ok(None),
+                    Err(error) if error.is::<std::str::Utf8Error>() => {
+                        return Err(error.context(BYTE_READ_HINT));
+                    }
+                    Err(error) => return Err(error),
+                };
                 let header = format!(
                     "Untrusted workspace file\nSnapshot ID: {}\n",
                     snapshot_id(&text)
                 );
                 let excerpt = line_tags::excerpt(
-                    &path.to_string_lossy(),
+                    &tagged_path.to_string_lossy(),
                     &text,
                     start,
                     end,
                     limit.min(output_limit.saturating_sub(header.len())),
                 )?;
                 let full = line_tags::excerpt(
-                    &path.to_string_lossy(),
+                    &tagged_path.to_string_lossy(),
                     &text,
                     start,
                     end,
                     audit_limit.saturating_sub(header.len()),
                 )?;
-                Ok::<_, anyhow::Error>((header.clone() + &excerpt, header + &full))
+                Ok(Some((header.clone() + &excerpt, header + &full)))
             })
             .await??;
-            *audit = Some(full);
-            return Ok(visible);
-        };
-        ensure!(
-            args.start_line.is_none() && args.end_line.is_none(),
-            "offset cannot be combined with a line range"
-        );
-        ensure!(offset <= metadata.len(), "offset is past end of file");
+            if let Some((visible, full)) = tagged {
+                *audit = Some(full);
+                return Ok(visible);
+            }
+        } else {
+            ensure!(
+                args.start_line.is_none() && args.end_line.is_none(),
+                "hex, offset, and length cannot be combined with a line range"
+            );
+        }
+        let offset = args.offset.unwrap_or(0);
+        let size = metadata.len();
+        let remaining = size
+            .checked_sub(offset)
+            .with_context(|| format!("offset 0x{offset:x} is past end of file at 0x{size:x}"))?;
+        let hex = line_mode || args.hex == Some(true);
+        let default_length = if hex { HEX_PREVIEW_BYTES } else { remaining };
+        let count = args.length.unwrap_or(default_length).min(remaining);
         let mut file = fs::File::open(path).await?;
         file.seek(SeekFrom::Start(offset)).await?;
+        let hex_range = HexRange {
+            offset,
+            size,
+            automatic: auto,
+        };
+        let capture_limit = if hex {
+            hex_range.capacity(audit_limit)
+        } else {
+            audit_limit
+        };
         let mut bytes = Vec::new();
-        let visible_limit = (limit.saturating_sub(128) / 3).max(4);
-        let audit_limit = args
-            .max_bytes
-            .unwrap_or(AUDIT_LIMIT)
-            .min(AUDIT_LIMIT)
-            .max(visible_limit);
-        file.take(audit_limit as u64)
+        file.take(count.min(capture_limit as u64))
             .read_to_end(&mut bytes)
             .await?;
+        let render_hex = |bytes: &[u8], audit: &mut Option<String>| {
+            *audit = Some(hex_range.render(bytes, audit_limit));
+            hex_range.render(bytes, limit)
+        };
+        if hex {
+            return Ok(render_hex(&bytes, audit));
+        }
+        let visible_limit = (limit.saturating_sub(128) / 3).max(4);
         let visible = &bytes[..bytes.len().min(visible_limit)];
+        let preview_len = count.min(args.length.unwrap_or(HEX_PREVIEW_BYTES));
+        let preview = &bytes[..(bytes.len() as u64).min(preview_len) as usize];
+        if auto && visible.contains(&0) {
+            return Ok(render_hex(preview, audit));
+        }
         let text = match std::str::from_utf8(visible) {
             Ok(text) => text,
             Err(error)
                 if error.error_len().is_none()
-                    && offset + (visible.len() as u64) < metadata.len() =>
+                    && error.valid_up_to() > 0
+                    && offset + (visible.len() as u64) < size =>
             {
                 // Carry an incomplete trailing code point into the next range.
                 std::str::from_utf8(&visible[..error.valid_up_to()])?
             }
-            Err(error) => return Err(error).context("read UTF-8 text at the requested offset"),
+            Err(_) if auto => return Ok(render_hex(preview, audit)),
+            Err(error) => return Err(error).context(BYTE_READ_HINT),
         };
         let next = offset + text.len() as u64;
         let full = std::str::from_utf8(&bytes).map_or_else(
@@ -403,12 +472,11 @@ impl Tools<'_> {
         *audit = Some(format!(
             "Untrusted workspace file. Bytes {offset}..{} of {}.\n{full}",
             offset + full.len() as u64,
-            metadata.len()
+            size
         ));
         Ok(format!(
             "Untrusted workspace file. Bytes {}..{next} of {}.\n{text}",
-            offset,
-            metadata.len()
+            offset, size
         ))
     }
 
@@ -459,8 +527,10 @@ impl Tools<'_> {
     }
 
     async fn command_result(&self, command: &mut Command) -> Result<(bool, String, String)> {
+        if command.as_std().get_current_dir().is_none() {
+            command.current_dir(self.workspace);
+        }
         command
-            .current_dir(self.workspace)
             .env_remove("OPENAI_API_KEY")
             .env_remove("RATIO_API_KEY")
             .stdin(Stdio::null())
@@ -472,7 +542,10 @@ impl Tools<'_> {
 
         #[cfg(windows)]
         let job = windows_job::Job::prepare(command)?;
-        let mut child = command.spawn().context("start command")?;
+        let mut child = command.spawn().with_context(|| {
+            let directory = command.as_std().get_current_dir().unwrap_or(self.workspace);
+            format!("start command in {}", directory.display())
+        })?;
         #[cfg(unix)]
         let mut guard = ProcessGroup(child.id());
         #[cfg(windows)]
@@ -509,6 +582,62 @@ impl Tools<'_> {
             ),
         ))
     }
+}
+
+const BYTE_READ_HINT: &str =
+    "Use hex:true with offset and length. This range could not be read as UTF-8";
+
+const HEX_PREVIEW_BYTES: u64 = 256;
+const HEX_ROW_BYTES: usize = 16;
+const HEX_ROW_OVERHEAD: usize = 22;
+const HEX_BYTE_WIDTH: usize = 4;
+
+struct HexRange {
+    offset: u64,
+    size: u64,
+    automatic: bool,
+}
+
+impl HexRange {
+    fn header(&self, end: u64) -> String {
+        let Self {
+            offset,
+            size,
+            automatic,
+        } = self;
+        let label = if *automatic { "Hex (auto)" } else { "Hex" };
+        format!("Untrusted workspace file. {label} 0x{offset:x}..0x{end:x} / 0x{size:x}\n")
+    }
+
+    fn capacity(&self, limit: usize) -> usize {
+        let budget = limit.saturating_sub(self.header(self.size).len());
+        let row_width = HEX_ROW_OVERHEAD + HEX_ROW_BYTES * HEX_BYTE_WIDTH;
+        (budget / row_width) * HEX_ROW_BYTES
+            + (budget % row_width).saturating_sub(HEX_ROW_OVERHEAD) / HEX_BYTE_WIDTH
+    }
+
+    fn render(&self, bytes: &[u8], limit: usize) -> String {
+        let bytes = &bytes[..bytes.len().min(self.capacity(limit))];
+        self.header(self.offset + bytes.len() as u64) + &hex_dump(self.offset, bytes)
+    }
+}
+
+fn hex_dump(offset: u64, data: &[u8]) -> String {
+    let mut result = String::new();
+    for (index, row) in data.chunks(HEX_ROW_BYTES).enumerate() {
+        let address = offset + (index * HEX_ROW_BYTES) as u64;
+        write!(result, "{address:016x}  ").expect("writing to a String cannot fail");
+        for byte in row {
+            write!(result, "{byte:02x} ").expect("writing to a String cannot fail");
+        }
+        result.push_str(" |");
+        result.extend(row.iter().map(|&byte| match byte {
+            b' '..=b'~' => char::from(byte),
+            _ => '.',
+        }));
+        result.push_str("|\n");
+    }
+    result
 }
 
 const MAX_EDIT_BYTES: usize = 4 * 1024 * 1024;
@@ -661,16 +790,44 @@ fn change_file(
 }
 
 fn read_edit_file(path: &Path) -> Result<String> {
-    let mut text = String::new();
-    std::fs::File::open(path)?
-        .take(MAX_EDIT_BYTES as u64 + 1)
-        .read_to_string(&mut text)
-        .context("read editable UTF-8 file")?;
-    ensure!(
-        text.len() <= MAX_EDIT_BYTES,
-        "file exceeds {MAX_EDIT_BYTES} bytes"
-    );
-    Ok(text)
+    read_text_snapshot(path, false)?.context("expected an editable UTF-8 file")
+}
+
+fn read_text_snapshot(path: &Path, auto: bool) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let mut file = std::fs::File::open(path)?.take(MAX_EDIT_BYTES as u64 + 1);
+    if auto {
+        file.by_ref()
+            .take(HEX_PREVIEW_BYTES)
+            .read_to_end(&mut bytes)?;
+        if bytes.contains(&0)
+            || std::str::from_utf8(&bytes).is_err_and(|error| error.error_len().is_some())
+        {
+            return Ok(None);
+        }
+    }
+    file.read_to_end(&mut bytes).context("read editable file")?;
+    if auto && bytes.contains(&0) {
+        return Ok(None);
+    }
+    let too_large = bytes.len() > MAX_EDIT_BYTES;
+    match String::from_utf8(bytes) {
+        // An input capped in the middle of a UTF-8 character can still be text.
+        Err(error) if !too_large || error.utf8_error().error_len().is_some() => {
+            if auto {
+                Ok(None)
+            } else {
+                Err(error.utf8_error()).context("read editable UTF-8 file")
+            }
+        }
+        result => {
+            ensure!(
+                !too_large,
+                "file exceeds {MAX_EDIT_BYTES} bytes. Use offset and length to read a range"
+            );
+            Ok(Some(result?))
+        }
+    }
 }
 
 fn git() -> Command {
@@ -775,10 +932,38 @@ fn schema(name: &str, description: &str, properties: Value, required: &[&str]) -
 #[derive(Deserialize)]
 struct ReadFile {
     path: PathBuf,
+    #[serde(default, deserialize_with = "byte_position")]
     offset: Option<u64>,
+    #[serde(default, deserialize_with = "byte_position")]
+    length: Option<u64>,
+    #[serde(default)]
+    hex: Option<bool>,
     start_line: Option<usize>,
     end_line: Option<usize>,
     max_bytes: Option<usize>,
+}
+
+fn byte_position<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Position {
+        Integer(u64),
+        Hex(String),
+    }
+    Option::<Position>::deserialize(deserializer)?
+        .map(|position| match position {
+            Position::Integer(value) => Ok(value),
+            Position::Hex(text) => text
+                .strip_prefix("0x")
+                .or_else(|| text.strip_prefix("0X"))
+                .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+                .ok_or_else(|| {
+                    serde::de::Error::custom("expected a nonnegative integer or 0x hex string")
+                }),
+        })
+        .transpose()
 }
 
 #[derive(Deserialize)]
@@ -816,12 +1001,75 @@ struct Diff {
 
 #[derive(Deserialize)]
 struct Shell {
-    command: String,
+    command: ShellCommand,
+    workdir: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ShellCommand {
+    Script(String),
+    Steps(Vec<String>),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shell_starts_in_the_requested_directory() {
+        use crate::api::Function;
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let subdir = workspace.join("nested dir");
+        fs::create_dir(&subdir).await.unwrap();
+        fs::write(workspace.join("probe.txt"), "root-probe")
+            .await
+            .unwrap();
+        fs::write(subdir.join("probe.txt"), "nested-probe")
+            .await
+            .unwrap();
+        let tools = Tools {
+            workspace: &workspace,
+            ownership: None,
+            access: Access::Work,
+            allow_inspection_shell: false,
+            timeout: Duration::from_secs(5),
+            output_bytes: 1024,
+            key: None,
+        };
+        let command = if cfg!(windows) {
+            "type probe.txt"
+        } else {
+            "cat probe.txt"
+        };
+        for (workdir, expected) in [
+            (None, "stdout:\nroot-probe"),
+            (Some(Path::new("nested dir")), "stdout:\nnested-probe"),
+            (Some(subdir.as_path()), "stdout:\nnested-probe"),
+            (
+                Some(Path::new("missing dir")),
+                "Tool error: start command in",
+            ),
+            (Some(Path::new("probe.txt")), "Tool error: start command in"),
+        ] {
+            let mut arguments = json!({"command":command});
+            if let Some(workdir) = workdir {
+                arguments["workdir"] = json!(workdir);
+            }
+            let call = ToolCall {
+                id: "workdir-test".into(),
+                kind: "function".into(),
+                function: Function {
+                    name: "shell".into(),
+                    arguments: arguments.to_string(),
+                },
+            };
+            let output = tools.execute(&call).await;
+            assert!(output.contains(expected), "{output}");
+        }
+    }
 
     #[cfg(windows)]
     #[tokio::test]
@@ -832,6 +1080,7 @@ mod tests {
             ownership: None,
             workspace: &workspace,
             access: Access::Work,
+            allow_inspection_shell: false,
             timeout: Duration::from_secs(3),
             output_bytes: 1024,
             key: None,
@@ -857,6 +1106,7 @@ mod tests {
             ownership: None,
             workspace: &workspace,
             access: Access::Inspect,
+            allow_inspection_shell: false,
             timeout: Duration::from_secs(1),
             output_bytes: 512,
             key: None,
@@ -864,6 +1114,8 @@ mod tests {
         let mut args = ReadFile {
             path: "text".into(),
             offset: Some(0),
+            length: None,
+            hex: None,
             start_line: None,
             end_line: None,
             max_bytes: None,
@@ -886,6 +1138,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_hex_reports_exact_ranges_with_bounded_audit_and_model_output() {
+        use crate::api::Function;
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let fixture = [0xff, b'A', 0, b' ', b'~', b'\n', 0x80, b'!'];
+        std::fs::write(workspace.join("data.bin"), fixture.repeat(64)).unwrap();
+        std::fs::write(workspace.join("short.bin"), fixture.repeat(16)).unwrap();
+        let tools = Tools {
+            ownership: None,
+            workspace: &workspace,
+            access: Access::Inspect,
+            allow_inspection_shell: false,
+            timeout: Duration::from_secs(1),
+            output_bytes: 128,
+            key: None,
+        };
+        let call = |arguments: Value| ToolCall {
+            id: "binary".into(),
+            kind: "function".into(),
+            function: Function {
+                name: "read_file".into(),
+                arguments: arguments.to_string(),
+            },
+        };
+        let read = call(json!({"path":"data.bin","hex":true,"offset":"0x1","length":"0x7"}));
+        let (visible, full) = tools.execute_audited(&read).await;
+        assert_eq!(visible, full);
+        assert!(visible.contains("Hex 0x1..0x8 / 0x200"));
+        assert!(
+            visible.contains("0000000000000001  41 00 20 7e 0a 80 21  |A. ~..!|"),
+            "{visible}"
+        );
+
+        let read = call(json!({"path":"data.bin","hex":true,"offset":0,"length":100}));
+        let (visible, full) = tools.execute_audited(&read).await;
+        assert!(visible.len() <= 128);
+        assert!(visible.ends_with("|\n"));
+        assert!(full.contains("Hex 0x0..0x64 / 0x200"));
+        assert!(!visible.contains("Hex 0x0..0x64"));
+
+        let read = call(json!({"path":"data.bin","hex":true}));
+        let (_, full) = tools.execute_audited(&read).await;
+        assert!(full.contains("Hex 0x0..0x100 / 0x200"));
+
+        for (offset, range) in [(127, "0x7f..0x80"), (128, "0x80..0x80")] {
+            let read = call(json!({"path":"short.bin","hex":true,"offset":offset,"length":8}));
+            assert!(tools.execute(&read).await.contains(range));
+        }
+        for arguments in [
+            json!({"path":"data.bin"}),
+            json!({"path":"data.bin","start_line":2}),
+            json!({"path":"data.bin","offset":0}),
+        ] {
+            let (visible, full) = tools.execute_audited(&call(arguments)).await;
+            assert!(full.contains("Hex (auto) 0x0..0x100 / 0x200"), "{full}");
+            assert!(visible.contains("ff 41 00 20"), "{visible}");
+            assert!(visible.len() <= 128);
+            assert!(!visible.contains("Snapshot ID"));
+        }
+        let read = call(json!({"path":"data.bin","offset":"0x6","length":2}));
+        assert!(tools.execute(&read).await.contains("Hex (auto) 0x6..0x8"));
+        let read = call(json!({"path":"data.bin","hex":false,"start_line":1}));
+        assert!(tools.execute(&read).await.contains("hex:true"));
+        let read = call(json!({"path":"data.bin","hex":true,"start_line":1}));
+        assert!(tools.execute(&read).await.contains("cannot be combined"));
+    }
+
+    #[tokio::test]
     async fn rejects_stale_range_snapshot_after_interior_changes() {
         use crate::api::Function;
         let root = tempfile::tempdir().unwrap();
@@ -902,6 +1223,7 @@ mod tests {
             workspace: &workspace,
             ownership: None,
             access: Access::Work,
+            allow_inspection_shell: false,
             timeout: Duration::from_secs(1),
             output_bytes: 4096,
             key: None,
