@@ -1011,6 +1011,86 @@ fn provider_retry_counts_against_run_budget() {
 }
 
 #[test]
+fn total_token_budget_is_opt_in_and_zero_overrides_a_configured_cap() {
+    for (cap, override_cap, should_finish) in [
+        ("", false, true),
+        ("max_total_tokens = 8000000", false, false),
+        ("max_total_tokens = 8000000", true, true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("ratio.toml");
+        std::fs::write(&profile, format!("[orchestration]\n{cap}\n")).unwrap();
+        let (endpoint, server) = mock(move |index, _| match index {
+            0 => {
+                let (status, mut response) = text("Plan complete.");
+                response["usage"] = json!({"total_tokens":8_000_000});
+                response["test_terminal"] = json!(!should_finish);
+                (status, response)
+            }
+            1 if should_finish => text("Work complete."),
+            2 if should_finish => decision("approved", "Verified."),
+            _ => panic!("unexpected request {index}"),
+        });
+        let mut args = vec!["--config", profile.to_str().unwrap(), "--goal", "Verify"];
+        if override_cap {
+            args.extend(["--max-total-tokens", "0"]);
+        }
+        let run = cli(temp.path(), &endpoint, &args);
+        if should_finish {
+            succeeded(&run);
+        } else {
+            assert_eq!(run.status.code(), Some(3));
+            assert!(String::from_utf8_lossy(&run.stdout).contains("metered tokens"));
+        }
+        server.join().unwrap();
+        if should_finish {
+            continue;
+        }
+
+        let reader = ra::session::Store::reader(temp.path()).unwrap();
+        let records = reader.runs().unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        let (_, phase) = reader
+            .budget_resume_checkpoint(&record.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(phase, "Work");
+        let (endpoint, server) = mock(|index, request| match index {
+            0 => {
+                assert!(request["messages"].to_string().contains("Plan complete."));
+                text("Work complete.")
+            }
+            1 => decision("approved", "Verified after resuming."),
+            _ => panic!("unexpected resumed request {index}"),
+        });
+        let resumed = cli(
+            temp.path(),
+            &endpoint,
+            &[
+                "--config",
+                profile.to_str().unwrap(),
+                "--resume",
+                "--run-id",
+                &record.run_id,
+                "--max-total-tokens",
+                "0",
+            ],
+        );
+        succeeded(&resumed);
+        server.join().unwrap();
+        let records = reader.runs().unwrap();
+        assert_eq!(records.len(), 1);
+        let finished = &records[0];
+        assert_eq!(finished.run_id, record.run_id);
+        assert_eq!(finished.phase, "Approved");
+        let metrics = reader.metrics(&record.run_id).unwrap();
+        assert_eq!(metrics.provider_attempts, 3);
+        assert!(metrics.metered_tokens > 8_000_000);
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn parallel_result_survives_interrupt_while_another_tool_is_in_flight() {
     use ra::{

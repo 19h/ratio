@@ -56,6 +56,14 @@ impl<'a> Orchestrator<'a> {
         mut session: Session,
         guidance: Option<Receiver<String>>,
     ) -> Result<Session> {
+        let mut restored_budget_checkpoint = false;
+        if self.config.resume
+            && session.phase == Phase::Exhausted
+            && let Some(checkpoint) = self.store.recover_budget_checkpoint(session.run_id())?
+        {
+            session = checkpoint;
+            restored_budget_checkpoint = true;
+        }
         if session.phase.done() {
             self.store.save(&session)?;
             return Ok(session);
@@ -96,6 +104,16 @@ impl<'a> Orchestrator<'a> {
             session.run_id(),
         )?;
         session.budget_started = true;
+        if restored_budget_checkpoint {
+            self.store
+                .journal
+                .borrow()
+                .restore_deferred_triage(session.run_id())?;
+            self.progress(&format!(
+                "[resume] Restored {} after budget exhaustion",
+                session.phase.label()
+            ));
+        }
         self.store.save(&session)?;
         let run_id = session.run_id().to_owned();
         let deadline = self.budget.until_exhausted();
@@ -127,7 +145,6 @@ impl<'a> Orchestrator<'a> {
             saved.phase = Phase::Exhausted;
             saved.assessment = format!("Run budget exhausted: {limit}");
             self.store.save(&saved)?;
-            self.store.journal.borrow().defer_triage(&run_id)?;
             return Ok(saved);
         }
         if let Err(error) = &outcome {
@@ -1099,8 +1116,9 @@ impl<'a> Orchestrator<'a> {
                         .context("provider returned empty assistant text")?,
                 ));
             }
+            let max_tool_rounds = self.config.orchestration.max_tool_rounds;
             ensure!(
-                dialogue.tool_rounds < self.config.orchestration.max_tool_rounds,
+                max_tool_rounds == 0 || dialogue.tool_rounds < max_tool_rounds,
                 "tool-round limit reached for this phase"
             );
             let mut ids = HashSet::new();
@@ -2022,7 +2040,8 @@ impl<'a> Orchestrator<'a> {
                 (Phase::Acknowledge, String::new())
             }
             Phase::Acknowledge if session.worker_plan.is_none() => {
-                if session.plan_attempt > self.config.orchestration.max_plan_attempts {
+                let max_plan_attempts = self.config.orchestration.max_plan_attempts;
+                if max_plan_attempts != 0 && session.plan_attempt > max_plan_attempts {
                     session.assessment = format!("Plan attempt limit reached.\n{excerpt}");
                     (Phase::Exhausted, String::new())
                 } else {

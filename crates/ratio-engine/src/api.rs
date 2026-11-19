@@ -274,10 +274,17 @@ impl Api {
                     None => pending::<()>().await,
                 }
             };
-            let result = tokio::time::timeout(
-                self.budget.remaining(),
-                self.complete_once(model, messages, tools, output_tokens, &tokens, &mut preview),
-            );
+            let completion =
+                self.complete_once(model, messages, tools, output_tokens, &tokens, &mut preview);
+            let result = async {
+                if let Some(remaining) = self.budget.remaining() {
+                    tokio::time::timeout(remaining, completion)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("run budget exhausted: active time"))?
+                } else {
+                    completion.await
+                }
+            };
             let result = tokio::select! {
                 biased;
                 () = cancelled => return Err(ApiError::Cancelled),
@@ -286,9 +293,8 @@ impl Api {
             drop(preview);
             drop(tokens);
             let error = match result {
-                Ok(Ok(completion)) => return Ok(completion),
-                Ok(Err(error)) => error,
-                Err(_) => return Err(anyhow::anyhow!("run budget exhausted: active time").into()),
+                Ok(completion) => return Ok(completion),
+                Err(error) => error,
             };
             let backoff = Duration::from_millis(if attempt == 0 { 250 } else { 1000 });
             let wait = match &error {
@@ -309,7 +315,13 @@ impl Api {
                 }
                 _ => return Err(error),
             };
-            if attempt == 2 || wait > Duration::from_secs(30) || wait >= self.budget.remaining() {
+            if attempt == 2
+                || wait > Duration::from_secs(30)
+                || self
+                    .budget
+                    .remaining()
+                    .is_some_and(|remaining| wait >= remaining)
+            {
                 return Err(if matches!(error, ApiError::Status { .. }) {
                     error
                 } else {

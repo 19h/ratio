@@ -4,7 +4,6 @@ model = "replace-with-provider-model"
 context_window = 32768
 
 [orchestration]
-max_review_cycles = 3
 parallel_stakeholders = true
 max_parallel_agents = 8
 

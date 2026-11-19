@@ -193,7 +193,9 @@ function renderLive() {
     button(state.live.paused ? "Resume" : "Pause", () => sendAction(state.live.paused ? "resume" : "pause").catch(captureError)),
     button("Stop", () => openAction("stop"), { class: "danger" }),
   ] : state.route.run && state.summary ? [
-    button("Resume saved", () => openAction("resume_saved"), { disabled: endings.includes(state.summary.run.phase) }),
+    button("Resume saved", () => openAction("resume_saved"), {
+      disabled: endings.includes(state.summary.run.phase) && !state.summary.resume_phase,
+    }),
     button("Fork", () => openAction("fork")),
   ] : [];
   if (controls.dataset.mode !== status || controls.dataset.phase !== state.summary?.run?.phase) {
@@ -856,7 +858,9 @@ function openAction(name, initial = "") {
   const [label, hint, field, required] = descriptions[name];
   actionState = { name, run: state.route.run, id: crypto.randomUUID() };
   $("#action-title").textContent = label;
-  $("#action-hint").textContent = hint;
+  $("#action-hint").textContent = name === "resume_saved" && state.summary?.resume_phase
+    ? `Continue from ${title(state.summary.resume_phase)} in the same run with the current limits and accumulated usage.`
+    : hint;
   $("#action-label").textContent = field;
   $("#action-label").hidden = !field;
   const input = $("#action-text");

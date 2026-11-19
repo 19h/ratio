@@ -274,6 +274,13 @@ fn select(reader: &RunReader, run: &str, view: &str, query: &Query) -> Result<Va
         "overview" => {
             let snapshot = reader.snapshot(run, None)?.context("Run not found")?;
             let session: Value = serde_json::from_slice(&snapshot)?;
+            let resume_phase = if session["phase"] == "Exhausted" {
+                reader
+                    .budget_resume_checkpoint(run)?
+                    .map(|(_, phase)| phase)
+            } else {
+                None
+            };
             let latest_error = if session["stopped"] == "failed" {
                 reader
                     .audit(
@@ -292,6 +299,7 @@ fn select(reader: &RunReader, run: &str, view: &str, query: &Query) -> Result<Va
                 "run":reader.run(run)?, "event":reader.latest_event(run)?, "head":reader.audit_head(run)?,
                 "goal":session["goal"], "request":session["request"], "verdict":session["verdict"],
                 "parent_run":session["parent_run_id"],
+                "resume_phase":resume_phase,
                 "latest_error":latest_error,
                 "assessment":session["assessment"], "acceptance":session["team_acceptance"],
                 "workers":session["workers"], "reviewers":session["reviewers"], "stakeholders":session["stakeholders"],
@@ -532,14 +540,15 @@ impl Dashboard {
                 args.push("--dashboard-managed".into());
                 if action.action != "start" {
                     let run = run.context("Choose a saved run")?;
-                    let record = Store::reader(&self.workspace)?
-                        .run(run)?
-                        .context("Run not found")?;
+                    let reader = Store::reader(&self.workspace)?;
+                    let record = reader.run(run)?.context("Run not found")?;
                     if action.action == "fork" {
                         args.extend(["--fork".into(), run.into()]);
                     } else {
                         ensure!(
-                            !matches!(record.phase.as_str(), "Approved" | "Rejected" | "Exhausted"),
+                            !matches!(record.phase.as_str(), "Approved" | "Rejected")
+                                && (record.phase != "Exhausted"
+                                    || reader.budget_resume_checkpoint(run)?.is_some()),
                             "This run has already finished"
                         );
                         args.extend(["--resume".into(), "--run-id".into(), run.into()]);

@@ -730,6 +730,17 @@ impl Store {
         Self::decode(file)
     }
 
+    pub(crate) fn recover_budget_checkpoint(&self, run: &str) -> Result<Option<Session>> {
+        let reader = RunReader::open(&self.directory.join("runs.sqlite3"))?;
+        let Some((sequence, _)) = reader.budget_resume_checkpoint(run)? else {
+            return Ok(None);
+        };
+        let checkpoint = reader
+            .snapshot(run, Some(sequence))?
+            .context("pre-budget checkpoint is missing")?;
+        Self::decode(checkpoint.as_slice()).map(Some)
+    }
+
     fn decode(source: impl std::io::Read) -> Result<Session> {
         // Check the version before deserializing version-dependent fields.
         let data: serde_json::Value =

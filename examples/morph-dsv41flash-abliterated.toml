@@ -86,12 +86,6 @@ Method references
 """
 
 [orchestration]
-max_review_cycles = 3
-max_plan_attempts = 3
-max_requests = 512
-max_total_tokens = 8000000
-max_run_secs = 3600
-max_tool_rounds = 100
 max_parallel_agents = 3
 require_task_graph = true
 stage_workspace = true

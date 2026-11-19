@@ -2,7 +2,9 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
     fs::File,
+    future::pending,
     io::Write,
+    num::NonZeroU64,
     path::PathBuf,
     rc::Rc,
     time::{Duration, Instant},
@@ -144,9 +146,9 @@ impl OutputRate {
 pub struct Budget {
     state: Rc<RefCell<State>>,
     active: watch::Sender<bool>,
-    requests: u64,
-    tokens: u64,
-    elapsed_ms: u64,
+    requests: Option<NonZeroU64>,
+    tokens: Option<NonZeroU64>,
+    elapsed_ms: Option<u64>,
 }
 
 impl Budget {
@@ -163,9 +165,10 @@ impl Budget {
                 exhausted: None,
             })),
             active: watch::channel(true).0,
-            requests: limits.max_requests,
-            tokens: limits.max_total_tokens,
-            elapsed_ms: limits.max_run_secs.saturating_mul(1000),
+            requests: NonZeroU64::new(limits.max_requests),
+            tokens: NonZeroU64::new(limits.max_total_tokens),
+            elapsed_ms: NonZeroU64::new(limits.max_run_secs)
+                .map(|seconds| seconds.get().saturating_mul(1000)),
         }
     }
 
@@ -193,11 +196,20 @@ impl Budget {
 
     pub fn reserve(&self, tokens: u64) -> Result<()> {
         let mut state = self.state.borrow_mut();
-        let limit = if state.elapsed() >= self.elapsed_ms {
+        let limit = if self
+            .elapsed_ms
+            .is_some_and(|limit| state.elapsed() >= limit)
+        {
             Some("active time")
-        } else if state.ledger.requests >= self.requests {
+        } else if self
+            .requests
+            .is_some_and(|limit| state.ledger.requests >= limit.get())
+        {
             Some("provider attempts")
-        } else if tokens > self.tokens.saturating_sub(state.ledger.tokens) {
+        } else if self
+            .tokens
+            .is_some_and(|limit| tokens > limit.get().saturating_sub(state.ledger.tokens))
+        {
             Some("metered tokens")
         } else {
             None
@@ -206,8 +218,8 @@ impl Budget {
             state.exhausted = Some(limit);
             anyhow::bail!("run budget exhausted: {limit}");
         }
-        state.ledger.requests += 1;
-        state.ledger.tokens += tokens;
+        state.ledger.requests = state.ledger.requests.saturating_add(1);
+        state.ledger.tokens = state.ledger.tokens.saturating_add(tokens);
         state.save()
     }
 
@@ -265,16 +277,15 @@ impl Budget {
         }
     }
 
-    pub fn remaining(&self) -> Duration {
-        Duration::from_millis(
-            self.elapsed_ms
-                .saturating_sub(self.state.borrow().elapsed()),
-        )
+    pub fn remaining(&self) -> Option<Duration> {
+        self.elapsed_ms
+            .map(|limit| Duration::from_millis(limit.saturating_sub(self.state.borrow().elapsed())))
     }
 
     pub(crate) fn pause(&self) -> Result<Pause<'_>> {
         ensure!(
-            !self.remaining().is_zero(),
+            self.remaining()
+                .is_none_or(|remaining| !remaining.is_zero()),
             "run budget exhausted: active time"
         );
         let mut state = self.state.borrow_mut();
@@ -290,10 +301,8 @@ impl Budget {
 
     pub(crate) async fn until_exhausted(&self) {
         let mut active = self.active.subscribe();
-        loop {
-            let running = *active.borrow_and_update();
-            if running {
-                let remaining = self.remaining();
+        while let Some(remaining) = self.remaining() {
+            if *active.borrow_and_update() {
                 if remaining.is_zero() {
                     return;
                 }
@@ -305,13 +314,15 @@ impl Budget {
                 let _ = active.changed().await;
             }
         }
+        pending().await
     }
 
     pub fn exhaustion(&self) -> Option<&'static str> {
-        self.state
-            .borrow()
-            .exhausted
-            .or_else(|| self.remaining().is_zero().then_some("active time"))
+        self.state.borrow().exhausted.or_else(|| {
+            self.remaining()
+                .filter(Duration::is_zero)
+                .map(|_| "active time")
+        })
     }
 
     pub fn save(&self) -> Result<()> {

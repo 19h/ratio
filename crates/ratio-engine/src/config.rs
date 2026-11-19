@@ -77,10 +77,13 @@ pub struct Cli {
     /// Maximum number of reviews, or 0 for unlimited.
     #[arg(long)]
     max_cycles: Option<usize>,
+    /// Maximum provider attempts, or 0 for unlimited.
     #[arg(long)]
     max_requests: Option<u64>,
+    /// Maximum metered tokens per run, or 0 for unlimited.
     #[arg(long)]
     max_total_tokens: Option<u64>,
+    /// Maximum active runtime in seconds, or 0 for unlimited.
     #[arg(long)]
     max_run_secs: Option<u64>,
     /// Run without the TUI. Progress goes to stderr and the assessment to stdout.
@@ -357,12 +360,12 @@ pub struct Orchestration {
 impl Default for Orchestration {
     fn default() -> Self {
         Self {
-            max_plan_attempts: 3,
-            max_requests: 512,
-            max_total_tokens: 8_000_000,
-            max_run_secs: 3600,
-            max_review_cycles: 3,
-            max_tool_rounds: 100,
+            max_plan_attempts: 0,
+            max_requests: 0,
+            max_total_tokens: 0,
+            max_run_secs: 0,
+            max_review_cycles: 0,
+            max_tool_rounds: 0,
             request_timeout_secs: 180,
             command_timeout_secs: 120,
             allow_inspection_shell: false,
@@ -604,13 +607,6 @@ impl Config {
         if let Some(limit) = cli.max_run_secs {
             orchestration.max_run_secs = limit;
         }
-        ensure!(
-            orchestration.max_requests > 0
-                && orchestration.max_total_tokens > 0
-                && orchestration.max_run_secs > 0
-                && orchestration.max_plan_attempts > 0,
-            "run budgets and max_plan_attempts must be positive"
-        );
         ensure!(file.workers.len() <= 64, "configure at most 64 workers");
         ensure!(
             !orchestration.stage_workspace
@@ -644,10 +640,6 @@ impl Config {
         if let Some(max_cycles) = cli.max_cycles {
             orchestration.max_review_cycles = max_cycles;
         }
-        ensure!(
-            orchestration.max_tool_rounds > 0,
-            "max_tool_rounds must be positive"
-        );
         ensure!(
             orchestration.request_timeout_secs > 0 && orchestration.command_timeout_secs > 0,
             "timeouts must be positive"

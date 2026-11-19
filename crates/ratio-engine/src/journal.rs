@@ -144,6 +144,15 @@ impl Journal {
         Ok(())
     }
 
+    pub(crate) fn restore_deferred_triage(&self, run: &str) -> Result<()> {
+        self.0.execute(
+            "UPDATE triage_inbox SET state=CASE WHEN decision IS NULL THEN 'queued' ELSE 'routed' END
+             WHERE run_id=?1 AND state='deferred'",
+            [run],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn next_triage(
         &self,
         run: &str,
@@ -698,6 +707,34 @@ impl RunReader {
             WHERE e.run_id=?1 AND (?2 IS NULL OR e.sequence=?2) ORDER BY e.sequence DESC LIMIT 1",
                 params![run, sequence],
                 |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub fn budget_resume_checkpoint(&self, run: &str) -> Result<Option<(u64, String)>> {
+        // Budget exhaustion records the preceding checkpoint with only its phase and
+        // assessment replaced. Review and plan exhaustion advance the phase machine.
+        self.0
+            .query_row(
+                "SELECT prior.sequence, prior.phase FROM runs r
+                 JOIN events stop ON stop.sequence=r.last_sequence
+                 JOIN checkpoint_blobs terminal ON terminal.digest=stop.checkpoint
+                 JOIN events prior ON prior.sequence=(
+                     SELECT sequence FROM events WHERE run_id=r.run_id AND sequence<stop.sequence
+                     AND phase!='Exhausted' ORDER BY sequence DESC LIMIT 1
+                 )
+                 JOIN checkpoint_blobs saved ON saved.digest=prior.checkpoint
+                 WHERE r.run_id=?1 AND r.phase='Exhausted' AND prior.cycle=stop.cycle
+                 AND prior.phase NOT IN ('Approved','Rejected','Publish')
+                 AND json_extract(CAST(terminal.content AS TEXT),'$.assessment') IN (
+                     'Run budget exhausted: active time',
+                     'Run budget exhausted: provider attempts',
+                     'Run budget exhausted: metered tokens'
+                 )
+                 AND json_remove(CAST(terminal.content AS TEXT),'$.phase','$.assessment')
+                   = json_remove(CAST(saved.content AS TEXT),'$.phase','$.assessment')",
+                [run],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
     }

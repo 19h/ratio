@@ -26,12 +26,13 @@ context_window = 32768
 # model = "reviewer-model"
 
 [orchestration]
-max_review_cycles = 3
-max_plan_attempts = 3
-max_requests = 512
-max_total_tokens = 8000000
-max_run_secs = 3600
-max_tool_rounds = 100
+# Optional limits. Omit a setting or use 0 for unlimited.
+# max_review_cycles = 3
+# max_plan_attempts = 3
+# max_requests = 512
+# max_total_tokens = 8000000
+# max_run_secs = 3600
+# max_tool_rounds = 100
 request_timeout_secs = 180
 command_timeout_secs = 120
 parallel_stakeholders = true

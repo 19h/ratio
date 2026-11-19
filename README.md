@@ -158,7 +158,7 @@ Ratio sends a Bearer header when a key is configured. A custom `Authorization` h
 ## Teams, communication, and review
 
 - **Panel.** Configure up to 64 combined `[[reviewers]]` and `[[stakeholders]]`, with names, personas, planning or review phases, and optional model overrides. The lead reviewer synthesizes their reports. `[orchestration].max_parallel_agents` defaults to 8. Set `parallel_stakeholders = false` for serial consultation.
-- **Workers.** Add `[[workers]]` with names, personas, and optional model overrides. With multiple workers, each must send and receive a peer coordination message. The lead reviewer freezes the plan with `submit_plan`, including workspace-relative write ownership. Every worker calls `ack_plan` with the same plan ID or uses `object_to_plan` to return the team to coordination. The default is three plan attempts per review cycle.
+- **Workers.** Add `[[workers]]` with names, personas, and optional model overrides. With multiple workers, each must send and receive a peer coordination message. The lead reviewer freezes the plan with `submit_plan`, including workspace-relative write ownership. Every worker calls `ack_plan` with the same plan ID or uses `object_to_plan` to return the team to coordination.
 - **Dependencies.** Generated teams use a typed task graph. To require it for a configured team, set `[orchestration].require_task_graph = true`. Each worker gets one task with an ID, description, predecessors, and acceptance criteria. Ratio validates references and acyclicity. Workers become runnable when their predecessors complete.
 - **Decision.** The lead reviewer issues `submit_verdict` as the sole tool call in its completion. The call carries a verdict and assessment. A `needs_revision` verdict also carries revision instructions.
 
@@ -335,14 +335,20 @@ Each resumed model request uses the current native tool schemas and access setti
 
 Ratio reserves output tokens and estimates the input cost of messages and tool definitions. Compaction summarizes earlier exchanges and retains the active task and recent call/result pairing. It targets 90% of available input space, with headroom for required content. Provider usage calibrates the target. An explicit context rejection can tighten the retry ceiling. If a reply reaches the output cap, Ratio discards partial calls and retries with a concision instruction and a smaller compaction target.
 
-| Limit | Default | Override |
-| --- | ---: | --- |
-| Review cycles | 3 | `--max-cycles` |
-| Provider attempts | 512 | `--max-requests` |
-| Metered tokens | 8,000,000 | `--max-total-tokens` |
-| Active runtime | 3,600 s | `--max-run-secs` |
+Omit a limit or set it to `0` for unlimited operation. A positive value sets the cap. CLI values override TOML.
 
-Set the same limits in `[orchestration]` with `max_review_cycles`, `max_requests`, `max_total_tokens`, and `max_run_secs`. A review limit of zero allows unlimited revisions within the other budgets. Attempts include retries and compaction. Token reservations use estimated input plus requested output and reconcile against usage when reported. Definite rate-limit and context rejections without usage release the token reservation. Ambiguous failures retain it. The active clock stops after an acknowledged pause reaches a request boundary and running tools settle.
+| Limit | `[orchestration]` setting | CLI override |
+| --- | --- | --- |
+| Review cycles | `max_review_cycles` | `--max-cycles` |
+| Provider attempts | `max_requests` | `--max-requests` |
+| Metered tokens | `max_total_tokens` | `--max-total-tokens` |
+| Active runtime in seconds | `max_run_secs` | `--max-run-secs` |
+| Plan attempts per review cycle | `max_plan_attempts` | |
+| Tool rounds per phase | `max_tool_rounds` | |
+
+Ratio records usage for all runs. Provider attempts include retries and compaction. Token reservations use estimated input plus requested output and reconcile against usage when reported. Definite rate-limit and context rejections without usage release the token reservation. Ambiguous failures retain it. The active clock stops after an acknowledged pause reaches a request boundary and running tools settle.
+
+After a run stops at its token, provider-attempt, or active-runtime limit, update the cap and use **Resume saved** or `--resume --run-id RUN_ID`. Ratio restores the checkpoint before the stop and keeps the same run ID, history, and accumulated usage.
 
 | Command | Output |
 | --- | --- |
