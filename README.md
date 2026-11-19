@@ -253,7 +253,9 @@ The journal preserves tool invocations and receipts independently of conversatio
 
 Automatic triage uses the lead reviewer to classify and route information within the existing run permissions. The inbox shows the decision, recipients, and delivery receipts. Pending items are marked deferred if the run finishes before delivery. **Add worker** requests a separate, read-only onboarding phase followed by unanimous acknowledgement of the amended plan. The worker request links to its onboarding IPC.
 
-To exercise the dashboard with Playwright, build `target/debug/ra`, install Playwright in your test environment, and run `node --test crates/ratio/tests/web_dashboard.mjs`. Set `RATIO_PLAYWRIGHT` to the module path if it is installed outside this workspace.
+To exercise the dashboard with Playwright, build `target/debug/ra`, install Playwright in your test environment, and run `node --test crates/ratio/tests/web_dashboard.mjs`. Set `RATIO_PLAYWRIGHT` to the module path if it is installed outside this workspace. Set `RATIO_WEB_SCREENSHOTS` to an existing directory to save a screenshot of each view during the run.
+
+The dashboard embeds DM Mono and Martian Mono under the SIL Open Font License. The license texts are in [`crates/ratio/src/web/fonts`](crates/ratio/src/web/fonts).
 
 ### Terminal UI
 

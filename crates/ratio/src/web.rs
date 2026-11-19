@@ -36,6 +36,25 @@ type Query = BTreeMap<String, String>;
 const HTML: &str = include_str!("web/index.html");
 const CSS: &str = include_str!("web/dashboard.css");
 const JS: &str = include_str!("web/dashboard.js");
+const ICON: &str = include_str!("web/favicon.svg");
+const FONTS: [(&str, &[u8]); 4] = [
+    (
+        "dm-mono-regular.ttf",
+        include_bytes!("web/fonts/dm-mono-regular.ttf"),
+    ),
+    (
+        "dm-mono-medium.ttf",
+        include_bytes!("web/fonts/dm-mono-medium.ttf"),
+    ),
+    (
+        "martian-mono-regular.ttf",
+        include_bytes!("web/fonts/martian-mono-regular.ttf"),
+    ),
+    (
+        "martian-mono-medium.ttf",
+        include_bytes!("web/fonts/martian-mono-medium.ttf"),
+    ),
+];
 
 struct Dashboard {
     workspace: PathBuf,
@@ -120,7 +139,15 @@ async fn handle(app: Arc<Dashboard>, request: Request<Incoming>) -> Reply {
         return match path.as_str() {
             "/dashboard.css" => response(StatusCode::OK, "text/css; charset=utf-8", CSS),
             "/dashboard.js" => response(StatusCode::OK, "text/javascript; charset=utf-8", JS),
+            "/favicon.svg" => response(StatusCode::OK, "image/svg+xml", ICON),
             "/" => response(StatusCode::OK, "text/html; charset=utf-8", HTML),
+            path if path.starts_with("/fonts/") => FONTS
+                .iter()
+                .find(|(name, _)| path.strip_prefix("/fonts/") == Some(*name))
+                .map_or_else(
+                    || error(StatusCode::NOT_FOUND, "Page not found"),
+                    |(_, font)| response(StatusCode::OK, "font/ttf", *font),
+                ),
             path if path.starts_with("/run/") => {
                 response(StatusCode::OK, "text/html; charset=utf-8", HTML)
             }

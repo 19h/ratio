@@ -4,41 +4,48 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Ratio · Run workspace</title>
+  <title>Ratio</title>
+  <link rel="icon" href="/favicon.svg">
   <link rel="stylesheet" href="/dashboard.css">
   <script defer src="/dashboard.js"></script>
 </head>
 <body>
   <a class="skip" href="#content">Skip to content</a>
-  <div class="shell">
-    <aside class="sidebar" aria-label="Workspace navigation">
-      <a class="brand" href="/" aria-label="Ratio runs"><span aria-hidden="true">R</span><strong>ratio</strong></a>
-      <div class="switcher"><label for="run-select">Workspace run</label><select id="run-select"></select></div>
-      <nav id="navigation" aria-label="Run views"></nav>
-      <div class="agent-nav"><p class="section-label">Agents</p><nav id="agent-nav" aria-label="Individual agents"></nav></div>
-      <div class="sidebar-footer"><button id="new-run" class="accent">Start run <kbd>+</kbd></button></div>
-    </aside>
+  <div class="app">
+    <header class="bar top">
+      <button id="menu" class="menu" aria-label="Toggle navigation" aria-expanded="false">menu</button>
+      <nav id="breadcrumb" class="brand" aria-label="Location"></nav>
+      <span class="spacer"></span>
+      <form id="global-search" role="search" hidden><input type="search" name="q" placeholder="search run history  /" aria-label="Search run history" spellcheck="false" autocomplete="off"></form>
+      <div id="connection" class="connection" aria-live="polite"><i></i><span>Connecting</span></div>
+      <div id="controls" class="run-controls"></div>
+    </header>
     <div class="workspace">
-      <header class="toolbar">
-        <button id="menu" class="quiet menu" aria-label="Toggle navigation" aria-expanded="false">Menu</button>
-        <div id="breadcrumb" class="breadcrumb">Workspace</div>
-        <form id="global-search" role="search"><input type="search" name="q" placeholder="Search run history" aria-label="Search run history"><button class="quiet" type="submit">Search</button></form>
-        <div id="connection" class="connection" aria-live="polite"><i></i><span>Connecting</span></div>
-        <div id="controls" class="run-controls"></div>
-      </header>
-      <div id="notice" class="notice" role="status" hidden></div>
-      <main id="content" tabindex="-1" aria-busy="true"></main>
+      <aside class="side" aria-label="Workspace navigation">
+        <div class="side-run"><label class="label" for="run-select">Run</label><select id="run-select"></select></div>
+        <nav id="navigation" aria-label="Run views" hidden></nav>
+        <div id="agent-heading" class="side-heading" hidden><span>Agents</span><small id="agent-count"></small></div>
+        <nav id="agent-nav" aria-label="Individual agents"></nav>
+        <footer class="bar"><button id="new-run" class="primary">Start run</button></footer>
+      </aside>
+      <div class="stage">
+        <div id="notice" class="notice" role="status" hidden><span></span><button type="button" id="dismiss-notice" aria-label="Dismiss notice">×</button></div>
+        <main id="content" tabindex="-1" aria-busy="true"></main>
+      </div>
     </div>
+    <footer id="status" class="status-bar" aria-label="Run status"></footer>
   </div>
   <dialog id="action-dialog">
     <form id="action-form">
-      <p class="section-label">RUN CONTROL</p>
-      <h2 id="action-title"></h2>
-      <p id="action-hint" class="muted"></p>
-      <label id="action-label" for="action-text"></label>
-      <textarea id="action-text" rows="7"></textarea>
-      <p class="action-error" role="alert" hidden></p>
-      <div class="dialog-buttons"><button type="button" id="close-action">Cancel</button><button type="submit" class="accent" id="submit-action">Submit</button></div>
+      <header class="bar"><span class="label">Run control</span></header>
+      <div class="dialog-body">
+        <h2 id="action-title"></h2>
+        <p id="action-hint" class="muted"></p>
+        <label id="action-label" class="label" for="action-text"></label>
+        <textarea id="action-text" rows="7" spellcheck="false"></textarea>
+        <p class="action-error" role="alert" hidden></p>
+      </div>
+      <footer class="bar"><span class="spacer"></span><button type="button" id="close-action">Cancel</button><button type="submit" class="primary" id="submit-action">Submit</button></footer>
     </form>
   </dialog>
 </body>

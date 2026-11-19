@@ -147,15 +147,22 @@ tools = ["inspect"]
     page.setDefaultTimeout(10_000);
     const exceptions = [];
     page.on("pageerror", error => exceptions.push(error.message));
+    page.on("console", message => {
+      if (message.type() === "error" && /Content Security Policy/.test(message.text())) exceptions.push(message.text());
+    });
+    const shot = async name => {
+      if (process.env.RATIO_WEB_SCREENSHOTS) await page.screenshot({path:join(process.env.RATIO_WEB_SCREENSHOTS,name+".png")});
+    };
     await page.goto(launch);
     await page.getByRole("heading",{name:"Runs",exact:true}).waitFor();
+    await shot("runs");
     assert.equal(new URL(page.url()).hash,"");
     await page.locator("#new-run").click();
     await page.getByLabel("Request",{exact:true}).fill("Inspect fixture MCP evidence");
     await page.locator("#submit-action").click();
     await page.getByRole("heading",{name:"Run overview"}).waitFor();
     await started;
-    if (process.env.RATIO_WEB_SCREENSHOT) await page.screenshot({path:process.env.RATIO_WEB_SCREENSHOT});
+    await shot("overview");
     const run = new URL(page.url()).pathname.split("/")[2];
     const response = await fetch(address.origin+`/api/run/${run}/stream?after=0`,{
       headers:{Authorization:"Bearer "+token},signal:AbortSignal.timeout(5_000),
@@ -181,14 +188,18 @@ tools = ["inspect"]
     await page.getByText("Add an evidence auditor",{exact:true}).waitFor();
     finishWorker();
     await page.getByText("Admitted",{exact:true}).waitFor();
+    await shot("triage");
     await page.getByRole("link",{name:"Onboarding IPC",exact:true}).click();
     await page.getByText("evidence: request acceptance",{exact:true}).first().waitFor();
+    await shot("sequence");
     await page.getByRole("link",{name:"Agent lanes",exact:true}).click();
     await page.getByRole("heading",{name:"Agent lanes"}).waitFor();
+    await shot("lanes");
     await page.locator("#agent-nav").getByRole("link",{name:"Evidence auditor"}).click();
     await page.getByRole("link",{name:"Incoming & outgoing IPC"}).click();
     await page.getByRole("link",{name:"Incoming",exact:true}).click();
     await page.getByText("acceptance: verify evidence",{exact:true}).first().waitFor();
+    await shot("agent");
     await page.locator("#navigation").getByRole("link",{name:"Tools & files"}).click();
     await page.getByRole("link",{name:"MCP",exact:true}).click();
     await page.getByRole("heading",{name:"MCP calls",exact:true}).waitFor();
@@ -201,6 +212,7 @@ tools = ["inspect"]
     await page.getByText("Full result",{exact:false}).first().waitFor();
     await page.locator("summary").filter({hasText:"Full result"}).click();
     await page.getByText("AuditInteriorMarker",{exact:false}).waitFor();
+    await shot("tools");
     const visible = page.locator("details").filter({has:page.locator("summary").filter({hasText:"Model-visible result"})});
     assert.doesNotMatch(await visible.textContent(),/AuditInteriorMarker/);
     await page.locator(".inspector").getByRole("link",{name:"Jump to chat"}).click();
@@ -208,8 +220,11 @@ tools = ["inspect"]
     assert.equal(await page.locator(".entry.selected .highlight").textContent(),"mcp_call");
     await page.reload();
     await page.locator(".entry.selected .highlight").waitFor();
+    await shot("timeline");
     await page.setViewportSize({width:480,height:845});
+    await shot("narrow");
     await page.getByRole("button",{name:"Toggle navigation"}).click();
+    await shot("narrow-menu");
     await page.locator("#navigation").getByRole("link",{name:"Overview"}).click();
     await page.getByRole("heading",{name:"Run overview"}).waitFor();
     await page.setViewportSize({width:1440,height:900});
@@ -218,6 +233,7 @@ tools = ["inspect"]
     await page.locator("#submit-action").click();
     await page.getByText("Inspect the forked evidence",{exact:true}).waitFor();
     assert.equal(await page.getByRole("link",{name:"Parent run",exact:true}).getAttribute("href"),`/run/${run}/overview`);
+    await shot("fork");
     const controls = page.locator("#controls");
     await controls.getByRole("button",{name:"Pause",exact:true}).click();
     await controls.getByRole("button",{name:"Resume",exact:true}).click();
