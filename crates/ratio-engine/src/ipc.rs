@@ -452,15 +452,26 @@ impl Route<'_> {
 
     pub fn schema(self) -> Value {
         let limit = self.message_limit();
+        let stakeholder = !self.mailbox.is_worker(self.sender);
+        let recipients = self
+            .mailbox
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                *index != self.sender && (!stakeholder || self.mailbox.is_worker(*index))
+            })
+            .map(|(_, member)| &member.id)
+            .collect::<Vec<_>>();
         json!({
             "type":"function",
             "function":{
                 "name":"send_message",
-                "description":format!("Send a concise message to a roster ID. Prefer BWP. Max {limit} UTF-8 bytes."),
+                "description":format!("Send to a listed ID. Stay below {limit} UTF-8 bytes."),
                 "parameters":{
                     "type":"object",
                     "properties":{
-                        "to":{"type":"string"},
+                        "to":{"type":"string","enum":recipients},
                         "message":{"type":"string","maxLength":limit},
                         "reply_sequence":{"type":"integer"}
                     },
@@ -662,6 +673,14 @@ mod tests {
             128,
         )
         .for_workers(2);
+        let stakeholder_route = Route {
+            mailbox: &mailbox,
+            sender: 2,
+        };
+        assert_eq!(
+            stakeholder_route.schema()["function"]["parameters"]["properties"]["to"]["enum"],
+            json!(["worker_1", "worker_2"])
+        );
         let send = |sender, to, message: &str| {
             send(
                 Route {

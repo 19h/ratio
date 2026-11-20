@@ -95,7 +95,9 @@ impl SharedMemory {
                     "invalid tool result ID"
                 );
                 let source = dialogue.evidence_for(&id, author, 0).with_context(|| {
-                    format!("no recorded result for tool call {id:?} in current context")
+                    format!(
+                        "no recorded result for {id:?} in current context. Use an exact tool name for its latest local result, an exact call ID, or a delivered evidence ID. Omit evidence if none is available"
+                    )
                 })?;
                 let entry = Evidence {
                     call_id: source.call_id,
@@ -217,8 +219,12 @@ struct Recall {
 pub(crate) fn schemas() -> [Value; 2] {
     [
         json!({"type":"function","function":{
-            "name":"remember", "description":"Save an attributed note for all agents in this run. Include evidence or uncertainty.",
-            "parameters":{"type":"object", "properties":{"topic":{"type":"string","maxLength":MAX_TOPIC},"note":{"type":"string","maxLength":MAX_NOTE},"evidence":{"type":"array","maxItems":8,"items":{"type":"string"},"description":"Recorded tool call IDs in your current context"}},"required":["topic","note"],"additionalProperties":false}
+            "name":"remember", "description":format!("Save a shared note. Topic/note: {MAX_TOPIC}/{MAX_NOTE} UTF-8 bytes."),
+            "parameters":{"type":"object", "properties":{
+                "topic":{"type":"string","maxLength":MAX_TOPIC},
+                "note":{"type":"string","maxLength":MAX_NOTE},
+                "evidence":{"type":"array","maxItems":8,"items":{"type":"string"},"description":"Optional: tool name (latest result), call ID or delivered evidence ID."}
+            },"required":["topic","note"],"additionalProperties":false}
         }}),
         json!({"type":"function","function":{
             "name":"recall", "description":"Read recent shared notes. Query matches all words in topic or note. Use before_id to continue.",

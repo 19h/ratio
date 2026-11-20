@@ -796,7 +796,10 @@ pub async fn check(config: &Config, name: &str) -> Result<Value> {
             "configured MCP tool {tool:?} was not advertised"
         );
     }
-    Ok(json!({"tools":listing.into_values().collect::<Vec<_>>() }))
+    Ok(json!({
+        "tools":listing.into_values().collect::<Vec<_>>(),
+        "inspection_tools":server.inspection_tools,
+    }))
 }
 
 struct Client {

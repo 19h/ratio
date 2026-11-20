@@ -1340,7 +1340,7 @@ impl<'a> Orchestrator<'a> {
         let enabled = members.len() > 1;
         let roster = mailbox.roster();
         let mut panel = members.iter().map(|(id, role, agent)| {
-            let mut prompt = format!("You are {role} {}. {}\nInspect the workspace and critique this phase's draft. Give concrete findings to the lead reviewer.", agent.name, agent.persona);
+            let mut prompt = format!("You are {role} {}. {}\nInspect the workspace and critique this phase's draft. The lead reviewer receives your final assessment. Put concrete findings and escalations there.", agent.name, agent.persona);
             if enabled {
                 prompt.push_str(&format!("\nYour ID: {id}\nPhase roster:\n{roster}\nUse send_message to exchange evidence or focused questions with other participants. Incoming messages arrive at request boundaries, even after an earlier assessment.\n{}", ipc::BWP));
             }
@@ -2029,7 +2029,7 @@ impl<'a> Orchestrator<'a> {
             let task = if implicit {
                 session.dialogue.current_task()
             } else if coordinating {
-                role.push_str("Phase: coordinate. Native file tools are read-only. Identify your task, dependencies and exclusive write paths. Report conflicts and your proposed assignment to the lead reviewer.");
+                role.push_str("Phase: coordinate. Native file tools are read-only. Identify your task, dependencies and exclusive write paths. Put conflicts and your proposed assignment in your final assessment for the lead reviewer.");
                 if peer_exchange {
                     let next = mailbox.id((index + 1) % workers.len());
                     role.push_str(&format!("\nCall send_message to {next} before finishing, with your proposed task and exclusive write paths."));
@@ -2670,7 +2670,7 @@ fn plan_schema(worker_count: usize, require_graph: bool) -> Value {
         .map(|id| (id.clone(), path_list.clone()))
         .collect();
     let mut schema = json!({"type":"function","function":{"name":"submit_plan",
-        "description":"Freeze the plan. Include each assignment in plan; ownership maps every worker_N to its exclusive paths. Use [] for read-only workers.",
+        "description":"Freeze the plan. Map every worker_N to exclusive write paths. Directory claims include all descendants. If workers share a directory, assign distinct subdirectories or individual files. Use [] for read-only workers.",
         "parameters":{"type":"object","properties":{"plan":{"type":"string"},
           "ownership":{"type":"object","properties":ownership,"required":ids,"additionalProperties":false}
         },"required":["plan","ownership"],"additionalProperties":false}}});
@@ -2825,14 +2825,19 @@ fn parse_plan(
                     Err(error) => return Err(error.into()),
                 }
             }
-            ensure!(
-                !ownership
+            for (other_index, other_paths) in ownership.iter().enumerate() {
+                if let Some(other) = other_paths
                     .iter()
-                    .flatten()
-                    .any(|other| other.includes(&entry.path) || entry.includes(&other.path)),
-                "overlapping worker write path {:?}",
-                entry.path
-            );
+                    .find(|other| other.includes(&entry.path) || entry.includes(&other.path))
+                {
+                    anyhow::bail!(
+                        "overlapping worker write paths: {id} claims {:?} and worker_{} claims {:?}. Assign distinct subdirectories or individual files",
+                        entry.path,
+                        other_index + 1,
+                        other.path
+                    );
+                }
+            }
         }
         paths.sort_by(|left, right| {
             left.path

@@ -2661,7 +2661,16 @@ phases = ["review"]
             .unwrap_or_default();
         let content = request["messages"].to_string();
         let (response, defer) = if system.contains("Your ID: reviewer_1") {
-            assert!(request["tools"].to_string().contains("\"send_message\""));
+            let send = request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|schema| schema["function"]["name"] == "send_message")
+                .unwrap();
+            assert_eq!(
+                send["function"]["parameters"]["properties"]["to"]["enum"],
+                json!(["stakeholder_1"])
+            );
             assert!(system.contains("stakeholder_1: Release stakeholder"));
             if !reviewer_started {
                 reviewer_started = true;
@@ -3173,6 +3182,17 @@ persona = "Own worker_3.txt."
                 if staged && freeze_attempts == 3 {
                     assert!(all_messages.contains("worker_3"));
                     assert!(all_messages.contains("missing"));
+                }
+                if !staged && freeze_attempts == 1 {
+                    submission["ownership"]["worker_1"] =
+                        json!([{"path":"tools/generate.py","directory":false}]);
+                    submission["ownership"]["worker_3"] =
+                        json!([{"path":"tools","directory":true}]);
+                }
+                if !staged && freeze_attempts == 2 {
+                    assert!(all_messages.contains("worker_3 claims"));
+                    assert!(all_messages.contains("worker_1 claims"));
+                    assert!(all_messages.contains("tools/generate.py"));
                 }
             }
             (calls(&[tool("plan", "submit_plan", submission)]), false)
