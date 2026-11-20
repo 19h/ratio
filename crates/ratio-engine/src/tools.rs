@@ -24,7 +24,7 @@ pub(crate) mod skills;
 #[cfg(windows)]
 mod windows_job;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
 pub enum Access {
     Inspect,
     Work,
@@ -41,8 +41,14 @@ pub struct Tools<'a> {
 }
 
 impl Tools<'_> {
-    fn allows_shell(&self) -> bool {
+    pub(crate) fn allows_shell(&self) -> bool {
         matches!(self.access, Access::Work) || self.allow_inspection_shell
+    }
+
+    pub(crate) fn validate_shell(call: &ToolCall) -> Result<()> {
+        let args: Shell = crate::api::tool_arguments(&call.function.arguments)?;
+        args.command.into_script()?;
+        Ok(())
     }
 
     pub fn schemas(&self) -> Vec<Value> {
@@ -902,7 +908,7 @@ async fn capture(
     })
 }
 
-fn schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+pub(crate) fn schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
         "type": "function",
         "function": {

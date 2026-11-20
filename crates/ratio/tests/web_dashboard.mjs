@@ -105,7 +105,17 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
         tasks:[{id:"inspect",worker:"worker_1",description:"Inspect interfaces",depends_on:[],acceptance:["Evidence captured"]}],
       }));
       else if (tools.has("ack_plan")) output = completion(null,call("ack_plan",{plan_id:tools.get("ack_plan").properties.plan_id.enum[0]}));
-      else if (tools.has("submit_verdict")) output = completion(null,call("submit_verdict",{verdict:"approved",assessment:"MCP evidence verified"}));
+      else if (system.startsWith("Investigate the question")) output = completion("Public fixture specialist conclusion.");
+      else if (tools.has("submit_verdict")) {
+        const previous = JSON.stringify(input.messages);
+        if (previous.includes("Public fixture specialist conclusion.")) {
+          output = completion(null, call("submit_verdict", {verdict:"approved", assessment:"MCP evidence verified"}));
+        } else if (previous.includes("verify-fixture")) {
+          output = completion(null, call("await_jobs", {jobs:[1]}));
+        } else {
+          output = completion(null, call("delegate", {role:"research", task:"Inspect the recorded fixture evidence."}, "verify-fixture"));
+        }
+      }
       else if (system.includes("Phase: execute")) {
         if (system.includes("worker_2")) output = completion("Reviewed integration evidence.");
         else if (!workerCalled) {
@@ -449,6 +459,29 @@ tools = ["inspect"]
     await page.locator('.entry.selected[data-kind="tool_result"]').getByText("Running",{exact:true}).waitFor();
     await inspection.getByRole("link",{name:"Jump to chat",exact:true}).click();
     await page.locator(".entry.selected .highlight").waitFor();
+    await page.locator("#controls").getByRole("button",{name:"Fork",exact:true}).waitFor();
+    await page.getByRole("button", {name:"Share", exact:true}).click();
+    await page.getByRole("button", {name:"Create link", exact:true}).click();
+    await page.locator("#share-url").waitFor();
+    const jobShare = new URL(await page.locator("#share-url").inputValue());
+    const sharedJobs = await (await publicRead(publicPath + "/history?kind=job", shareToken(jobShare))).json();
+    assert.equal(sharedJobs.rows.length, 1);
+    assert.equal(sharedJobs.rows[0].data.state, "completed");
+    assert.equal(sharedJobs.rows[0].data.specialist, "job-1");
+    const jobDetail = await (await publicRead(publicPath + "/entry/job-1", shareToken(jobShare))).json();
+    assert.equal(jobDetail.outcome.data.output.text, "Public fixture specialist conclusion.");
+    assert.ok(jobDetail.turn.data.calls.some(call => call.tool === "delegate"));
+    const jobVisitor = await browser.newPage();
+    await jobVisitor.goto(jobShare.href);
+    await jobVisitor.locator("#navigation").getByRole("link",{name:"Tools & files"}).click();
+    await jobVisitor.getByRole("link",{name:"Jobs",exact:true}).click();
+    await jobVisitor.waitForURL(url => url.searchParams.get("tab") === "jobs");
+    await jobVisitor.getByRole("link",{name:"Specialist conversation",exact:true}).click();
+    await jobVisitor.getByRole("heading",{name:"Research",exact:true}).waitFor();
+    await jobVisitor.getByText("Public fixture specialist conclusion.",{exact:true}).first().waitFor();
+    assert.equal(await jobVisitor.locator("#controls button").count(), 0);
+    await jobVisitor.close();
+    await page.getByRole("button",{name:"Close",exact:true}).click();
     await page.setViewportSize({width:480,height:845});
     await shot("narrow");
     await page.getByRole("button",{name:"Toggle navigation"}).click();

@@ -5,6 +5,7 @@ pub mod config;
 pub mod context;
 pub mod events;
 pub mod ipc;
+mod jobs;
 mod journal;
 mod line_tags;
 mod memory;

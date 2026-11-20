@@ -32,6 +32,8 @@ struct Evidence {
     call_id: String,
     tool: String,
     digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_actor: Option<String>,
 }
 
 impl SharedMemory {
@@ -92,18 +94,14 @@ impl SharedMemory {
                     valid(&id, 128, false) && key.is_none_or(|key| !id.contains(key)),
                     "invalid tool result ID"
                 );
-                let (tool, output) = dialogue.result_for(&id).with_context(|| {
+                let source = dialogue.evidence_for(&id, author, 0).with_context(|| {
                     format!("no recorded result for tool call {id:?} in current context")
                 })?;
-                let digest = ring::digest::digest(&ring::digest::SHA256, output.as_bytes())
-                    .as_ref()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect();
                 let entry = Evidence {
-                    call_id: id,
-                    tool: tool.into(),
-                    digest,
+                    call_id: source.call_id,
+                    tool: source.tool,
+                    digest: source.digest,
+                    source_actor: (source.actor != author).then_some(source.actor),
                 };
                 if !evidence.contains(&entry) {
                     evidence.push(entry);
@@ -166,8 +164,14 @@ impl SharedMemory {
                 );
                 for evidence in &entry.evidence {
                     row.push_str(&format!(
-                        "  Evidence: {} {} SHA-256 {}\n",
-                        evidence.tool, evidence.call_id, evidence.digest
+                        "  Evidence: {} {} SHA-256 {}{}\n",
+                        evidence.tool,
+                        evidence.call_id,
+                        evidence.digest,
+                        evidence
+                            .source_actor
+                            .as_ref()
+                            .map_or_else(String::new, |actor| format!(" from {actor}"))
                     ));
                 }
                 let room = limit.saturating_sub(result.len() + 60);

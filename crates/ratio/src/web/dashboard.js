@@ -381,7 +381,7 @@ function filters(route, { actor = true, kind = false } = {}) {
   };
   form.append(node("input", { type: "search", name: "q", value: query.q ?? "", placeholder: "Search entries", "aria-label": "Search entries", spellcheck: "false" }),
     ...(actor ? [select("actor", "All agents", (state.summary?.event?.workflow?.agents ?? []).map(agent => [agent.id, agent.name]))] : []),
-    ...(kind ? [select("kind", "All event types", ["chat", "tool", "tool_result", "ipc", "phase", "brief", "proposal", "guidance", "triage", "triage_delivery", "compaction", "verification", "contract_error", "error", "control"].map(type => [type, title(type)]))] : []),
+    ...(kind ? [select("kind", "All event types", ["chat", "tool", "tool_result", "job", "job_delivery", "ipc", "phase", "brief", "proposal", "guidance", "triage", "triage_delivery", "compaction", "verification", "contract_error", "error", "control"].map(type => [type, title(type)]))] : []),
     node("input", { type: "number", min: "1", name: "cycle", value: query.cycle ?? "", placeholder: "Cycle", "aria-label": "Cycle" }),
     select("phase", "All phases", ["ProposeTeam", "Plan", "PlanConsult", "PlanSynthesize", "Coordinate", "FreezePlan", "Acknowledge", "Work", "OnboardWorker", "Review", "ReviewConsult", "ReviewSynthesize", "Publish"].map(phase => [phase, title(phase)])),
     node("button", { type: "submit" }, "Apply"));
@@ -391,6 +391,13 @@ function filters(route, { actor = true, kind = false } = {}) {
 function pagination(label, ...links) {
   const shown = links.filter(Boolean);
   return shown.length ? node("nav", { class: "pagination", "aria-label": label }, shown) : null;
+}
+
+function jobLink(data) {
+  if (data.specialist) return actorLink(data.specialist, "Specialist conversation");
+  if (data.job && ["delegate", "start_tool", "jobs"].includes(data.tool))
+    return go(`Job #${data.job}`, entryUrl(`job-${data.job}`, "tools", { tab: "jobs" }));
+  return null;
 }
 
 function historyCard(event, selected, call, anchor = true) {
@@ -406,9 +413,11 @@ function historyCard(event, selected, call, anchor = true) {
     body = node("div", { class: "tool-event" },
       link(tool, entryUrl(key), { class: "truncate", title: tool }),
       node("span", { class: "tool-event-state", "data-state": data.state }, title(data.state)),
-      data.path ? node("code", { class: "truncate tool-event-path", title: data.path }, data.path) : null,
+      data.path ? node("code", { class: "truncate tool-event-path", title: data.path }, data.path) : jobLink(data),
       data.turn ? link("Chat", entryUrl(data.turn, "history", { call: key }),
         { class: "tool-event-chat", title: "Open original chat turn", "aria-label": "Jump to chat" }) : null);
+  } else if (event.kind === "job_delivery") {
+    body = row(go(`Job #${data.job}`, entryUrl(data.call, "tools", { tab: "jobs" })), muted("Result delivered"));
   } else if (event.kind === "ipc") {
     body = [row(caption("To"), (data.to ?? []).map(id => actorLink(id)), pill(data.delivery)), pre(data.body)];
   } else if (event.kind === "triage") {
@@ -432,15 +441,19 @@ function toolName(data) {
 }
 
 function toolTable(rows, route, page) {
-  return table(["Time", "Tool", "Agent", "Path", "State", "Duration", "Conversation"], rows.map(event => {
+  const jobs = page === "tools" && route.query.tab === "jobs";
+  const columns = jobs ? ["Time", "Job", "Caller", "State", "Conversation"] :
+    ["Time", "Tool", "Agent", "Path", "State", "Duration", "Conversation"];
+  return table(columns, rows.map(event => {
     const call = event.data;
+    const path = call.path ? link(call.path, runUrl("tools", { tab: "files", path: call.path })) : "—";
+    const duration = call.elapsed_ms == null ? "—" : `${call.elapsed_ms} ms`;
     const cells = [time(event.timestamp_ms), link(toolName(call), entryUrl(event.key, page, route.query)),
-      actorLink(event.actor), call.path ? link(call.path, runUrl("tools", { tab: "files", path: call.path })) : "—", pill(call.state),
-      call.elapsed_ms === null || call.elapsed_ms === undefined ? "—" : `${call.elapsed_ms} ms`,
-      go("Jump to chat", entryUrl(call.turn, "history", { call: event.key }))];
+      actorLink(event.actor), ...(jobs ? [] : [path]), pill(call.state), ...(jobs ? [] : [duration]),
+      row(jobLink(call), call.turn ? go("Jump to chat", entryUrl(call.turn, "history", { call: event.key })) : null)];
     cells.selected = event.key === route.query.entry;
     return cells;
-  }), "tools");
+  }), jobs ? "jobs-table" : "tools");
 }
 
 function download(text, filename) {
@@ -479,7 +492,8 @@ function inspector(detail, close) {
     rows = [node("div", { class: "inspector-section" }, facts([
       ["Tool", code(toolName(data))], ["Agent", actorLink(event.actor)], ["State", pill(outcome.state)],
       ["Time", time(event.timestamp_ms)], ["Path", data.path ? code(data.path) : null]]),
-    go("Jump to chat", entryUrl(data.turn, "history", { call: data.call ?? event.key }))),
+    row(jobLink({ ...data, ...outcome }),
+      data.turn ? go("Jump to chat", entryUrl(data.turn, "history", { call: data.call ?? event.key })) : null)),
     detail.tool_stages?.length > 1 ? node("div", { class: "inspector-section" },
       caption("Tool lifecycle"), detail.tool_stages.map(stage => row(
         stage.key === event.key ? pill(stage.state) : go(title(stage.state), entryUrl(stage.key, "history", { kind: stage.state === "queued" ? "tool" : "tool_result" })),
@@ -721,15 +735,16 @@ async function historyView(route) {
   const tab = query.tab ?? "all";
   const matrix = page === "ipc" && tab === "matrix";
   const kind = page === "ipc" || (page === "agent" && tab === "ipc") ? "ipc" :
-    page === "tools" ? tab === "mcp" ? "mcp" : "tool" :
+    page === "tools" ? ({ mcp: "mcp", jobs: "job" }[tab] ?? "tool") :
       page === "agent" && tab === "tools" ? "tool" : query.kind;
-  const [historyData, chosen] = await Promise.all([
+  const [historyData, chosen, specialistEntry] = await Promise.all([
     matrix ? api(apiRun("routes", query)) : api(apiRun("history", { ...query, actor: actor ?? query.actor, kind,
       collapse_tools: page === "history" && !kind ? 1 : undefined,
       from: actor && tab === "ipc" && query.direction === "outgoing" ? actor : query.from,
       to: actor && tab === "ipc" && query.direction === "incoming" ? actor : query.to,
       path: tab === "files" ? query.path ?? "*" : query.path })),
     query.entry ? api(apiRun("entry/" + encodeURIComponent(query.entry))).catch(() => null) : null,
+    page === "agent" && /^job-\d+$/.test(actor) ? api(apiRun("entry/" + actor)).catch(() => null) : null,
   ]);
   let { rows } = historyData;
   const messages = page === "ipc" && !matrix ? exchanges(rows.filter(event =>
@@ -741,7 +756,9 @@ async function historyView(route) {
   const head = [];
   if (page === "agent") {
     const flow = state.summary.event?.workflow;
-    const agent = flow?.agents?.find(entry => entry.id === actor) ?? { id: actor, name: actor };
+    const specialist = specialistEntry?.event;
+    const agent = flow?.agents?.find(entry => entry.id === actor) ??
+      { id: actor, name: specialist ? toolName(specialist.data) : actor };
     const task = flow?.tasks?.find(entry => entry.task.worker === actor);
     const match = /^(worker|reviewer|stakeholder)_(\d+)$/.exec(actor ?? "");
     const persona = match ? state.summary[match[1] + "s"]?.[Number(match[2]) - 1]?.persona : null;
@@ -750,8 +767,9 @@ async function historyView(route) {
       pre(body, { class: "agent-field-text", tabindex: 0, "aria-label": label, "data-scroll": `agent-${label.toLowerCase()}` })) : null;
     head.push(node("section", { class: "band agent-band", "data-scroll": "agent-band" },
       node("div", { class: "hero" }, caption("Agent"), node("h1", { class: "hero-title" }, agent.name),
-        node("span", { class: "hero-sub" }, node("span", { class: `dot${active ? " live" : ""}`, "data-agent-dot": actor }), code(actor), task ? pill(task.state) : null)),
-      field("Task", task?.task?.description), field("Persona", persona),
+        node("span", { class: "hero-sub" }, node("span", { class: `dot${active ? " live" : ""}`, "data-agent-dot": actor }), code(actor), task ? pill(task.state) : null,
+          specialist ? go("Originating job", entryUrl(specialist.key, "tools", { tab: "jobs" })) : null)),
+      field("Task", task?.task?.description ?? asText(specialist?.data.arguments)), field("Persona", persona),
       pre(active?.text || "", { class: "preview", hidden: !active, "data-preview-actor": actor })),
     tabs(local, [["all", "Conversation"], ["ipc", "Incoming & outgoing IPC"], ["tools", "Tools"]], tab, query));
     if (tab === "ipc") head.push(node("nav", { class: "tabs sub", "aria-label": "Message direction" },
@@ -772,7 +790,7 @@ async function historyView(route) {
     head.push(heading(views[page] ?? "Timeline"));
   }
   if (page === "ipc") head.push(tabs(local, [["all", "Sequence"], ["lanes", "Agent lanes"], ["matrix", "Route matrix"]], tab, query));
-  if (page === "tools") head.push(tabs(local, [["all", "All tools"], ["mcp", "MCP"], ["files", "File activity"]], tab, query));
+  if (page === "tools") head.push(tabs(local, [["all", "All tools"], ["jobs", "Jobs"], ["mcp", "MCP"], ["files", "File activity"]], tab, query));
   if (query.path && tab === "files") head.push(node("div", { class: "scope" }, caption("File"), code(query.path), go("All files", runUrl("tools", { tab: "files" }))));
   if ((page === "ipc" && (query.from || query.to || query.worker_request)) ||
       (page === "agent" && query.worker_request)) head.push(node("div", { class: "scope" },
@@ -785,7 +803,7 @@ async function historyView(route) {
   }
   let content;
   if (page === "ipc") content = matrix ? routeMatrix(rows, query) : communication(messages, query, focus);
-  else if (page === "tools" || tab === "tools") content = section({ label: tab === "mcp" ? "MCP calls" : "Tool calls", meta: rows.length || null, flush: true }, toolTable(rows, route, local));
+  else if (page === "tools" || tab === "tools") content = section({ label: tab === "jobs" ? "Jobs" : tab === "mcp" ? "MCP calls" : "Tool calls", meta: rows.length || null, flush: true }, toolTable(rows, route, local));
   else content = node("section", { class: "timeline", "aria-label": "Recorded timeline" }, rows.length
     ? rows.map(event => historyCard(event, query.entry, query.call))
     : empty("No matching entries."));

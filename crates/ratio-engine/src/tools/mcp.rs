@@ -46,6 +46,7 @@ type ConnectionSlot = Rc<tokio::sync::Mutex<Option<Client>>>;
 #[derive(Default)]
 pub(crate) struct Connections {
     clients: RefCell<BTreeMap<ConnectionKey, ConnectionSlot>>,
+    calls: RefCell<BTreeMap<ConnectionKey, Rc<tokio::sync::Mutex<()>>>>,
     refreshed: Option<RefCell<BTreeMap<ConnectionKey, BTreeMap<String, bool>>>>,
 }
 
@@ -59,6 +60,22 @@ impl Connections {
 
     pub(crate) fn clear(&self) {
         self.clients.borrow_mut().clear();
+        self.calls.borrow_mut().clear();
+    }
+
+    pub(crate) fn close_specialists(&self) {
+        let ordinary = |actor: &str| !actor.starts_with("job-") && !actor.starts_with("operator:");
+        self.clients
+            .borrow_mut()
+            .retain(|(_, actor, _), _| ordinary(actor));
+        self.calls
+            .borrow_mut()
+            .retain(|(_, actor, _), _| ordinary(actor));
+        if let Some(refreshed) = &self.refreshed {
+            refreshed
+                .borrow_mut()
+                .retain(|(_, actor, _), _| ordinary(actor));
+        }
     }
 
     pub(crate) fn model_turn(&self, actor: &str, workspace: &Path) {
@@ -75,6 +92,9 @@ impl Connections {
 
     pub(crate) fn close_worker(&self, actor: &str) {
         self.clients
+            .borrow_mut()
+            .retain(|(_, owner, _), _| owner != actor);
+        self.calls
             .borrow_mut()
             .retain(|(_, owner, _), _| owner != actor);
     }
@@ -107,7 +127,7 @@ impl SearchQuery {
 }
 
 enum Operation<'a> {
-    Call(&'a str, &'a Map<String, Value>),
+    Call(&'a str, &'a Map<String, Value>, bool),
     List {
         name: Option<&'a str>,
         offset: usize,
@@ -204,11 +224,93 @@ pub(crate) async fn dispatch(
     output_limit: usize,
     key: Option<&str>,
 ) -> (String, String) {
+    dispatch_mode(
+        sessions,
+        actor,
+        servers,
+        access,
+        call,
+        workspace,
+        time_limit,
+        output_limit,
+        key,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_background(
+    sessions: &Connections,
+    actor: &str,
+    servers: &BTreeMap<String, McpServer>,
+    access: Access,
+    call: &ToolCall,
+    workspace: &Path,
+    time_limit: Duration,
+    output_limit: usize,
+    key: Option<&str>,
+) -> (String, String) {
+    dispatch_mode(
+        sessions,
+        actor,
+        servers,
+        access,
+        call,
+        workspace,
+        time_limit,
+        output_limit,
+        key,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_mode(
+    sessions: &Connections,
+    actor: &str,
+    servers: &BTreeMap<String, McpServer>,
+    access: Access,
+    call: &ToolCall,
+    workspace: &Path,
+    time_limit: Duration,
+    output_limit: usize,
+    key: Option<&str>,
+    background: bool,
+) -> (String, String) {
     let same = |text: String| (text.clone(), text);
+    let connection = serde_json::from_str::<Value>(&call.function.arguments)
+        .ok()
+        .and_then(|arguments| {
+            let name = arguments["server"].as_str()?;
+            let server = servers.get(name)?;
+            (server.lifetime == McpLifetime::Worker)
+                .then(|| (name.to_owned(), actor.to_owned(), workspace.to_owned()))
+        });
+    let slot = connection.as_ref().map(|key| {
+        sessions
+            .calls
+            .borrow_mut()
+            .entry(key.clone())
+            .or_default()
+            .clone()
+    });
+    // Wait outside the RPC timeout. A queued call must not reset an active
+    // worker connection while that connection is serving another call.
+    let _lease = match &slot {
+        Some(slot) => Some(slot.lock().await),
+        None => None,
+    };
+    let reset_connection = || {
+        if let Some(key) = &connection {
+            sessions.clients.borrow_mut().remove(key);
+        }
+    };
     let call_started = Cell::new(false);
     let (visible, full) = match timeout(
         time_limit,
-        run(
+        run_mode(
             sessions,
             actor,
             servers,
@@ -216,6 +318,7 @@ pub(crate) async fn dispatch(
             call,
             workspace,
             &call_started,
+            background,
         ),
     )
     .await
@@ -280,10 +383,7 @@ pub(crate) async fn dispatch(
         }
         Ok(Err(error)) if error.to_string().starts_with("REFUSED") => same(format!("{error:#}")),
         Ok(Err(error)) => {
-            sessions
-                .clients
-                .borrow_mut()
-                .retain(|(_, owner, path), _| owner != actor || path != workspace);
+            reset_connection();
             if error.to_string().starts_with(UNKNOWN_CALL) {
                 same(format!("{error:#}"))
             } else {
@@ -291,10 +391,7 @@ pub(crate) async fn dispatch(
             }
         }
         Err(_) => {
-            sessions
-                .clients
-                .borrow_mut()
-                .retain(|(_, owner, path), _| owner != actor || path != workspace);
+            reset_connection();
             if call_started.get() {
                 same(format!(
                     "{UNKNOWN_CALL}server timed out after possible dispatch"
@@ -311,15 +408,49 @@ pub(crate) async fn dispatch(
     (clip(&redact(visible), output_limit), redact(full))
 }
 
-async fn run(
+pub(crate) fn validate_call(
     sessions: &Connections,
     actor: &str,
     servers: &BTreeMap<String, McpServer>,
     access: Access,
     call: &ToolCall,
     workspace: &Path,
-    call_started: &Cell<bool>,
-) -> Result<(ConnectionKey, Output)> {
+) -> Result<()> {
+    let (input, _) = validated_request(servers, access, call)?;
+    let name = input.name.as_deref().context("mcp_call requires name")?;
+    let key = (input.server.clone(), actor.into(), workspace.to_owned());
+    ensure_schema(sessions, &key, name)
+}
+
+pub(crate) fn validate_call_policy(
+    servers: &BTreeMap<String, McpServer>,
+    access: Access,
+    call: &ToolCall,
+) -> Result<()> {
+    let (input, _) = validated_request(servers, access, call)?;
+    input.name.context("mcp_call requires name")?;
+    Ok(())
+}
+
+fn ensure_schema(sessions: &Connections, key: &ConnectionKey, name: &str) -> Result<()> {
+    ensure!(
+        sessions.refreshed.as_ref().is_none_or(|refreshed| {
+            refreshed
+                .borrow()
+                .get(key)
+                .and_then(|tools| tools.get(name))
+                == Some(&true)
+        }),
+        "REFUSED: Fetch the current schema with tool_search before calling {name:?} after restart."
+    );
+    Ok(())
+}
+
+fn validated_request<'a>(
+    servers: &'a BTreeMap<String, McpServer>,
+    access: Access,
+    call: &ToolCall,
+) -> Result<(Request, &'a McpServer)> {
     ensure!(call.kind == "function", "unsupported tool call type");
     ensure!(
         call.function.arguments.len() <= 128 * 1024,
@@ -341,21 +472,54 @@ async fn run(
             "REFUSED: MCP tool {name:?} is blocked by the configured tool policy for this phase. Use mcp_list for available tools."
         );
     }
+    Ok((input, server))
+}
+
+#[cfg(test)]
+async fn run(
+    sessions: &Connections,
+    actor: &str,
+    servers: &BTreeMap<String, McpServer>,
+    access: Access,
+    call: &ToolCall,
+    workspace: &Path,
+    call_started: &Cell<bool>,
+) -> Result<(ConnectionKey, Output)> {
+    run_mode(
+        sessions,
+        actor,
+        servers,
+        access,
+        call,
+        workspace,
+        call_started,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_mode(
+    sessions: &Connections,
+    actor: &str,
+    servers: &BTreeMap<String, McpServer>,
+    access: Access,
+    call: &ToolCall,
+    workspace: &Path,
+    call_started: &Cell<bool>,
+    background: bool,
+) -> Result<(ConnectionKey, Output)> {
+    let (input, server) = validated_request(servers, access, call)?;
     let key = (input.server.clone(), actor.into(), workspace.to_owned());
     let operation = match call.function.name.as_str() {
         "mcp_call" => {
             let name = input.name.as_deref().context("mcp_call requires name")?;
-            ensure!(
-                sessions.refreshed.as_ref().is_none_or(|refreshed| {
-                    refreshed
-                        .borrow()
-                        .get(&key)
-                        .and_then(|tools| tools.get(name))
-                        == Some(&true)
-                }),
-                "REFUSED: Fetch the current schema with tool_search before calling {name:?} after restart."
-            );
-            Operation::Call(name, &input.arguments)
+            let fresh_schema = match ensure_schema(sessions, &key, name) {
+                Ok(()) => false,
+                Err(_) if background => true,
+                Err(error) => return Err(error),
+            };
+            Operation::Call(name, &input.arguments, fresh_schema)
         }
         "mcp_list" => Operation::List {
             name: input.name.as_deref(),
@@ -412,7 +576,14 @@ async fn invoke(
     call_started: &Cell<bool>,
 ) -> Result<Output> {
     match operation {
-        Operation::Call(name, arguments) => {
+        Operation::Call(name, arguments, fresh_schema) => {
+            if fresh_schema {
+                let catalog = discover(client, server, access, Some(name), schema_entry).await?;
+                ensure!(
+                    catalog.contains_key(name),
+                    "REFUSED: queued MCP tool {name:?} is no longer available"
+                );
+            }
             call_started.set(true);
             let result = client
                 .rpc("tools/call", json!({"name":name,"arguments":arguments}))

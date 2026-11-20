@@ -241,6 +241,12 @@ A stakeholder addresses the reply to the requester. Ratio broadcasts it to all w
 
 `remember` stores author-attributed, run-scoped notes. An optional `evidence` list references up to eight tool results from the current context. Ratio checks the references and hashes the results. `recall` searches or pages through the shared notes. The checkpoint preserves up to 128 notes along with queued and delivered IPC.
 
+### On-demand work
+
+Agents can use `list_specialists` to find research, synthesis, adviser, memory, and tool operator roles, plus consultations using the configured workers' personas. `delegate` starts a separate conversation with a task and optional evidence references. Specialists can consult each other and return compact results. The tool operator uses configured MCP access within the caller's permissions.
+
+`start_tool` runs an authorized shell or MCP call in the background. Both submission tools return a job ID. An agent can continue working, check `job_status`, or use `await_jobs` to release its agent slot until the jobs finish. Results enter the caller's context at a model request boundary. Tight context windows can use a single `jobs` tool with an operation and arguments. The **Jobs** tab under **Tools & files** links back to the calling turn and to each specialist conversation.
+
 ## Workspace and publication
 
 The reviewer and stakeholders can list directories, read workspace files, and inspect Git changes. Native file tools confine paths to the workspace. After the team gate, native writes also check frozen path ownership.

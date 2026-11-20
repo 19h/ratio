@@ -3695,3 +3695,587 @@ fn wait_for_screen(terminal: &mut std::fs::File, display: &mut Vec<u8>, wanted: 
         }
     }
 }
+
+fn seed_job_fixture(root: &Path, panel: bool) -> String {
+    use ra::{
+        config::Worker,
+        session::{Phase, Session, Store, WorkerPlan, WritePath},
+    };
+    let mut session = Session::new("Fixture goal: test job scheduling.".into());
+    session.phase = Phase::Work;
+    if panel {
+        let workers = vec![Worker {
+            name: "Implementer".into(),
+            persona: "Fixture implementation persona.".into(),
+            model: None,
+        }];
+        let mut plan = WorkerPlan::freeze(
+            "Fixture assignment.".into(),
+            1,
+            1,
+            &workers,
+            vec![vec![WritePath {
+                path: "answer.txt".into(),
+                directory: false,
+            }]],
+        );
+        plan.acknowledgements = vec![0];
+        session.workers = Some(workers);
+        session.worker_plan = Some(plan);
+    }
+    Store::open(root).unwrap().save(&session).unwrap();
+    session.run_id().to_owned()
+}
+
+fn job_response(
+    responses: bool,
+    prose: Option<&str>,
+    call: Option<(&str, &str, Value)>,
+    done: bool,
+) -> (u16, Value) {
+    if responses {
+        let items = match call {
+            Some((id, name, arguments)) => vec![json!({
+                "type":"function_call","status":"completed","id":format!("fc_{id}"),
+                "call_id":id,"name":name,"arguments":arguments.to_string()
+            })],
+            None => vec![json!({
+                "type":"message","role":"assistant","status":"completed","id":"msg_mock",
+                "content":[{"type":"output_text","text":prose.unwrap()}]
+            })],
+        };
+        return stream_response_at_eof(
+            &[json!({"type":"response.completed","response":{
+                "status":"completed","output":items,"usage":{"input_tokens":15,"output_tokens":7}
+            }})],
+            done,
+        );
+    }
+    let (status, mut answer) = match call {
+        Some((id, name, arguments)) => calls(&[tool(id, name, arguments)]),
+        None => text(prose.unwrap()),
+    };
+    if done {
+        answer["test_terminal"] = json!(true);
+    }
+    (status, answer)
+}
+
+#[test]
+fn nested_specialist_jobs_release_the_only_slot_on_both_provider_apis() {
+    use ratio_engine::{audit::AuditFilter, session::Store};
+
+    for (api, panel) in [("chat-completions", true), ("responses", false)] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let config = root.join("ratio.toml");
+        let run = seed_job_fixture(root, panel);
+        std::fs::write(&config, "[orchestration]\nmax_parallel_agents = 1\n").unwrap();
+        std::fs::write(
+            root.join("evidence.txt"),
+            "PRIVATE RESEARCH TOOL TRANSCRIPT",
+        )
+        .unwrap();
+        let responses = api == "responses";
+        let (endpoint, server) = mock(move |_, request| {
+            let messages = request[if responses { "input" } else { "messages" }]
+                .as_array()
+                .unwrap();
+            if !responses {
+                assert_history(&request);
+            }
+            let system = messages[0]["content"].as_str().unwrap();
+            let history = serde_json::to_string(messages).unwrap();
+            let last = messages.last().unwrap();
+            let last_call = last[if responses { "call_id" } else { "tool_call_id" }].as_str();
+            let call =
+                |id, name, args| job_response(responses, None, Some((id, name, args)), false);
+            let report = |report| job_response(responses, Some(report), None, false);
+            let schemas = request["tools"].as_array().unwrap();
+            let has_tool = |name| {
+                schemas.iter().any(|schema| {
+                    schema[if responses { "name" } else { "function" }]
+                        .as_str()
+                        .or_else(|| schema["function"]["name"].as_str())
+                        == Some(name)
+                })
+            };
+            if system.starts_with("Produce a compact synthesis") {
+                assert!(!has_tool("create_file"));
+                match last_call {
+                    Some("consult-research") => {
+                        call("await-research", "await_jobs", json!({"jobs":[2]}))
+                    }
+                    Some("await-research") => {
+                        assert!(history.contains("research conclusion"));
+                        assert!(!history.contains("PRIVATE RESEARCH TOOL TRANSCRIPT"));
+                        report("synthesis conclusion")
+                    }
+                    _ => call(
+                        "consult-research",
+                        "delegate",
+                        json!({"role":"research","task":"Investigate fixture evidence."}),
+                    ),
+                }
+            } else if system.starts_with("Investigate the question") {
+                match last_call {
+                    Some("cycle") => {
+                        assert!(history.contains("already occurs in this job ancestry"));
+                        call("evidence-read", "read_file", json!({"path":"evidence.txt"}))
+                    }
+                    Some("evidence-read") => {
+                        assert!(history.contains("PRIVATE RESEARCH TOOL TRANSCRIPT"));
+                        call(
+                            "consult-memory",
+                            "delegate",
+                            json!({
+                                "role":"memory","task":"Record the evidence.","evidence":["read_file"]
+                            }),
+                        )
+                    }
+                    Some("consult-memory") => {
+                        call("await-memory", "await_jobs", json!({"jobs":[3]}))
+                    }
+                    Some("await-memory") => {
+                        assert!(history.contains("Evidence recorded."));
+                        report("research conclusion")
+                    }
+                    _ => call(
+                        "cycle",
+                        "delegate",
+                        json!({"role":"synthesis","task":"Repeat the ancestor."}),
+                    ),
+                }
+            } else if system.starts_with("Retrieve or organize shared run memory") {
+                assert!(has_tool("remember") && !has_tool("read_file"));
+                assert!(
+                    history.contains("source_1 from job-2")
+                        && history.contains("PRIVATE RESEARCH TOOL TRANSCRIPT")
+                );
+                if last_call == Some("record-source") {
+                    assert!(history.contains("Saved shared memory 1"));
+                    report("Evidence recorded.")
+                } else {
+                    call(
+                        "record-source",
+                        "remember",
+                        json!({"topic":"fixture","note":"Fixture evidence checked.","evidence":["source_1"]}),
+                    )
+                }
+            } else if has_tool("submit_verdict") {
+                job_response(
+                    responses,
+                    None,
+                    Some((
+                        "review",
+                        "submit_verdict",
+                        json!({
+                            "verdict":"approved","assessment":"Nested delegation verified."
+                        }),
+                    )),
+                    true,
+                )
+            } else {
+                assert!(has_tool("list_specialists"));
+                assert!(!history.contains("PRIVATE RESEARCH TOOL TRANSCRIPT"));
+                assert!(!history.contains("research conclusion"));
+                match last_call {
+                    Some("consult-synthesis") => {
+                        call("await-synthesis", "await_jobs", json!({"jobs":[1]}))
+                    }
+                    Some("await-synthesis") => {
+                        assert!(history.contains("synthesis conclusion"));
+                        report("Implementation consumed the specialist result.")
+                    }
+                    _ => call(
+                        "consult-synthesis",
+                        "delegate",
+                        json!({"role":"synthesis","task":"Summarize the fixture evidence."}),
+                    ),
+                }
+            }
+        });
+        let mut args = vec!["--resume", "--config", config.to_str().unwrap()];
+        if responses {
+            args.extend(["--provider-api", "responses"]);
+        }
+        succeeded(&cli_window(root, &endpoint, "8192", &args));
+        server.join().unwrap();
+        let reader = Store::reader(root).unwrap();
+        let jobs = reader
+            .audit(
+                &run,
+                AuditFilter {
+                    kind: Some("job"),
+                    ..AuditFilter::default()
+                },
+                30,
+            )
+            .unwrap();
+        assert_eq!(jobs.len(), 3);
+        for (id, result) in [
+            (1, "synthesis conclusion"),
+            (2, "research conclusion"),
+            (3, "Evidence recorded."),
+        ] {
+            let key = format!("job-{id}");
+            let job = reader.audit_event(&run, &key).unwrap().unwrap();
+            assert_eq!(job.data["specialist"], key);
+            assert!(job.data["turn"].is_string());
+            let outcome = reader.audit_outcome(&run, &key).unwrap().unwrap();
+            assert_eq!(outcome.data["state"], "completed");
+            assert_eq!(outcome.data["output"]["text"], result);
+        }
+        let delivered = reader
+            .audit(
+                &run,
+                AuditFilter {
+                    kind: Some("job_delivery"),
+                    ..AuditFilter::default()
+                },
+                30,
+            )
+            .unwrap();
+        assert_eq!(delivered.len(), 3);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn background_shell_allows_a_model_turn_and_defers_same_worker_mutation() {
+    use ratio_engine::{audit::AuditFilter, session::Store};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_owned();
+    let workspace = root.clone();
+    let config = root.join("ratio.toml");
+    let run = seed_job_fixture(&root, true);
+    std::fs::write(&config, "[orchestration]\nmax_parallel_agents = 1\n").unwrap();
+    let (endpoint, server) = mock(move |_, request| {
+        assert_history(&request);
+        let messages = request["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        let history = serde_json::to_string(messages).unwrap();
+        if request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|schema| schema["function"]["name"] == "submit_verdict")
+        {
+            return decision("approved", "The mutation waited for the background shell.");
+        }
+        match last["tool_call_id"].as_str() {
+            Some("start-background") => {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while !workspace.join("shell-started").exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "shell did not start while the caller continued"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                std::fs::write(workspace.join("model-continued"), "").unwrap();
+                calls(&[tool(
+                    "later-write",
+                    "create_file",
+                    json!({"path":"answer.txt","content":"ready"}),
+                )])
+            }
+            Some("later-write") => {
+                assert!(history.contains("background shell finished"), "{history}");
+                assert_eq!(
+                    std::fs::read_to_string(workspace.join("answer.txt")).unwrap(),
+                    "ready"
+                );
+                text("Background shell and subsequent write finished.")
+            }
+            _ => calls(&[tool(
+                "start-background",
+                "start_tool",
+                json!({
+                    "tool":"shell", "arguments":{"command":[
+                        "touch shell-started",
+                        "i=0; until test -f model-continued; do i=$((i + 1)); test \"$i\" -lt 200 || exit 1; sleep 0.02; done",
+                        "sleep 0.1; test ! -e answer.txt || exit 1; echo background shell finished"
+                    ],"workdir":null}
+                }),
+            )]),
+        }
+    });
+    succeeded(&cli_window(
+        &root,
+        &endpoint,
+        "8192",
+        &["--resume", "--config", config.to_str().unwrap()],
+    ));
+    server.join().unwrap();
+    let reader = Store::reader(&root).unwrap();
+    let jobs = reader
+        .audit(
+            &run,
+            AuditFilter {
+                kind: Some("job"),
+                ..AuditFilter::default()
+            },
+            30,
+        )
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].data["state"], "completed");
+    let deferred_write = reader
+        .audit(
+            &run,
+            AuditFilter {
+                kind: Some("tool_result"),
+                ..AuditFilter::default()
+            },
+            60,
+        )
+        .unwrap()
+        .into_iter()
+        .find(|event| event.data["tool"] == "create_file" && event.data["state"] == "completed")
+        .unwrap();
+    assert!(jobs[0].sequence < deferred_write.sequence);
+}
+
+#[cfg(unix)]
+#[test]
+fn operator_jobs_share_mcp_state_and_background_calls_do_not_hold_agent_slots() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().to_owned();
+    let config = workspace.join("ratio.toml");
+    seed_job_fixture(&workspace, true);
+    std::fs::write(&config, r#"
+[orchestration]
+max_parallel_agents = 1
+
+[mcp_servers.fixture]
+command = "/bin/sh"
+args = ["-c", '''
+    IFS= read -r frame
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}}'
+    IFS= read -r frame
+    id=1
+    count=0
+    while IFS= read -r frame; do
+        id=$((id + 1))
+        case "$frame" in
+            *tools/list*) result='{"tools":[{"name":"increment","inputSchema":{"type":"object"}}]}' ;;
+            *'"name":"increment"'*)
+                count=$((count + 1))
+                if test "$count" -eq 2; then
+                    touch mcp-started
+                    i=0
+                    until test -e model-progress; do
+                        i=$((i + 1)); test "$i" -lt 200 || exit 1
+                        sleep 0.02
+                    done
+                fi
+                result="{\"fixture_count\":$count}"
+                ;;
+            *) exit 1 ;;
+        esac
+        printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+    done
+''']
+allow_all = true
+lifetime = "worker"
+"#).unwrap();
+    let model_workspace = workspace.clone();
+    let (endpoint, server) = mock(move |_, request| {
+        assert_history(&request);
+        let messages = request["messages"].as_array().unwrap();
+        let system = messages[0]["content"].as_str().unwrap();
+        let history = serde_json::to_string(messages).unwrap();
+        let last = messages.last().unwrap();
+        let call = |id, name, args| calls(&[tool(id, name, args)]);
+        let mcp_args = || json!({"server":"fixture","name":"increment"});
+        let schemas = request["tools"].as_array().unwrap();
+        let has = |name| schemas.iter().any(|tool| tool["function"]["name"] == name);
+        if system.starts_with("Handle the requested operation") {
+            assert!(!has("shell") && !has("create_file") && has("mcp_call"));
+            let second = history.contains("Second increment.");
+            match last["tool_call_id"].as_str() {
+                Some("discover-increment") if second => call(
+                    "async-increment",
+                    "start_tool",
+                    json!({
+                        "tool":"mcp_call","arguments":mcp_args()
+                    }),
+                ),
+                Some("discover-increment") => call("sync-increment", "mcp_call", mcp_args()),
+                Some("sync-increment") => {
+                    assert!(history.contains(r#"fixture_count\":1"#));
+                    text("First increment returned one.")
+                }
+                Some("async-increment") => {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                    while !model_workspace.join("mcp-started").exists() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "shared MCP call did not advance"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    std::fs::write(model_workspace.join("model-progress"), "").unwrap();
+                    call("await-increment", "await_jobs", json!({"jobs":[3]}))
+                }
+                Some("await-increment") => {
+                    assert!(
+                        history.contains("fixture_count") && history.contains(":2"),
+                        "{history}"
+                    );
+                    text("Second increment returned two.")
+                }
+                _ => call(
+                    "discover-increment",
+                    "tool_search",
+                    json!({"server":"fixture","query":["increment"]}),
+                ),
+            }
+        } else if has("submit_verdict") {
+            match last["tool_call_id"].as_str() {
+                Some("review-consult") => call(
+                    "early-verdict",
+                    "submit_verdict",
+                    json!({
+                        "verdict":"approved","assessment":"Do not accept an early verdict."
+                    }),
+                ),
+                Some("early-verdict") => {
+                    assert!(history.contains("Job results are ready"));
+                    assert!(history.contains("The mutation is unavailable in review."));
+                    decision("approved", "MCP state and decision gate verified.")
+                }
+                _ => call(
+                    "review-consult",
+                    "delegate",
+                    json!({"role":"research","task":"Test review’s MCP inspection permissions."}),
+                ),
+            }
+        } else if system.starts_with("Investigate the question") {
+            assert!(!has("mcp_call") && !has("start_tool"));
+            if last["tool_call_id"] == "forbidden-mcp" {
+                assert!(history.contains("REFUSED"));
+                text("The mutation is unavailable in review.")
+            } else {
+                call(
+                    "forbidden-mcp",
+                    "start_tool",
+                    json!({"tool":"mcp_call","arguments":mcp_args()}),
+                )
+            }
+        } else {
+            match last["tool_call_id"].as_str() {
+                Some("first-operator") => call("wait-first", "await_jobs", json!({"jobs":[1]})),
+                Some("wait-first") => {
+                    assert!(history.contains("First increment returned one."));
+                    call(
+                        "second-operator",
+                        "delegate",
+                        json!({"role":"tool_operator","task":"Second increment."}),
+                    )
+                }
+                Some("second-operator") => call("wait-second", "await_jobs", json!({"jobs":[2]})),
+                Some("wait-second") => {
+                    assert!(history.contains("Second increment returned two."));
+                    call("other-agents-job", "job_status", json!({"job":3}))
+                }
+                Some("other-agents-job") => {
+                    assert!(history.contains("unknown job for this caller"));
+                    text("Both operator calls completed.")
+                }
+                _ => call(
+                    "first-operator",
+                    "delegate",
+                    json!({"role":"tool_operator","task":"First increment."}),
+                ),
+            }
+        }
+    });
+    succeeded(&cli_window(
+        &workspace,
+        &endpoint,
+        "8192",
+        &["--resume", "--config", config.to_str().unwrap()],
+    ));
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_background_shell_is_reported_unknown_without_replay() {
+    use ratio_engine::{audit::AuditFilter, session::Store};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let run = seed_job_fixture(root, false);
+    let (endpoint, server) = mock(|index, _| match index {
+        0 => calls(&[tool(
+            "start-once",
+            "start_tool",
+            json!({
+                "tool":"shell","arguments":{"command":["echo once >> dispatches","sleep 30"],"workdir":null}
+            }),
+        )]),
+        1 => {
+            let (status, mut response) =
+                calls(&[tool("wait-once", "await_jobs", json!({"jobs":[1]}))]);
+            response["test_terminal"] = json!(true);
+            (status, response)
+        }
+        _ => panic!("unexpected request before interruption"),
+    });
+    let exhausted = cli_window(
+        root,
+        &endpoint,
+        "8192",
+        &["--resume", "--max-run-secs", "2"],
+    );
+    server.join().unwrap();
+    assert!(
+        String::from_utf8_lossy(&exhausted.stderr).contains("active time")
+            || String::from_utf8_lossy(&exhausted.stdout).contains("active time")
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches")).unwrap(),
+        "once\n"
+    );
+    let (endpoint, server) = mock(|index, request| {
+        if index == 0 {
+            let history = request["messages"].to_string();
+            assert!(history.contains("Tool outcome unknown"));
+            assert!(history.contains("wait-once"));
+            text("Interrupted outcome observed.")
+        } else {
+            decision("approved", "Resume preserved the original dispatch.")
+        }
+    });
+    succeeded(&cli_window(
+        root,
+        &endpoint,
+        "8192",
+        &["--resume", "--max-run-secs", "0"],
+    ));
+    server.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches")).unwrap(),
+        "once\n"
+    );
+    let reader = Store::reader(root).unwrap();
+    assert_eq!(
+        reader.audit_outcome(&run, "job-1").unwrap().unwrap().data["state"],
+        "unknown"
+    );
+    let deliveries = reader
+        .audit(
+            &run,
+            AuditFilter {
+                kind: Some("job_delivery"),
+                ..AuditFilter::default()
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+}

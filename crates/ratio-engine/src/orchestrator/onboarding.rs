@@ -394,6 +394,7 @@ impl Orchestrator<'_> {
             staging: None,
             admission_run: None,
             triage_run: None,
+            jobs: None,
         }
     }
 

@@ -627,6 +627,7 @@ impl RunReader {
                 AND NOT (kind='chat' AND coalesce(json_array_length(data,'$.calls'),0)>0
                     AND trim(coalesce(json_extract(data,'$.text.text'),json_extract(data,'$.text'),''),
                         char(9,10,11,12,13,32))=''))
+                OR (?5='job' AND kind='tool' AND a.key GLOB 'job-[0-9]*')
                 OR (?5='mcp' AND kind='tool' AND json_extract(data,'$.tool') IN ('mcp_list','tool_search','mcp_call')))
             AND (?6 IS NULL OR cycle=?6) AND (?7 IS NULL OR phase=?7)
             AND (?8 IS NULL OR sequence IN (SELECT rowid FROM audit_search WHERE audit_search MATCH ?8)

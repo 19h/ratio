@@ -18,6 +18,7 @@ use crate::{
     config::{Stakeholder, Worker},
     context::Dialogue,
     ipc::{GateState, MailboxState},
+    jobs::Jobs,
     journal::CheckpointDetails,
     memory::SharedMemory,
 };
@@ -154,6 +155,8 @@ pub struct Session {
     pub(crate) panel: Option<PanelProgress>,
     #[serde(default, skip_serializing_if = "SharedMemory::is_empty")]
     pub(crate) memory: SharedMemory,
+    #[serde(default, skip_serializing_if = "Jobs::is_empty")]
+    pub(crate) jobs: Jobs,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -476,6 +479,7 @@ impl Session {
         } else {
             "lead_reviewer"
         };
+        self.jobs.for_each_dialogue(&mut visit);
         if self.phase != Phase::Work || self.worker_progress.is_empty() {
             visit(lead, &self.dialogue);
         }
@@ -544,6 +548,7 @@ impl Session {
             team_ipc: None,
             panel: None,
             memory: SharedMemory::default(),
+            jobs: Jobs::default(),
         }
     }
 }
@@ -763,7 +768,7 @@ impl Store {
 
     pub(crate) fn save_with_traffic(&self, session: &Session, ipc: Vec<IpcEvent>) -> Result<()> {
         let bytes = serde_json::to_vec(session)?;
-        let mut audit = Vec::new();
+        let mut audit = session.jobs.audit();
         session.for_each_dialogue(|actor, dialogue| {
             let actor = actor
                 .strip_prefix("panel_")
@@ -794,6 +799,7 @@ impl Store {
             )
             .context("commit Ratio run checkpoint")?;
         session.for_each_dialogue(|_, dialogue| dialogue.audit.committed());
+        session.jobs.committed();
         // The JSON file remains a compatibility projection. Resume reads the journal.
         let mut temp = tempfile::NamedTempFile::new_in(&self.directory)?;
         temp.write_all(&bytes)?;

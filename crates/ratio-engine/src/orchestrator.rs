@@ -3,8 +3,10 @@ use std::{borrow::Cow, collections::HashSet, path::Path, sync::mpsc::Receiver, t
 use anyhow::{Context, Result, ensure};
 
 mod contracts;
+mod jobs;
 mod onboarding;
 mod triage;
+use self::jobs::{JobPeer, JobScheduler, JobScope};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use ratio_protocol::{RunStop, TaskGraph};
 use serde_json::{Value, json};
@@ -168,6 +170,7 @@ impl<'a> Orchestrator<'a> {
     ) -> Result<Session> {
         let candidate = staging.map(Staging::candidate);
         let workspace = candidate.as_deref().unwrap_or(&self.config.cwd);
+        session.jobs.recover(self.job_limit())?;
         if session.dialogue.recover_interrupted_tool()? {
             self.progress("[resume] Recovered an interrupted tool call");
         }
@@ -301,6 +304,16 @@ impl<'a> Orchestrator<'a> {
                         }
                     }
                     let mut repairs = 0;
+                    let book = session.jobs.clone();
+                    let workers = session.workers.clone().unwrap_or_default();
+                    let memory = session.memory.clone();
+                    let goal = session.goal.clone();
+                    let jobs = crate::jobs::enabled(phase).then_some(JobScope {
+                        book: &book,
+                        workers: &workers,
+                        goal: &goal,
+                    });
+                    let mut scheduler = JobScheduler::new(self, jobs, &memory, None);
                     if phase == Phase::Work && self.reporter.observes_network() {
                         self.reporter.handoff(
                             traffic_scope(&session),
@@ -311,17 +324,21 @@ impl<'a> Orchestrator<'a> {
                         );
                     }
                     loop {
-                        let ready = self.api.wait_for_generation().await;
+                        let ready = if scheduler.is_idle() {
+                            self.api.wait_for_generation().await
+                        } else {
+                            Ok(())
+                        };
                         if session.dialogue.pending()?.is_none() {
                             self.receive_guidance(&mut session, guidance.as_ref())?;
                         }
-                        if session.dialogue.in_flight
-                            && ready
-                                .as_ref()
-                                .is_err_and(|error| error.is::<crate::events::CheckpointExit>())
+                        if ready
+                            .as_ref()
+                            .is_err_and(|error| error.is::<crate::events::CheckpointExit>())
                         {
                             // This call was marked for dispatch but has not started.
                             session.dialogue.in_flight = false;
+                            book.checkpoint_exit();
                             self.store.save(&session)?;
                         }
                         ready?;
@@ -346,37 +363,41 @@ impl<'a> Orchestrator<'a> {
                             self.apply_triage(&mut session.dialogue, actor, &note);
                             self.store.save(&session)?;
                         }
+                        let peer = PeerTools {
+                            memory: &memory,
+                            author: if phase == Phase::Work {
+                                "worker_1"
+                            } else {
+                                "lead_reviewer"
+                            },
+                            route: None,
+                            ack: None,
+                            final_review,
+                            plan_workers: (phase == Phase::FreezePlan)
+                                .then_some(workers.as_slice()),
+                            ownership: None,
+                            workspace,
+                            require_task_graph: session.require_task_graph,
+                            repairing: repairs > 0,
+                            jobs: jobs.map(|scope| JobPeer {
+                                scope,
+                                parent: None,
+                                shared_candidate: false,
+                            }),
+                            allow_approval: staging.is_none()
+                                || session
+                                    .verification
+                                    .as_ref()
+                                    .is_some_and(|receipt| receipt.passed),
+                        };
                         match self
-                            .step(
-                                &mut session.dialogue,
+                            .step_lead_with_jobs(
+                                &mut session,
                                 model,
                                 access,
                                 &system,
-                                phase.label(),
-                                PeerTools {
-                                    memory: &session.memory,
-                                    author: if phase == Phase::Work {
-                                        "worker_1"
-                                    } else {
-                                        "lead_reviewer"
-                                    },
-                                    route: None,
-                                    ack: None,
-                                    final_review,
-                                    plan_workers: session
-                                        .workers
-                                        .as_deref()
-                                        .filter(|_| phase == Phase::FreezePlan),
-                                    ownership: None,
-                                    workspace,
-                                    require_task_graph: session.require_task_graph,
-                                    repairing: repairs > 0,
-                                    allow_approval: staging.is_none()
-                                        || session
-                                            .verification
-                                            .as_ref()
-                                            .is_some_and(|receipt| receipt.passed),
-                                },
+                                peer,
+                                &mut scheduler,
                             )
                             .await?
                         {
@@ -457,6 +478,12 @@ impl<'a> Orchestrator<'a> {
                                 self.store.save(&session)?;
                             }
                             Step::Finished(text) => {
+                                if book.has_outstanding(actor) || book.has_receipts(actor) {
+                                    session.dialogue.job_report =
+                                        Some(clip(&text, self.job_limit() / 3));
+                                    self.store.save(&session)?;
+                                    continue;
+                                }
                                 if !self.receive_guidance(&mut session, guidance.as_ref())? {
                                     break text;
                                 }
@@ -518,6 +545,12 @@ impl<'a> Orchestrator<'a> {
                 self.reporter.emit(Kind::Agent, phase.label(), &response);
             }
             let scope = traffic_scope(&session);
+            ensure!(
+                !session.jobs.active(),
+                "cannot advance with unfinished jobs"
+            );
+            session.jobs.clear_phase();
+            self.mcp.close_specialists();
             session.panel = None;
             self.advance(&mut session, response);
             if phase == Phase::Work {
@@ -731,6 +764,23 @@ impl<'a> Orchestrator<'a> {
         })
     }
 
+    fn toolset<'b>(
+        &'b self,
+        access: Access,
+        workspace: &'b Path,
+        ownership: Option<&'b [WritePath]>,
+    ) -> Tools<'b> {
+        Tools {
+            workspace,
+            access,
+            ownership,
+            allow_inspection_shell: self.config.orchestration.allow_inspection_shell,
+            timeout: Duration::from_secs(self.config.orchestration.command_timeout_secs),
+            output_bytes: (self.config.context_window / 2).clamp(512, 24 * 1024),
+            key: self.config.api_key.as_deref(),
+        }
+    }
+
     async fn step(
         &self,
         dialogue: &mut Dialogue,
@@ -741,23 +791,36 @@ impl<'a> Orchestrator<'a> {
         peer: PeerTools<'_>,
     ) -> Result<Step> {
         dialogue.audit_brief(peer.author, |text| self.api.redact(text));
-        let shell_disabled = self.config.constraints.shell_disabled_for(peer.author);
-        // Keep individual results bounded before they enter history.
-        let tools = Tools {
-            workspace: peer.workspace,
-            access,
-            allow_inspection_shell: self.config.orchestration.allow_inspection_shell,
-            timeout: Duration::from_secs(self.config.orchestration.command_timeout_secs),
-            output_bytes: (self.config.context_window / 2).clamp(512, 24 * 1024),
-            key: self.config.api_key.as_deref(),
-            ownership: peer.ownership,
-        };
+        let shell_disabled = self
+            .config
+            .constraints
+            .shell_disabled_for(peer.policy_actor());
+        let tools = self.toolset(access, peer.workspace, peer.ownership);
         if let Some(call) = dialogue.pending()?.cloned() {
             let mut shell_control = (call.function.name == "shell")
                 .then(|| self.reporter.generation_control())
                 .flatten();
             let shell_state = shell_control.as_ref().map(|control| *control.borrow());
             if shell_state.is_some_and(|state| state.paused) {
+                return Ok(Step::Continue);
+            }
+            if matches!(
+                call.function.name.as_str(),
+                "submit_plan" | "submit_verdict"
+            ) && peer
+                .jobs
+                .is_some_and(|jobs| jobs.scope.book.has_receipts(peer.author))
+            {
+                let receipt =
+                    "Job results are ready. Review them before submitting this decision again.";
+                dialogue.audit_tool(
+                    peer.author,
+                    &call,
+                    "refused",
+                    Some((receipt, receipt)),
+                    None,
+                );
+                dialogue.record_tool(call.id, receipt.into());
                 return Ok(Step::Continue);
             }
             if peer.final_review && call.function.name == "submit_verdict" {
@@ -831,6 +894,11 @@ impl<'a> Orchestrator<'a> {
                         ..
                     },
                 ) => same(gate.object(&call, worker)),
+                (tool, _) if !peer.permits(tool) => same(format!("REFUSED: {tool} is unavailable to this specialist.")),
+                (tool, _) if crate::jobs::TOOLS.contains(&tool) => same(
+                    self.job_call(&call, dialogue, peer, access)
+                        .unwrap_or_else(|error| format!("REFUSED: {}", self.api.redact(&format!("{error:#}"))))
+                ),
                 ("remember" | "recall", _) => same(peer.memory.execute(
                     &call,
                     peer.author,
@@ -841,7 +909,7 @@ impl<'a> Orchestrator<'a> {
                 ("mcp_list" | "tool_search" | "mcp_call", _) => {
                     crate::tools::mcp::dispatch(
                         &self.mcp,
-                        peer.author,
+                        peer.mcp_actor(),
                         &self.config.mcp_servers,
                         access,
                         &call,
@@ -876,24 +944,7 @@ impl<'a> Orchestrator<'a> {
                 },
                 _ => tools.execute_audited(&call).await,
             };
-            let mcp_error = full
-                .strip_prefix("Untrusted MCP tool output\n")
-                .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
-                .is_some_and(|payload| payload["isError"] == true);
-            let state = if output.starts_with(crate::tools::mcp::UNKNOWN_CALL) {
-                "unknown"
-            } else if output.starts_with("REFUSED")
-                || (output.starts_with("Tool error: tool ") && output.contains("is unavailable"))
-            {
-                "refused"
-            } else if output.starts_with("Tool error:")
-                || full.starts_with("Succeeded: false\n")
-                || mcp_error
-            {
-                "failed"
-            } else {
-                "completed"
-            };
+            let state = jobs::tool_outcome(&output, &full).label();
             dialogue.audit_tool(
                 peer.author,
                 &call,
@@ -914,6 +965,20 @@ impl<'a> Orchestrator<'a> {
         schemas.extend(memory::schemas());
         schemas.extend(crate::tools::skills::schema(&self.config.skills));
         schemas.extend(crate::tools::mcp::schemas(servers, access));
+        let job_schemas = (peer.jobs.is_some() && !peer.repairing).then(|| {
+            crate::jobs::schemas(
+                tools.allows_shell() && !shell_disabled && peer.permits("shell"),
+                peer.permits("mcp_call")
+                    && schemas
+                        .iter()
+                        .any(|schema| schema["function"]["name"] == "mcp_call"),
+            )
+        });
+        schemas.retain(|schema| {
+            schema["function"]["name"]
+                .as_str()
+                .is_some_and(|name| peer.permits(name))
+        });
         if let Some(route) = peer.route {
             schemas.push(route.schema());
         }
@@ -936,7 +1001,11 @@ impl<'a> Orchestrator<'a> {
             });
             Cow::Borrowed(system)
         } else {
-            crate::tools::mcp::with_instructions(system, servers, access)
+            if peer.permits("mcp_call") {
+                crate::tools::mcp::with_instructions(system, servers, access)
+            } else {
+                Cow::Borrowed(system)
+            }
         };
         if self.config.resume
             && schemas
@@ -947,7 +1016,7 @@ impl<'a> Orchestrator<'a> {
                 "\nRunner resumed. Fetch current MCP schemas with tool_search. Reopen external session handles as needed.",
             );
         }
-        if !peer.repairing {
+        if !peer.repairing && peer.permits("shell") {
             if shell_disabled {
                 system
                     .to_mut()
@@ -968,6 +1037,27 @@ impl<'a> Orchestrator<'a> {
                 .estimated_budget
                 .unwrap_or(window_budget)
                 .min(hard_limit);
+            let schemas = job_schemas
+                .as_ref()
+                .map_or(Cow::Borrowed(&schemas[..]), |job_schemas| {
+                    let (prefix, steering) = dialogue.request_context(&system);
+                    let mut messages = dialogue.messages(&prefix);
+                    messages.extend(steering.as_ref());
+                    let essential = prefix.iter().chain(steering.as_ref()).collect::<Vec<_>>();
+                    let has_jobs = peer
+                        .jobs
+                        .is_some_and(|jobs| jobs.scope.book.has_jobs(peer.author));
+                    let compact = [crate::jobs::compact_schema()];
+                    for extra in [job_schemas.as_slice(), compact.as_slice()] {
+                        let combined = schemas.iter().chain(extra).cloned().collect::<Vec<_>>();
+                        if estimate(&messages, &combined) <= target - target / 10
+                            || (has_jobs && estimate(&essential, &combined) <= target - target / 10)
+                        {
+                            return Cow::Owned(combined);
+                        }
+                    }
+                    Cow::Borrowed(&schemas[..])
+                });
             let compact = Compact {
                 api: &self.api,
                 actor: peer.author,
@@ -1002,7 +1092,7 @@ impl<'a> Orchestrator<'a> {
             let mut messages = dialogue.messages(&prefix);
             messages.extend(steering.as_ref());
             let projected = estimate(&messages, &schemas);
-            self.mcp.model_turn(peer.author, peer.workspace);
+            self.mcp.model_turn(peer.mcp_actor(), peer.workspace);
             let completion = match self
                 .api
                 .complete_as(
@@ -1277,6 +1367,9 @@ impl<'a> Orchestrator<'a> {
             1
         };
         let memory = session.memory.clone();
+        let book = session.jobs.clone();
+        let workers = session.workers.clone().unwrap_or_default();
+        let goal = session.goal.clone();
         self.drive_panel(
             &mut panel,
             &mailbox,
@@ -1295,6 +1388,11 @@ impl<'a> Orchestrator<'a> {
                 staging: None,
                 admission_run: None,
                 triage_run: None,
+                jobs: Some(JobScope {
+                    book: &book,
+                    workers: &workers,
+                    goal: &goal,
+                }),
             },
             |panel| self.checkpoint_panel(session, panel, &mailbox, None),
         )
@@ -1315,6 +1413,7 @@ impl<'a> Orchestrator<'a> {
         let mut saved = panel.iter().map(PanelAgent::snapshot).collect::<Vec<_>>();
         let mut idle = panel.iter_mut().map(Some).collect::<Vec<_>>();
         let candidate = &tokio::sync::RwLock::new(());
+        let mut scheduler = JobScheduler::new(self, options.jobs, options.memory, Some(candidate));
         let mut active = FuturesUnordered::new();
         let control = self.reporter.generation_control();
         let paused = || control.as_ref().is_some_and(|state| state.borrow().paused);
@@ -1322,7 +1421,7 @@ impl<'a> Orchestrator<'a> {
         let mut first_error = None;
         loop {
             if first_error.is_none() {
-                let ready = if active.is_empty() {
+                let ready = if active.is_empty() && scheduler.is_idle() {
                     self.api.wait_for_generation().await
                 } else {
                     Ok(())
@@ -1352,6 +1451,9 @@ impl<'a> Orchestrator<'a> {
                         agent.dialogue.in_flight = false;
                         *progress = agent.snapshot();
                     }
+                    if let Some(jobs) = options.jobs {
+                        jobs.book.checkpoint_exit();
+                    }
                     checkpoint(&saved)?;
                 }
                 ready?;
@@ -1367,6 +1469,17 @@ impl<'a> Orchestrator<'a> {
                         .is_some(),
                     _ => false,
                 };
+                let mut jobs_changed = false;
+                if !paused() {
+                    jobs_changed |=
+                        scheduler.start_tools(self.config.orchestration.max_parallel_agents);
+                    if scheduler.specialist_first() {
+                        let free = options
+                            .width
+                            .saturating_sub(active.len() + scheduler.agent_slots());
+                        jobs_changed |= scheduler.start_specialists(free.min(1))?;
+                    }
+                }
                 if !paused() && !triage_waiting {
                     if self
                         .prepare_idle_agents(
@@ -1381,6 +1494,9 @@ impl<'a> Orchestrator<'a> {
                         checkpoint(&saved)?;
                     }
                     if paused() {
+                        if jobs_changed {
+                            checkpoint(&saved)?;
+                        }
                         continue;
                     }
 
@@ -1388,17 +1504,36 @@ impl<'a> Orchestrator<'a> {
                     // Rotate after each dispatch so that a fast agent cannot keep a
                     // slot ahead of another agent that has been ready longer.
                     for sender in (cursor..idle.len()).chain(0..cursor) {
-                        if active.len() == options.width {
+                        if active.len() + scheduler.agent_slots() >= options.width {
                             break;
                         }
-                        let Some(agent) = &idle[sender] else { continue };
+                        let Some(agent) = &mut idle[sender] else {
+                            continue;
+                        };
+                        let actor = mailbox.id(sender);
+                        let jobs_attached = options.jobs.is_some_and(|jobs| {
+                            jobs.book.has_outstanding(actor) || jobs.book.has_receipts(actor)
+                        });
+                        let has_receipt = options
+                            .jobs
+                            .is_some_and(|jobs| jobs.book.has_receipts(actor))
+                            && agent.dialogue.pending()?.is_none();
+                        if let Some(jobs) = options.jobs {
+                            if jobs.book.blocked(actor, &agent.dialogue)? {
+                                continue;
+                            }
+                        }
                         let integrating = options.staging.is_some()
+                            && !jobs_attached
                             && sender < workers
                             && agent.assessment.is_some()
                             && agent.artifact_sha256.is_none();
                         if !integrating {
-                            if agent.assessment.is_some()
-                                || (admitting && agent.dialogue.pending()?.is_none())
+                            if ((agent.assessment.is_some() || agent.dialogue.job_report.is_some())
+                                && (!has_receipt || agent.failed))
+                                || (admitting
+                                    && !jobs_attached
+                                    && agent.dialogue.pending()?.is_none())
                             {
                                 continue;
                             }
@@ -1418,6 +1553,14 @@ impl<'a> Orchestrator<'a> {
                                 continue;
                             }
                         }
+                        if has_receipt && let Some(jobs) = options.jobs {
+                            jobs_changed |=
+                                jobs.book
+                                    .deliver(actor, &mut agent.dialogue, self.job_limit());
+                            agent.reopen(limit);
+                            agent.dialogue.reopen_job_report(self.job_limit());
+                            saved[sender] = agent.snapshot();
+                        }
                         let agent = idle[sender].take().expect("ready agent");
                         active.push(async move {
                             let result = if integrating {
@@ -1432,7 +1575,15 @@ impl<'a> Orchestrator<'a> {
                         cursor = (sender + 1) % idle.len();
                     }
 
-                    if active.is_empty() {
+                    jobs_changed |= scheduler.start_specialists(
+                        options
+                            .width
+                            .saturating_sub(active.len() + scheduler.agent_slots()),
+                    )?;
+                    if jobs_changed {
+                        checkpoint(&saved)?;
+                    }
+                    if active.is_empty() && scheduler.is_idle() && !jobs_changed {
                         if admitting {
                             let pending =
                                 idle.iter().flatten().try_fold(false, |pending, agent| {
@@ -1440,21 +1591,33 @@ impl<'a> Orchestrator<'a> {
                                         pending || agent.dialogue.pending()?.is_some(),
                                     )
                                 })?;
-                            if !pending {
+                            if !pending && options.jobs.is_none_or(|jobs| !jobs.book.active()) {
                                 break;
                             }
                         }
                         ensure!(
                             saved.iter().all(|agent| agent.assessment.is_some())
-                                && !mailbox.has_pending(),
+                                && !mailbox.has_pending()
+                                && options.jobs.is_none_or(|jobs| !jobs.book.active()),
                             "task scheduler has no runnable agents"
                         );
                         break;
                     }
+                } else if jobs_changed {
+                    checkpoint(&saved)?;
                 }
             }
 
-            let Some((sender, agent, result)) = active.next().await else {
+            let settled = tokio::select! {
+                result = active.next(), if !active.is_empty() => result,
+                result = scheduler.settle_next(), if !scheduler.is_idle() => {
+                    result?;
+                    checkpoint(&saved)?;
+                    continue;
+                }
+                else => None,
+            };
+            let Some((sender, agent, result)) = settled else {
                 if let Some(error) = first_error {
                     return Err(error);
                 }
@@ -1508,6 +1671,16 @@ impl<'a> Orchestrator<'a> {
         }
         for (index, slot) in idle.iter_mut().enumerate() {
             let Some(agent) = slot else { continue };
+            if let Some(jobs) = options.jobs {
+                if agent.failed
+                    && jobs
+                        .book
+                        .deliver(mailbox.id(index), &mut agent.dialogue, self.job_limit())
+                {
+                    saved[index] = agent.snapshot();
+                    changed = true;
+                }
+            }
             if agent.failed || agent.dialogue.pending()?.is_some() {
                 continue;
             }
@@ -1595,7 +1768,13 @@ impl<'a> Orchestrator<'a> {
             private_workspace = Some(workspace);
         }
         let pending = agent.dialogue.pending()?.is_some();
-        if !pending && self.worker_admission_pending(options.admission_run)? {
+        if !pending
+            && self.worker_admission_pending(options.admission_run)?
+            && options.jobs.is_none_or(|jobs| {
+                let actor = mailbox.id(sender);
+                !jobs.book.has_outstanding(actor) && !jobs.book.has_receipts(actor)
+            })
+        {
             return Ok(());
         }
         // Private worker trees can continue running tools while integration
@@ -1619,6 +1798,11 @@ impl<'a> Orchestrator<'a> {
             allow_approval: false,
             require_task_graph: false,
             repairing: false,
+            jobs: options.jobs.map(|scope| JobPeer {
+                scope,
+                parent: None,
+                shared_candidate: options.staging.is_some() && private_workspace.is_none(),
+            }),
         };
         match self
             .step(
@@ -1636,9 +1820,15 @@ impl<'a> Orchestrator<'a> {
                 unreachable!("panel has no decision tool")
             }
             Ok(Step::Finished(result)) => {
-                self.reporter
-                    .agent(peer.author, Kind::Agent, "Report", &result);
-                agent.assessment = Some(result);
+                if options.jobs.is_some_and(|jobs| {
+                    jobs.book.has_outstanding(peer.author) || jobs.book.has_receipts(peer.author)
+                }) {
+                    agent.dialogue.job_report = Some(clip(&result, self.job_limit() / 3));
+                } else {
+                    self.reporter
+                        .agent(peer.author, Kind::Agent, "Report", &result);
+                    agent.assessment = Some(result);
+                }
                 Ok(())
             }
             Err(error) if options.tolerate_failures || stakeholder => {
@@ -1936,6 +2126,9 @@ impl<'a> Orchestrator<'a> {
         }
 
         let memory = session.memory.clone();
+        let book = session.jobs.clone();
+        let job_workers = workers.to_vec();
+        let goal = session.goal.clone();
         let admission_run = session.run_id().to_owned();
         if enabling_work {
             if let Some((id, _)) = self.store.pending_worker(&admission_run)? {
@@ -1967,6 +2160,11 @@ impl<'a> Orchestrator<'a> {
                 .map(|stage| (stage, session.cycle)),
             admission_run: (enabling_work && !implicit).then_some(admission_run.as_str()),
             triage_run: enabling_work.then_some(admission_run.as_str()),
+            jobs: crate::jobs::enabled(phase).then_some(JobScope {
+                book: &book,
+                workers: &job_workers,
+                goal: &goal,
+            }),
         };
         if enabling_work {
             self.checkpoint_workers(
@@ -2345,6 +2543,27 @@ struct PeerTools<'a> {
     allow_approval: bool,
     require_task_graph: bool,
     repairing: bool,
+    jobs: Option<JobPeer<'a>>,
+}
+
+impl<'a> PeerTools<'a> {
+    fn policy_actor(&self) -> &'a str {
+        self.jobs
+            .and_then(|jobs| jobs.parent)
+            .map_or(self.author, |job| &job.policy_actor)
+    }
+
+    fn mcp_actor(&self) -> &'a str {
+        self.jobs
+            .and_then(|jobs| jobs.parent)
+            .map(|job| job.mcp_actor.as_str())
+            .filter(|actor| !actor.is_empty())
+            .unwrap_or(self.author)
+    }
+
+    fn permits(&self, tool: &str) -> bool {
+        self.jobs.is_none_or(|jobs| jobs.permits(tool))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2363,6 +2582,7 @@ struct PanelOptions<'a> {
     staging: Option<(&'a Staging, usize)>,
     admission_run: Option<&'a str>,
     triage_run: Option<&'a str>,
+    jobs: Option<JobScope<'a>>,
 }
 
 impl PanelAgent<'_> {
