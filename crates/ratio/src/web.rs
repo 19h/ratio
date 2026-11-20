@@ -308,6 +308,18 @@ async fn handle(app: Arc<Dashboard>, surface: Surface, request: Request<Incoming
         })
         .await;
     }
+    if path == "/api/config" {
+        return json_reply(match app.effective_config() {
+            Ok(config) => {
+                let mut summary = config.summary();
+                summary["ok"] = json!(true);
+                summary
+            }
+            Err(cause) => {
+                json!({"ok":false,"error":format!("{cause:#}"),"workspace":app.workspace})
+            }
+        });
+    }
     let Some((run, view)) = run_route(&path) else {
         return error(StatusCode::NOT_FOUND, "Unknown run or endpoint");
     };
@@ -734,6 +746,41 @@ struct Action {
 }
 
 impl Dashboard {
+    /// The configuration a run started now would load, validated the same way.
+    fn effective_config(&self) -> Result<Config> {
+        let cli = Cli::try_parse_from(
+            std::iter::once(OsString::from("ra")).chain(self.launch_args.iter().cloned()),
+        )?;
+        let config = Config::load(cli)?;
+        ensure!(
+            config.cwd == self.workspace,
+            "The profile selects a different workspace. Reopen the dashboard for this workspace."
+        );
+        Api::new(&config, Reporter::Silent, Budget::new(&config))?;
+        Ok(config)
+    }
+
+    /// One small request per configured model, run in a short-lived child
+    /// process so a slow provider cannot stall the dashboard.
+    async fn check_provider(&self) -> Result<Value> {
+        self.effective_config()?;
+        let mut command = tokio::process::Command::new(std::env::current_exe()?);
+        command
+            .args(&self.launch_args)
+            .arg("--check-provider")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(60), command.output())
+            .await
+            .context("The provider did not answer within 60 seconds")??;
+        serde_json::from_slice(&output.stdout).with_context(|| {
+            format!(
+                "Provider check failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        })
+    }
+
     async fn action(&self, action: Action) -> Result<Value> {
         ensure!(
             (1..=80).contains(&action.id.len())
@@ -743,6 +790,10 @@ impl Dashboard {
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
             "Invalid action ID"
         );
+        if action.action == "check_provider" {
+            // Read-only and slow, so it stays outside the action lock.
+            return self.check_provider().await;
+        }
         let mut actions = self.actions.lock().await;
         if let Some((_, receipt)) = actions.iter().find(|(id, _)| id == &action.id) {
             return Ok(receipt.clone());
@@ -822,6 +873,10 @@ impl Dashboard {
                     }
                 } else {
                     ensure!(note.is_some(), "Enter a request to start a run");
+                }
+                if !resume {
+                    // Report a broken profile here instead of in the runner log.
+                    self.effective_config()?;
                 }
                 if let Some(note) = note {
                     ensure!(note.len() <= 65_536 && !resume, "Invalid run request");

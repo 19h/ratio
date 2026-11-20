@@ -67,14 +67,18 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
     let instructions = Message::system(format!(
         "Help the user plan a Ratio coding task. Refine the goal to describe the requested outcome, scope and acceptance criteria. A lead reviewer is built in. Add specialist reviewers and stakeholders when distinct expertise would help. Reviewers check evidence and report findings. Stakeholders advise on domain requirements. They can participate in planning and/or review. Preserve configured reviewers and stakeholders. Never perform the work.\n\
          Include goal, reviewers, stakeholders, and message. goal and message are strings. reviewers and stakeholders are arrays, which may be empty, of objects with name, persona (the participant description), phases (an array of planning and/or review), and optional agent with a model string. Return the full current proposal after each refinement. Put your response or question in message.\n\
-         {worker_prompt}\n{}\nWorkspace: {}\nConfigured constraints:\n{}",
+         {worker_prompt}\n{}\nWorkspace: {}\nConfigured constraints:\n{}{}",
         if generate {
             "Return the proposal by calling submit_team alone."
         } else {
             "Return the proposal as JSON text."
         },
         config.cwd.display(),
-        config.constraints.prompt()
+        config.constraints.prompt(),
+        config
+            .project_instructions()
+            .map(|text| crate::instructions::prompt(&text))
+            .unwrap_or_default()
     ));
     let mut previous = draft.clone();
     let mut length_retries = 0;
@@ -108,7 +112,7 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
         let completion = match api
             .complete_for(
                 "Setup agent",
-                &config.reviewer_model,
+                config.reviewer_spec(),
                 &messages,
                 &schemas,
                 config.output_tokens,
@@ -166,6 +170,7 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
                     worker.name = worker.name.trim().to_owned();
                     worker.persona = worker.persona.trim().to_owned();
                     worker.model = None;
+                    worker.reasoning_effort = None;
                     ensure!(
                         !worker.name.is_empty()
                             && !worker.persona.is_empty()

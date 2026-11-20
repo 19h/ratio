@@ -58,6 +58,8 @@ impl Profile {
                     tool,
                     "read_file"
                         | "list_directory"
+                        | "search_files"
+                        | "find_files"
                         | "git_status"
                         | "git_diff"
                         | "read_skill"
@@ -80,6 +82,8 @@ pub(crate) struct Role {
     pub instructions: String,
     pub profile: Profile,
     pub model: Option<String>,
+    #[serde(skip)]
+    pub effort: Option<String>,
 }
 
 pub(crate) fn roles(workers: &[Worker]) -> Vec<Role> {
@@ -96,6 +100,7 @@ pub(crate) fn roles(workers: &[Worker]) -> Vec<Role> {
             "Handle the requested operation using the configured MCP tools. Discover schemas first. Return the outcome and any handles needed by follow-up jobs."),
     ].into_iter().map(|(id, name, profile, instructions)| Role {
         id: id.into(), name: name.into(), profile, instructions: instructions.into(), model: None,
+        effort: None,
     }).collect::<Vec<_>>();
     roles.extend(workers.iter().enumerate().map(|(index, worker)| Role {
         id: format!("worker_{}", index + 1),
@@ -103,6 +108,7 @@ pub(crate) fn roles(workers: &[Worker]) -> Vec<Role> {
         instructions: format!("Consult using this worker persona:\n{}", worker.persona),
         profile: Profile::Inspect,
         model: worker.model.clone(),
+        effort: worker.reasoning_effort.clone(),
     }));
     roles
 }
@@ -275,6 +281,8 @@ pub(crate) struct Specialist {
     pub role: String,
     pub name: String,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub instructions: String,
     pub profile: Profile,
     pub dialogue: Dialogue,
@@ -314,9 +322,8 @@ impl Permissions {
             "mcp_list" | "tool_search" | "mcp_call" => self.mcp,
             "shell" => self.shell,
             "remember" | "recall" => self.memory,
-            "read_file" | "list_directory" | "git_status" | "git_diff" | "read_skill" => {
-                self.workspace
-            }
+            "read_file" | "list_directory" | "search_files" | "find_files" | "git_status"
+            | "git_diff" | "read_skill" => self.workspace,
             _ => true,
         }
     }

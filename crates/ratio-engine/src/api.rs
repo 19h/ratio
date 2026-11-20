@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::{
     budget::{Budget, TokenProgress, TokenValues},
-    config::{Config, Provider, ProviderApi},
+    config::{Config, ModelSpec, Provider, ProviderApi},
     context::{clip, estimate},
     events::{Generation, Kind, LiveGeneration, Reporter, clean},
 };
@@ -204,13 +204,66 @@ impl Api {
 
     pub async fn complete(
         &self,
-        model: &str,
+        model: ModelSpec<'_>,
         messages: &[&Message],
         tools: &[Value],
         output_tokens: usize,
     ) -> Result<Completion, ApiError> {
-        self.complete_for(model, model, messages, tools, output_tokens)
+        self.complete_for(model.model, model, messages, tools, output_tokens)
             .await
+    }
+
+    /// Send one small tool-calling request to each distinct configured model.
+    /// Reports reachability, and whether the model answered with the tool call.
+    pub async fn check(&self, config: &Config) -> Value {
+        let mut specs = vec![config.reviewer_spec(), config.worker_spec()];
+        specs.extend(
+            config
+                .workers
+                .iter()
+                .map(|worker| worker.spec(config.worker_spec())),
+        );
+        specs.extend(
+            config
+                .reviewers
+                .iter()
+                .chain(&config.stakeholders)
+                .map(|agent| agent.spec(config.reviewer_spec())),
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        specs.retain(|spec| seen.insert(spec.model));
+        let system = Message::system("Connectivity check. Call the ping tool once.");
+        let request = Message::user("Call ping now.");
+        let tools = [serde_json::json!({"type":"function","function":{
+            "name":"ping","description":"Confirm that tool calls work.",
+            "parameters":{"type":"object","properties":{},"additionalProperties":false}
+        }})];
+        let mut checks = Vec::new();
+        for spec in specs {
+            let started = std::time::Instant::now();
+            let result = self
+                .complete_for(
+                    "Provider check",
+                    spec,
+                    &[&system, &request],
+                    &tools,
+                    config.output_tokens.min(256),
+                )
+                .await;
+            let (tool_call, error) = match &result {
+                Ok(completion) => (
+                    matches!(&completion.message, Message::Assistant { tool_calls, .. }
+                        if tool_calls.iter().any(|call| call.function.name == "ping")),
+                    None,
+                ),
+                Err(error) => (false, Some(self.redact(&error.to_string()))),
+            };
+            checks.push(serde_json::json!({
+                "model": spec.model, "ok": result.is_ok(), "tool_call": tool_call,
+                "latency_ms": started.elapsed().as_millis() as u64, "error": error,
+            }));
+        }
+        serde_json::json!({ "checks": checks })
     }
 
     pub(crate) async fn wait_for_generation(&self) -> Result<()> {
@@ -233,7 +286,7 @@ impl Api {
     pub async fn complete_for(
         &self,
         label: &str,
-        model: &str,
+        model: ModelSpec<'_>,
         messages: &[&Message],
         tools: &[Value],
         output_tokens: usize,
@@ -246,7 +299,7 @@ impl Api {
         &self,
         actor: &str,
         label: &str,
-        model: &str,
+        model: ModelSpec<'_>,
         messages: &[&Message],
         tools: &[Value],
         output_tokens: usize,
@@ -343,13 +396,14 @@ impl Api {
 
     async fn complete_once(
         &self,
-        model: &str,
+        spec: ModelSpec<'_>,
         messages: &[&Message],
         tools: &[Value],
         output_tokens: usize,
         tokens: &TokenProgress<'_>,
         preview: &mut Preview<'_>,
     ) -> Result<Completion, ApiError> {
+        let model = spec.model;
         let responses = self.provider.api == ProviderApi::Responses;
         let mut payload = if responses {
             responses::payload(model, messages, tools, output_tokens, self.provider.stream)
@@ -371,6 +425,13 @@ impl Api {
         }
         if let Some(value) = self.provider.seed {
             payload["seed"] = serde_json::json!(value);
+        }
+        if let Some(effort) = spec.effort {
+            if responses {
+                payload["reasoning"] = serde_json::json!({"effort": effort});
+            } else {
+                payload["reasoning_effort"] = serde_json::json!(effort);
+            }
         }
         if !tools.is_empty() {
             if !responses {

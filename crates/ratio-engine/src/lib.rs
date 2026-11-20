@@ -4,6 +4,7 @@ pub mod budget;
 pub mod config;
 pub mod context;
 pub mod events;
+mod instructions;
 pub mod ipc;
 mod jobs;
 mod journal;

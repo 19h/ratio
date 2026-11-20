@@ -58,6 +58,7 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
   const started = new Promise(resolve => { firstWork = resolve; });
   let workerCalled = false;
   let sawGuidance = false;
+  let sawSteering = false;
   let reportedTotal = 0;
   const provider = createServer(async (request,response) => {
     try {
@@ -67,11 +68,13 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
       const tools = new Map((input.tools ?? []).map(item => [item.function.name,item.function.parameters]));
       const system = input.messages[0].content;
       assert.equal(input.model,"browser-cli-model");
+      sawSteering ||= JSON.stringify(input.messages).includes("User steering:\\nPrefer the narrower interface");
       let output;
       if (system.includes("Inspect the forked evidence")) {
         await forkGate;
         output = completion("Fork recorded.");
       }
+      else if (tools.has("ping")) output = completion(null,call("ping",{}));
       else if (tools.has("submit_team")) output = completion(null,call("submit_team",{
         goal:"Inspect project interfaces",message:"One worker",
         workers:[{name:"Integrator",persona:"Inspect the MCP fixture"}],
@@ -148,7 +151,8 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
         }
       } else output = completion("Inspect the MCP evidence.");
       response.setHeader("content-type","application/json");
-      reportedTotal += 1;
+      // The provider check runs outside any run, so its usage is not metered there.
+      if (!tools.has("ping")) reportedTotal += 1;
       response.end(JSON.stringify({...output, usage:{prompt_tokens:1,completion_tokens:0,total_tokens:1}}));
     } catch (error) {
       response.statusCode = 400;
@@ -161,12 +165,15 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
 model = "fixture-model"
 context_window = 8192
 output_tokens = 256
+[provider.headers]
+x-fixture = "header-secret-value"
 [mcp_servers.fixture]
 command = ${JSON.stringify(process.execPath)}
 args = ["-e", ${JSON.stringify(mcp)}]
 tools = ["inspect"]
 `);
-  const child = spawn(bin,["-C",dir,"--config",profile,"--web","--web-port=0","--web-share-port=0","--model","browser-cli-model"],{stdio:["ignore","pipe","pipe"]});
+  const child = spawn(bin,["-C",dir,"--config",profile,"--web","--web-port=0","--web-share-port=0","--model","browser-cli-model"],
+    {stdio:["ignore","pipe","pipe"],env:{...process.env,RATIO_API_KEY:"fixture-secret-key"}});
   let errors = "";
   child.stderr.on("data",data => { errors += data; });
   const lines = createInterface({input:child.stdout});
@@ -199,6 +206,14 @@ tools = ["inspect"]
     await page.getByRole("heading",{name:"Runs",exact:true}).waitFor();
     await shot("runs");
     assert.equal(new URL(page.url()).hash,"");
+    const summary = await (await fetch(address.origin+"/api/config",{headers:{Authorization:"Bearer "+token}})).text();
+    const effective = JSON.parse(summary);
+    assert.deepEqual([effective.ok,effective.models.worker,effective.provider.key,effective.provider.headers],
+      [true,"browser-cli-model",true,["x-fixture"]]);
+    assert.ok(!summary.includes("fixture-secret-key") && !summary.includes("header-secret-value"));
+    await page.getByRole("heading",{name:"Configuration",exact:true}).waitFor();
+    await page.getByRole("button",{name:"Test provider",exact:true}).click();
+    await page.getByText("Reachable. The model returned the test tool call.",{exact:true}).waitFor();
     await page.locator("#new-run").click();
     await page.getByLabel("Request",{exact:true}).fill("Inspect fixture MCP evidence");
     await page.locator("#submit-action").click();
@@ -267,6 +282,8 @@ tools = ["inspect"]
         assert.equal(control.status, 403, method);
       }
     }
+    assert.equal((await fetch(new URL("/api/config", shared),
+      { headers: { Authorization: "Bearer " + shareToken(shared) } })).status, 403);
     const visitor = await browser.newPage();
     visitor.setDefaultTimeout(10_000);
     await visitor.goto(shared.href);
@@ -304,6 +321,10 @@ tools = ["inspect"]
     await page.locator("#submit-action").click();
     await page.getByText("Additional interface evidence for Integrator",{exact:true}).waitFor();
     await page.getByText("Waiting for triage at the next runner checkpoint.", { exact: true }).waitFor();
+    await page.getByRole("button",{name:"Send guidance",exact:true}).click();
+    await page.getByLabel("Guidance",{exact:true}).fill("Prefer the narrower interface");
+    await page.locator("#submit-action").click();
+    await page.getByText("guidance queued",{exact:true}).waitFor();
     release();
     await page.locator('[data-token-flow="cached_input"][data-token-count="7"]').waitFor();
     finishStream();
@@ -425,6 +446,7 @@ tools = ["inspect"]
     await page.getByRole("link",{name:"fixture / mcp_list",exact:true}).waitFor({state:"detached"});
     await page.getByRole("link",{name:"fixture / inspect",exact:true}).click();
     assert.equal(sawGuidance,true);
+    assert.equal(sawSteering,true);
     await page.getByText("Full result",{exact:false}).first().waitFor();
     await page.locator("summary").filter({hasText:"Full result"}).click();
     await page.getByText("AuditInteriorMarker",{exact:false}).waitFor();
@@ -537,6 +559,48 @@ tools = ["inspect"]
     provider.closeAllConnections();
     await new Promise(resolve => provider.close(resolve));
     await rm(dir,{recursive:true,force:true});
+  }
+});
+
+test("a broken profile is reported before a run starts", { timeout: 60_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ratio-config-"));
+  const profile = join(dir, "ratio.toml");
+  const settings = 'endpoint = "http://127.0.0.1:9/v1"\nmodel = "fixture-model"\n';
+  await writeFile(profile, settings);
+  const child = spawn(bin, ["-C", dir, "--config", profile, "--web", "--web-port=0"], { stdio: ["ignore", "pipe", "pipe"] });
+  let browser;
+  try {
+    const [launch] = await once(createInterface({ input: child.stdout }), "line");
+    const address = new URL(launch);
+    const token = new URLSearchParams(address.hash.slice(1)).get("access");
+    const refused = await fetch(address.origin + "/api/action", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, Origin: address.origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "refused-start", action: "start", text: "Inspect the project" }),
+    });
+    assert.equal(refused.status, 409);
+    assert.equal((await refused.json()).error, "set --context-window to the model's token limit");
+    browser = await chromium.launch();
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    page.setDefaultTimeout(10_000);
+    await page.goto(launch);
+    await page.getByText("set --context-window to the model's token limit", { exact: true }).waitFor();
+    assert.equal(await page.getByRole("button", { name: "Test provider", exact: true }).count(), 0);
+    await page.locator("#new-run").click();
+    assert.equal(await page.locator("#submit-action").isDisabled(), true);
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
+    await writeFile(profile, settings + "context_window = 8192\n");
+    await page.getByRole("button", { name: "Recheck", exact: true }).click();
+    await page.getByText("8,192 tokens, replies up to 2,048", { exact: true }).waitFor();
+    await page.getByText("None. A run continues until the reviewer approves or rejects it.", { exact: true }).waitFor();
+    await page.locator("#new-run").click();
+    assert.equal(await page.locator("#submit-action").isDisabled(), false);
+  } finally {
+    if (browser) await browser.close();
+    const exited = once(child, "exit");
+    child.kill();
+    await exited;
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

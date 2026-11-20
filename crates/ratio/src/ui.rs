@@ -1033,7 +1033,9 @@ impl View {
         }
         if let Some(receipt) = &self.workflow.verification {
             lines.push(Line::default());
-            lines.push(Line::raw(format!("Candidate {}", receipt.candidate)));
+            if !receipt.candidate.is_empty() {
+                lines.push(Line::raw(format!("Candidate {}", receipt.candidate)));
+            }
             lines.push(Line::raw(if receipt.passed {
                 "Verification passed"
             } else {

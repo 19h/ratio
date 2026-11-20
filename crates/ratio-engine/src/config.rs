@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 )]
 pub struct Cli {
     /// Serve the workspace's live and historical runs in a local browser.
-    #[arg(long, conflicts_with_all = ["request", "goal", "goal_stdin", "attach", "resume", "fork", "detached", "control", "plan_only", "review_plan", "check_mcp", "list_runs", "events", "metrics", "otlp_trace", "evaluate"])]
+    #[arg(long, conflicts_with_all = ["request", "goal", "goal_stdin", "attach", "resume", "fork", "detached", "control", "plan_only", "review_plan", "check_mcp", "check_provider", "list_runs", "events", "metrics", "otlp_trace", "evaluate"])]
     pub web: bool,
     /// Loopback port for --web. Zero selects a free port.
     #[arg(long, requires = "web", default_value_t = 0)]
@@ -46,6 +46,9 @@ pub struct Cli {
     /// List permitted tools from a configured stdio server without starting a run.
     #[arg(long, value_name = "NAME", conflicts_with_all = ["request", "goal", "goal_stdin", "resume", "detached", "plan_only"])]
     pub check_mcp: Option<String>,
+    /// Send one small request to each configured model and print the result as JSON.
+    #[arg(long, conflicts_with_all = ["request", "goal", "goal_stdin", "resume", "detached", "plan_only", "check_mcp", "fork", "attach", "control", "list_runs", "events", "metrics", "otlp_trace", "evaluate"])]
+    pub check_provider: bool,
     #[arg(short, long)]
     pub config: Option<PathBuf>,
     #[arg(short = 'C', long)]
@@ -77,6 +80,9 @@ pub struct Cli {
     seed: Option<i64>,
     #[arg(long, value_name = "BOOL")]
     parallel_tool_calls: Option<bool>,
+    /// Reasoning effort to request, such as low, medium, or high.
+    #[arg(long, value_name = "LEVEL")]
+    reasoning_effort: Option<String>,
     /// Send max_tokens for providers that require the legacy field.
     #[arg(long)]
     legacy_max_tokens: bool,
@@ -309,7 +315,32 @@ pub struct Provider {
     pub top_p: Option<f64>,
     pub seed: Option<i64>,
     pub parallel_tool_calls: Option<bool>,
+    pub reasoning_effort: Option<String>,
     pub headers: BTreeMap<String, String>,
+}
+
+/// A model with the reasoning effort to request from it.
+#[derive(Clone, Copy)]
+pub struct ModelSpec<'a> {
+    pub model: &'a str,
+    pub effort: Option<&'a str>,
+}
+
+impl<'a> ModelSpec<'a> {
+    /// Apply an agent's own overrides over a role default.
+    pub fn with(self, model: Option<&'a str>, effort: Option<&'a str>) -> Self {
+        Self {
+            model: model.unwrap_or(self.model),
+            effort: effort.or(self.effort),
+        }
+    }
+}
+
+fn valid_effort(value: &str) -> bool {
+    (1..=32).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte))
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, ValueEnum)]
@@ -330,6 +361,7 @@ impl Default for Provider {
             top_p: None,
             seed: None,
             parallel_tool_calls: None,
+            reasoning_effort: None,
             headers: BTreeMap::new(),
         }
     }
@@ -340,6 +372,8 @@ impl Default for Provider {
 struct RoleConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -361,6 +395,8 @@ pub struct Orchestration {
     pub verification_commands: Vec<String>,
     pub worker_system_prompt: Option<String>,
     pub reviewer_system_prompt: Option<String>,
+    pub project_instructions: bool,
+    pub instruction_files: Vec<String>,
 }
 
 impl Default for Orchestration {
@@ -382,6 +418,10 @@ impl Default for Orchestration {
             verification_commands: Vec::new(),
             worker_system_prompt: None,
             reviewer_system_prompt: None,
+            project_instructions: true,
+            instruction_files: ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md"]
+                .map(String::from)
+                .to_vec(),
         }
     }
 }
@@ -443,13 +483,17 @@ pub struct Stakeholder {
 
 impl RoleConfig {
     fn is_default(&self) -> bool {
-        self.model.is_none()
+        self.model.is_none() && self.reasoning_effort.is_none()
     }
 }
 
 impl Stakeholder {
-    pub fn model<'a>(&'a self, fallback: &'a str) -> &'a str {
-        self.agent.model.as_deref().unwrap_or(fallback)
+    /// This participant's model and effort, falling back to the role default.
+    pub fn spec<'a>(&'a self, fallback: ModelSpec<'a>) -> ModelSpec<'a> {
+        fallback.with(
+            self.agent.model.as_deref(),
+            self.agent.reasoning_effort.as_deref(),
+        )
     }
 }
 
@@ -459,6 +503,49 @@ pub struct Worker {
     pub name: String,
     pub persona: String,
     pub model: Option<String>,
+    // Omitted when unset so plan digests of existing runs stay stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+impl Worker {
+    /// This worker's model and effort, falling back to the role default.
+    pub fn spec<'a>(&'a self, fallback: ModelSpec<'a>) -> ModelSpec<'a> {
+        fallback.with(self.model.as_deref(), self.reasoning_effort.as_deref())
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::{ModelSpec, Stakeholder, Worker, valid_effort};
+
+    #[test]
+    fn agent_settings_override_the_role_default_and_keep_plan_digests_stable() {
+        let role = ModelSpec {
+            model: "role-model",
+            effort: Some("low"),
+        };
+        let plain: Worker = toml::from_str("name = \"A\"\npersona = \"B\"").unwrap();
+        let spec = plain.spec(role);
+        assert_eq!((spec.model, spec.effort), ("role-model", Some("low")));
+        // The roster is hashed into the plan ID, so an unset effort must not appear.
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"name":"A","persona":"B","model":null}"#
+        );
+        let tuned: Worker =
+            toml::from_str("name = \"A\"\npersona = \"B\"\nreasoning_effort = \"high\"").unwrap();
+        let spec = tuned.spec(role);
+        assert_eq!((spec.model, spec.effort), ("role-model", Some("high")));
+        let reviewer: Stakeholder = toml::from_str(
+            "name = \"A\"\npersona = \"B\"\n[agent]\nmodel = \"own\"\nreasoning_effort = \"medium\"",
+        )
+        .unwrap();
+        let spec = reviewer.spec(role);
+        assert_eq!((spec.model, spec.effort), ("own", Some("medium")));
+        assert!(valid_effort("xhigh") && valid_effort("low-latency_2"));
+        assert!(!valid_effort("") && !valid_effort("Very High") && !valid_effort(&"x".repeat(33)));
+    }
 }
 
 fn both_phases() -> Vec<ConsultationPhase> {
@@ -467,11 +554,15 @@ fn both_phases() -> Vec<ConsultationPhase> {
 
 pub struct Config {
     pub goal: Option<String>,
+    /// Profile this configuration was read from, if any.
+    pub profile: Option<PathBuf>,
     pub cwd: PathBuf,
     pub endpoint: String,
     pub api_key: Option<String>,
     pub worker_model: String,
     pub reviewer_model: String,
+    pub worker_effort: Option<String>,
+    pub reviewer_effort: Option<String>,
     pub context_window: usize,
     pub output_tokens: usize,
     pub legacy_max_tokens: bool,
@@ -491,6 +582,107 @@ pub struct Config {
 }
 
 impl Config {
+    /// Default model and effort for work-phase agents.
+    pub fn worker_spec(&self) -> ModelSpec<'_> {
+        ModelSpec {
+            model: &self.worker_model,
+            effort: self.worker_effort.as_deref(),
+        }
+    }
+
+    /// Default model and effort for the lead reviewer and inspection agents.
+    pub fn reviewer_spec(&self) -> ModelSpec<'_> {
+        ModelSpec {
+            model: &self.reviewer_model,
+            effort: self.reviewer_effort.as_deref(),
+        }
+    }
+
+    /// What the next run will use, for display to the operator. Built as an
+    /// allowlist: the key and header values never appear, only their presence.
+    pub fn summary(&self) -> serde_json::Value {
+        let endpoint = reqwest::Url::parse(&self.endpoint).map_or_else(
+            |_| "invalid URL".to_owned(),
+            |mut url| {
+                url.set_query(None);
+                url.set_fragment(None);
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                url.to_string()
+            },
+        );
+        let limits = &self.orchestration;
+        fn names(agents: &[Stakeholder]) -> Vec<&str> {
+            agents.iter().map(|agent| agent.name.as_str()).collect()
+        }
+        serde_json::json!({
+            "workspace": self.cwd,
+            "profile": self.profile,
+            "provider": {
+                "endpoint": endpoint,
+                "api": match self.provider.api {
+                    ProviderApi::ChatCompletions => "chat_completions",
+                    ProviderApi::Responses => "responses",
+                },
+                "stream": self.provider.stream,
+                "key": self.api_key.is_some(),
+                "headers": self.provider.headers.keys().collect::<Vec<_>>(),
+            },
+            "models": {
+                "worker": self.worker_model, "reviewer": self.reviewer_model,
+                "worker_effort": self.worker_effort, "reviewer_effort": self.reviewer_effort,
+            },
+            "context_window": self.context_window,
+            "output_tokens": self.output_tokens,
+            "limits": {
+                "max_review_cycles": limits.max_review_cycles,
+                "max_requests": limits.max_requests,
+                "max_total_tokens": limits.max_total_tokens,
+                "max_run_secs": limits.max_run_secs,
+                "max_tool_rounds": limits.max_tool_rounds,
+                "max_parallel_agents": limits.max_parallel_agents,
+                "request_timeout_secs": limits.request_timeout_secs,
+                "command_timeout_secs": limits.command_timeout_secs,
+            },
+            "team": {
+                "mode": if !self.workers.is_empty() {
+                    "configured"
+                } else if self.fixed_team {
+                    "fixed"
+                } else {
+                    "generated"
+                },
+                "workers": self.workers.iter().map(|worker| &worker.name).collect::<Vec<_>>(),
+                "reviewers": names(&self.reviewers),
+                "stakeholders": names(&self.stakeholders),
+            },
+            "staging": {
+                "enabled": limits.stage_workspace,
+                "verification_commands": limits.verification_commands,
+            },
+            "instructions": {
+                "enabled": limits.project_instructions,
+                "files": limits.instruction_files,
+            },
+            "mcp_servers": self.mcp_servers.keys().collect::<Vec<_>>(),
+            "skills": self.skills.keys().collect::<Vec<_>>(),
+        })
+    }
+
+    /// Project instruction text for agent prompts, read from the workspace root.
+    pub(crate) fn project_instructions(&self) -> Option<String> {
+        self.orchestration
+            .project_instructions
+            .then(|| {
+                crate::instructions::load(
+                    &self.cwd,
+                    &self.orchestration.instruction_files,
+                    crate::instructions::limit(self.context_window),
+                )
+            })
+            .flatten()
+    }
+
     fn profile(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
         if let Some(path) = explicit {
             return Some(path.to_owned());
@@ -586,6 +778,28 @@ impl Config {
             "output token budget must be positive and smaller than the context window"
         );
         let mut provider = file.provider;
+        // An agent's own setting wins, then its role, then the shared default.
+        let shared_effort = cli.reasoning_effort.or(provider.reasoning_effort.take());
+        let worker_effort = file.worker.reasoning_effort.or(shared_effort.clone());
+        let reviewer_effort = file.reviewer.reasoning_effort.or(shared_effort);
+        ensure!(
+            worker_effort
+                .iter()
+                .chain(&reviewer_effort)
+                .chain(
+                    file.workers
+                        .iter()
+                        .filter_map(|worker| worker.reasoning_effort.as_ref())
+                )
+                .chain(
+                    file.reviewers
+                        .iter()
+                        .chain(&file.stakeholders)
+                        .filter_map(|agent| agent.agent.reasoning_effort.as_ref())
+                )
+                .all(|value| valid_effort(value)),
+            "reasoning_effort must be 1 to 32 characters of a-z, 0-9, _ or -"
+        );
         provider.api = cli.provider_api.unwrap_or(provider.api);
         provider.stream = cli.stream.unwrap_or(provider.stream);
         provider.temperature = cli.temperature.or(provider.temperature);
@@ -621,14 +835,17 @@ impl Config {
         }
         ensure!(file.workers.len() <= 64, "configure at most 64 workers");
         ensure!(
-            !orchestration.stage_workspace
-                || (!orchestration.verification_commands.is_empty()
-                    && orchestration.verification_commands.len() <= 16
-                    && orchestration
-                        .verification_commands
-                        .iter()
-                        .all(|command| !command.trim().is_empty() && command.len() <= 4096)),
+            !orchestration.stage_workspace || !orchestration.verification_commands.is_empty(),
             "staged execution requires 1–16 nonempty verification commands of at most 4096 bytes each"
+        );
+        // Direct runs check the same commands in the live workspace.
+        ensure!(
+            orchestration.verification_commands.len() <= 16
+                && orchestration
+                    .verification_commands
+                    .iter()
+                    .all(|command| !command.trim().is_empty() && command.len() <= 4096),
+            "verification_commands accepts up to 16 nonempty commands of at most 4096 bytes each"
         );
         ensure!(
             file.workers
@@ -644,6 +861,14 @@ impl Config {
         ensure!(
             (1..=64).contains(&orchestration.max_parallel_agents),
             "max_parallel_agents must be 1–64"
+        );
+        ensure!(
+            orchestration.instruction_files.len() <= 8
+                && orchestration
+                    .instruction_files
+                    .iter()
+                    .all(|name| crate::instructions::valid_name(name)),
+            "instruction_files accepts at most 8 workspace-relative file paths"
         );
         ensure!(
             file.reviewers.len() + file.stakeholders.len() <= 64,
@@ -686,6 +911,7 @@ impl Config {
 
         Ok(Self {
             goal: cli.goal.or(file.goal),
+            profile: cli.config,
             cwd,
             endpoint: cli
                 .endpoint
@@ -699,6 +925,8 @@ impl Config {
                 .filter(|key| !key.is_empty()),
             worker_model,
             reviewer_model,
+            worker_effort,
+            reviewer_effort,
             context_window,
             output_tokens,
             legacy_max_tokens: cli.legacy_max_tokens || file.legacy_max_tokens,

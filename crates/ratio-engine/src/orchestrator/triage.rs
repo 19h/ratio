@@ -136,7 +136,7 @@ impl Orchestrator<'_> {
                 .complete_as(
                     "lead_reviewer",
                     "Information triage",
-                    &self.config.reviewer_model,
+                    self.config.reviewer_spec(),
                     &messages,
                     &schemas,
                     output,

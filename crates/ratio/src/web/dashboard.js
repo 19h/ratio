@@ -25,7 +25,7 @@ const stages = [
   ["Publish", ["Publish"]],
 ];
 const endings = ["Approved", "Rejected", "Exhausted"];
-const state = { runs: [], summary: null, live: null, route: {}, version: 0, stream: null, follow: true, refreshPending: false };
+const state = { runs: [], summary: null, live: null, config: null, providerCheck: null, route: {}, version: 0, stream: null, follow: true, refreshPending: false };
 const number = new Intl.NumberFormat();
 const clock = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
 
@@ -196,6 +196,7 @@ function renderLive() {
     : state.route.run ? "Recorded run" : readOnly ? "Shared run" : "Local workspace";
   const controls = $("#controls");
   const actions = readOnly ? [] : state.live ? [
+    button("Guide", () => openAction("guide")),
     button("Add worker", () => openAction("add_worker"), { disabled: state.summary?.run?.phase !== "Work" }),
     button(state.live.paused ? "Resume" : "Pause", () => sendAction(state.live.paused ? "resume" : "pause").catch(captureError)),
     button("Stop", () => openAction("stop"), { class: "danger" }),
@@ -264,15 +265,71 @@ function tokenFlow(kind, arrow, label, count) {
     text);
 }
 
+async function testProvider() {
+  state.providerCheck = { pending: true };
+  load(false);
+  try { state.providerCheck = await postAction("check_provider"); }
+  catch (error) { state.providerCheck = { error: error.message }; }
+  load(false);
+}
+
+function providerCheck() {
+  const check = state.providerCheck;
+  if (!check) return null;
+  if (check.pending) return muted("Sending one small request to each configured model…");
+  if (check.error) return node("p", { class: "action-error", role: "alert" }, check.error);
+  return table(["Model", "Result", "Latency"], check.checks.map(item => [code(item.model),
+    !item.ok ? node("span", { class: "action-error" }, item.error)
+      : item.tool_call ? "Reachable. The model returned the test tool call."
+        : "Reachable, but the model did not call the test tool. Check that it supports function calling.",
+    item.ok ? `${number.format(item.latency_ms)} ms` : "—"]));
+}
+
+function configPanel() {
+  const config = state.config;
+  if (!config) return null;
+  const actions = row(button("Recheck", () => { state.providerCheck = null; load(false); }),
+    config.ok ? button("Test provider", () => testProvider(), { disabled: Boolean(state.providerCheck?.pending) }) : null);
+  const note = muted("Each run reads the profile when it starts. Flags and environment variables are fixed when the dashboard starts.");
+  if (!config.ok) {
+    return section("Configuration", node("p", { class: "action-error", role: "alert" }, config.error),
+      muted("Runs cannot start until this is fixed. Edit the profile, then choose Recheck."), note, actions);
+  }
+  const { provider, models, team, staging, limits } = config;
+  const model = (name, effort) => [code(name), effort ? ` (${effort} effort)` : null];
+  const caps = [
+    limits.max_review_cycles ? `${number.format(limits.max_review_cycles)} review cycles` : null,
+    limits.max_total_tokens ? `${number.format(limits.max_total_tokens)} tokens` : null,
+    limits.max_run_secs ? `${number.format(limits.max_run_secs)} seconds` : null,
+    limits.max_requests ? `${number.format(limits.max_requests)} requests` : null,
+  ].filter(Boolean);
+  return section({ label: "Configuration", meta: config.profile ?? "No profile file" }, facts([
+    ["Endpoint", [code(provider.endpoint), " ", tag(provider.api)]],
+    ["Key", provider.key ? "Set" : "Not set"],
+    ["Models", models.worker === models.reviewer && models.worker_effort === models.reviewer_effort
+      ? model(models.worker, models.worker_effort)
+      : ["Workers ", model(models.worker, models.worker_effort), ", reviewer ", model(models.reviewer, models.reviewer_effort)]],
+    ["Context", `${number.format(config.context_window)} tokens, replies up to ${number.format(config.output_tokens)}`],
+    ["Team", team.mode === "generated" ? "Proposed for each request"
+      : team.mode === "fixed" ? "One built-in worker" : `Configured: ${team.workers.join(", ")}`],
+    ["Publication", [staging.enabled ? "Staged." : "Direct. Workers edit the workspace in place.",
+      staging.verification_commands.length ? [" Verified by ", code(staging.verification_commands.join(" && "))] : null]],
+    ["Limits", caps.length ? caps.join(", ") : "None. A run continues until the reviewer approves or rejects it."],
+    ["MCP servers", config.mcp_servers.length ? config.mcp_servers.join(", ") : null],
+  ]), providerCheck(), note, actions);
+}
+
 function workspace() {
   if (!state.runs.length) {
-    return view(heading("Runs"), node("button", { type: "button", class: "empty-drop", onclick: () => openAction("start") },
+    return view(heading("Runs"), [node("button", { type: "button", class: "empty-drop", onclick: () => openAction("start") },
       node("strong", {}, "Start a run"),
-      node("span", {}, "Describe the outcome and its constraints. Ratio proposes a team, plans the work, and records every step here.")));
+      node("span", {}, "Describe the outcome and its constraints. Ratio proposes a team, plans the work, and records every step here.")),
+    configPanel()]);
   }
-  return view(heading("Runs", `${state.runs.length} in this workspace`),
+  return view(heading("Runs", `${state.runs.length} in this workspace`), [
     section({ label: "Run history", flush: true }, table(["Run", "Phase", "Cycle", "Last checkpoint"], state.runs.map(run =>
-      [link(run.run_id, runUrl("overview", {}, run.run_id)), pill(run.phase), run.cycle, code(run.last_sequence)]))));
+      [link(run.run_id, runUrl("overview", {}, run.run_id)), pill(run.phase), run.cycle, code(run.last_sequence)]))),
+    configPanel()]);
 }
 
 function agentRow(agent, task, describe = true) {
@@ -344,7 +401,8 @@ function overview() {
         section("Run state", facts([
           ["Acknowledged", acknowledged.length ? acknowledged.map(id => actorLink(id)) : "None yet"],
           ["Worker request", flow.worker_addition ? go(flow.worker_addition, runUrl("triage")) : "None yet"],
-          ["Verification", flow.verification ? [pill(flow.verification.passed ? "completed" : "failed"), code(flow.verification.candidate)] : "No receipt yet"],
+          ["Verification", flow.verification ? [pill(flow.verification.passed ? "completed" : "failed"),
+            flow.verification.candidate ? code(flow.verification.candidate) : null] : "No receipt yet"],
           ["Verdict", data.verdict ? pill(data.verdict.verdict) : null],
           ["Assessment", data.assessment ? pre(data.assessment) : null],
           ["Failure", data.latest_error ? [pre(data.latest_error.data.text), go("Open failure in timeline", entryUrl(data.latest_error.key))] : null],
@@ -690,6 +748,7 @@ async function triageView(route) {
   return view(heading("Triage", null,
     !readOnly ? [
       button("Submit information", () => openAction("triage"), { class: "primary", disabled: !state.live }),
+      button("Send guidance", () => openAction("guide"), { disabled: !state.live }),
       button("Request worker", () => openAction("add_worker"), { disabled: !working }),
     ] : null), [
     workflow?.worker_addition ? section("Worker admission", node("p", {}, workflow.worker_addition),
@@ -857,12 +916,14 @@ async function load(restart = true, preserveInteraction = false) {
   }
   main.setAttribute("aria-busy", "true");
   try {
-    const [runs, summary, live] = await Promise.all([
+    const [runs, summary, live, config] = await Promise.all([
       readOnly ? { runs: [] } : api("/api/runs"),
       wanted.run ? api(apiRun("overview")) : null,
       wanted.run ? api(apiRun("live")).catch(() => null) : null,
+      wanted.run || readOnly ? state.config : api("/api/config").catch(() => null),
     ]);
     if (version !== state.version) return;
+    state.config = config;
     const navigationChanged = navigationKey(state.runs, state.summary) !== navigationKey(runs.runs, summary);
     state.runs = runs.runs;
     state.summary = summary;
@@ -964,6 +1025,7 @@ const descriptions = {
   resume_saved: ["Resume saved run", "Continue from the latest committed checkpoint with the current runner configuration.", "", false],
   add_worker: ["Request a worker", "Describe the role and scope. Writes remain gated until unanimous acknowledgement.", "Assignment and proposed scope", true],
   triage: ["Submit information", "The lead reviewer will classify and route this item automatically.", "Information", true],
+  guide: ["Send guidance", "Sent verbatim to every agent active in the current phase. Use Submit information when the lead reviewer should decide who needs it.", "Guidance", true],
   stop: ["Stop this run", "Cancel active work and retain the last checkpoint.", "", false],
 };
 
@@ -983,7 +1045,11 @@ function openAction(name, initial = "") {
   input.required = required;
   input.maxLength = name === "start" || name === "fork" ? 65536 : 4096;
   $("#submit-action").textContent = label;
-  $(".action-error").hidden = true;
+  // A known-bad profile cannot start a run. Say why before the request is typed.
+  const blocked = (name === "start" || name === "fork") && state.config?.ok === false;
+  $("#submit-action").disabled = blocked;
+  $(".action-error").textContent = blocked ? state.config.error : "";
+  $(".action-error").hidden = !blocked;
   $("#action-dialog").showModal();
   (field ? input : $("#submit-action")).focus();
 }

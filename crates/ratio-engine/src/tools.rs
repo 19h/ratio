@@ -20,6 +20,7 @@ use tokio::{
 use crate::{api::ToolCall, context::clip, line_tags};
 
 pub mod mcp;
+mod search;
 pub(crate) mod skills;
 #[cfg(windows)]
 mod windows_job;
@@ -120,12 +121,33 @@ impl Tools<'_> {
                 &["command", "workdir"],
             ));
         }
+        schemas.extend(search::schemas());
         schemas
+    }
+
+    async fn search_scope(&self, path: Option<&Path>) -> Result<search::Scope> {
+        let within = match path {
+            Some(path) => self
+                .resolve(path)
+                .await?
+                .strip_prefix(self.workspace)?
+                .to_owned(),
+            None => PathBuf::new(),
+        };
+        Ok(search::Scope {
+            workspace: self.workspace.to_owned(),
+            within,
+            output_bytes: self.output_bytes,
+            timeout: self.timeout,
+        })
     }
 
     pub fn label(&self, call: &ToolCall) -> String {
         let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
         let detail = args.get("path").and_then(Value::as_str).or_else(|| {
+            if let Some(pattern) = args.get("pattern").and_then(Value::as_str) {
+                return Some(pattern);
+            }
             let command = args.get("command")?;
             command
                 .as_str()
@@ -211,6 +233,19 @@ impl Tools<'_> {
                     .await?;
                 *audit = Some(full);
                 Ok(format!("Untrusted Git diff\n{output}"))
+            }
+            "search_files" => {
+                let args: search::SearchFiles = crate::api::tool_arguments(arguments)?;
+                let scope = self.search_scope(args.path.as_deref()).await?;
+                let (visible, full) =
+                    tokio::task::spawn_blocking(move || search::search(&scope, &args)).await??;
+                *audit = Some(full);
+                Ok(visible)
+            }
+            "find_files" => {
+                let args: search::FindFiles = crate::api::tool_arguments(arguments)?;
+                let scope = self.search_scope(args.path.as_deref()).await?;
+                Ok(tokio::task::spawn_blocking(move || search::find(&scope, &args)).await??)
             }
             "create_file" if matches!(self.access, Access::Work) => {
                 let args: CreateFile = crate::api::tool_arguments(arguments)?;
@@ -876,13 +911,23 @@ struct CapturedStream {
 }
 
 impl CapturedStream {
+    /// Render at most `cap` captured bytes. Long output keeps its start and a
+    /// larger share of its end, where builds and tests report their failures.
     fn render(&self, cap: usize) -> String {
-        let keep = self.bytes.len().min(cap);
-        let mut result = String::from_utf8_lossy(&self.bytes[..keep]).into_owned();
-        if self.total > keep {
-            result.push_str(&format!("\n[{} bytes omitted]", self.total - keep));
+        if self.total <= cap && self.bytes.len() == self.total {
+            return String::from_utf8_lossy(&self.bytes).into_owned();
         }
-        result
+        let keep = self.bytes.len().min(cap);
+        let head = keep / 4;
+        let tail = keep - head;
+        // Bytes past the capture limit were never stored, so the tail is the
+        // end of what was captured.
+        format!(
+            "{}\n[{} bytes omitted]\n{}",
+            String::from_utf8_lossy(&self.bytes[..head]),
+            self.total - keep,
+            String::from_utf8_lossy(&self.bytes[self.bytes.len() - tail..])
+        )
     }
 }
 
@@ -1036,6 +1081,26 @@ impl ShellCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_command_output_keeps_its_start_and_most_of_its_end() {
+        let stream = |text: &str| CapturedStream {
+            bytes: text.as_bytes().to_vec(),
+            total: text.len(),
+        };
+        assert_eq!(stream("short").render(64), "short");
+        let long = format!("BEGIN{}FAILED: assertion at the end", "x".repeat(4000));
+        let shown = stream(&long).render(200);
+        assert!(shown.starts_with("BEGIN") && shown.ends_with("FAILED: assertion at the end"));
+        assert!(shown.contains(&format!("\n[{} bytes omitted]\n", long.len() - 200)));
+        assert_eq!(shown.len(), 200 + "\n[3837 bytes omitted]\n".len());
+        // Output beyond the capture limit is counted even though it was not stored.
+        let capped = CapturedStream {
+            bytes: b"stored".to_vec(),
+            total: 1000,
+        };
+        assert!(capped.render(4096).contains("[994 bytes omitted]"));
+    }
 
     #[tokio::test]
     async fn shell_starts_in_the_requested_directory() {

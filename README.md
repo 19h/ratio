@@ -49,7 +49,7 @@ export RATIO_API_KEY='<provider key>'
 ra -C /path/to/project --web
 ```
 
-Ratio prints a private URL such as `http://127.0.0.1:52814/#access=...`. Open it in your browser, click **Start run**, and describe the outcome you want. Ratio proposes a team, plans, works, and reviews while you watch.
+Ratio prints a private URL such as `http://127.0.0.1:52814/#access=...`. Open it in your browser. The start page shows the configuration the next run will use, and reports a broken profile before you start. Click **Test provider** to confirm the endpoint, key, and model. Then click **Start run** and describe the outcome you want. Ratio proposes a team, plans, works, and reviews while you watch.
 
 Three things to know before the first run:
 
@@ -147,7 +147,7 @@ verification_commands = ["npm test"]
 ra -C PROJECT --config PROJECT/ratio.toml --web
 ```
 
-This profile turns on [staged publication](#staged-publication). Workers edit private copies, `npm test` runs on the merged candidate, and your worktree changes only after the reviewer approves a candidate that passed. Staging needs the root of a Git worktree and at least one verification command.
+This profile turns on [staged publication](#staged-publication). Workers edit private copies, `npm test` runs on the merged candidate, and your worktree changes only after the reviewer approves a candidate that passed. Staging needs the root of a Git worktree and at least one verification command. Without `stage_workspace`, the same [verification commands](#verification-commands) run in the live workspace and still block approval when they fail.
 
 More starting points:
 
@@ -161,21 +161,40 @@ git -C "$workspace" init
 ra --headless --config examples/morph-dsv41flash-abliterated.toml -C "$workspace"
 ```
 
+### Project instructions
+
+At the start of a run, Ratio reads `AGENTS.md`, `CLAUDE.md`, and `CONTRIBUTING.md` from the workspace root and adds them to every agent's system prompt. Build commands, conventions, and rules you already wrote for people or other tools apply without repeating them in the request.
+
+```toml
+[orchestration]
+# project_instructions = false                 # turn loading off
+instruction_files = ["AGENTS.md", "docs/CONVENTIONS.md"]
+```
+
+Files are read in order until the budget is spent, which is an eighth of the context window and at most 8 KiB. Longer text is shortened in the middle. Files with identical content are included once. The text is fixed when the run starts, so an agent that edits one of these files does not change the prompts of the others. `instruction_files` takes up to eight paths relative to the workspace.
+
 ### Check the setup
 
+The dashboard's start page lists the endpoint, models, context window, team mode, publication mode, and limits that the next run will use. It never shows the key or header values, only whether they are set. **Test provider** sends one small request to each configured model and reports whether it answered and whether it returned a tool call. **Recheck** reads the profile again after you edit it.
+
+The same checks run from a terminal.
+
 ```sh
+ra -C /path/to/project --check-provider
 ra -C /path/to/project --plan-only 'Add a --version flag to the CLI'
 ```
 
-This asks the model to propose a team for the request, prints the proposal as JSON, and exits. It writes nothing to the project. A printed proposal means the endpoint, key, model ID, and function calling all work. Otherwise it prints the provider's error.
+`--check-provider` prints one JSON record per model with `ok`, `tool_call`, `latency_ms`, and any provider error. `--plan-only` asks the model to propose a team for the request, prints the proposal as JSON, and exits. A printed proposal means the endpoint, key, model ID, and function calling all work. Neither command writes to the project.
 
 ### When a run does not start
 
-Each run the dashboard starts writes a log to `PROJECT/.ratio/runner-*.log`. A run that fails after starting also shows a **Failure** entry on its Overview.
+The start page and the **Start run** dialog report a profile that cannot be loaded. Each run the dashboard starts also writes a log to `PROJECT/.ratio/runner-*.log`. A run that fails after starting shows a **Failure** entry on its Overview.
 
 | What you see | Cause | Fix |
 | --- | --- | --- |
-| **Start run** shows `detached process exited during startup ... See .../.ratio/runner-....log` | The run could not load its settings. The log names the reason. | `set --model or --worker-model` means no model is configured. `set --context-window to the model's token limit` means `context_window` is missing. Add the setting to the profile and click **Start run** again. |
+| The start page or **Start run** shows `set --model or --worker-model` | No model is configured. | Add `model` to the profile and click **Recheck**. |
+| The start page or **Start run** shows `set --context-window to the model's token limit` | `context_window` is missing. | Add `context_window` to the profile and click **Recheck**. |
+| **Start run** shows `detached process exited during startup ... See .../.ratio/runner-....log` | The run stopped while starting. The log names the reason. | Open the log, fix the cause it names, and click **Start run** again. |
 | `ra: invalid config ...: unknown field` | A key is misspelled or sits in the wrong table, such as a limit outside `[orchestration]`. | Fix the key. The message lists the keys Ratio accepts at that level. |
 | The run stays in the Team phase, the log repeats `Provider retry`, and the run fails with `Connection refused` | The endpoint is unreachable. | Check the URL and port, and that the local server is running. |
 | The provider answers 401 or 403 | The key is missing, wrong, or not visible to the dashboard. | Export `RATIO_API_KEY` in the same shell, then restart `ra --web`. |
@@ -202,9 +221,20 @@ Each run the dashboard starts writes a log to `PROJECT/.ratio/runner-*.log`. A r
 | Streaming | `--stream true\|false` | | `[provider].stream`, `[provider].stream_usage` |
 | Sampling | `--temperature`, `--top-p`, `--seed` | | `[provider].temperature`, `top_p`, `seed` |
 | Provider tool batching | `--parallel-tool-calls true\|false` | | `[provider].parallel_tool_calls` |
+| Reasoning effort | `--reasoning-effort LEVEL` | | `[provider].reasoning_effort`, `[worker]`, `[reviewer]`, `[[workers]]`, `[stakeholders.agent]` |
 | Extra HTTP headers | | | `[provider.headers]` |
 
 Role-specific and per-agent model settings can override the shared model. Set the context window to a token budget supported by every model in the run.
+
+`reasoning_effort` is unset by default and nothing is sent. Set it to a level your provider accepts, such as `low`, `medium`, or `high`. Ratio sends it as `reasoning_effort` with Chat Completions and as `reasoning.effort` with Responses. An agent's own setting wins, then its role table, then the flag, then `[provider]`. A common split is a higher level for the reviewer than for the workers.
+
+```toml
+[provider]
+reasoning_effort = "medium"
+
+[reviewer]
+reasoning_effort = "high"
+```
 
 Chat Completions is the default. Pass the base URL or full method URL for the selected transport. Choose Responses with `--provider-api responses` or `[provider].api = "responses"`. Both transports support function tools and SSE, with complete JSON accepted as a fallback. Ratio waits for a complete model reply before dispatching any tool. Responses uses `store: false` and carries returned reasoning items alongside the corresponding tool results.
 
@@ -266,10 +296,13 @@ Press `1` to `6` to switch views and `/` to search the run. In the message seque
 | --- | --- |
 | **Pause** / **Resume** | Interrupt active generations and hold the run, then continue it |
 | **Stop** | Cancel active work and keep the last checkpoint |
+| **Guide** | Send an instruction verbatim to every agent active in the current phase |
 | **Add worker** | Request an additional worker during the work phase. See [Adding a worker mid-run](#adding-a-worker-mid-run). |
 | **Submit information** in the Triage view | Give the team new information. The lead reviewer routes it to the right agents. |
 | **Resume saved** | Continue a stopped run from its latest checkpoint with the current configuration |
 | **Fork** | Start a new run with the same roster, optionally with a new request |
+
+Use **Guide** when you know what the team should do differently. The text reaches the active agents with their next model request, up to 4,096 bytes. Use **Submit information** when you have facts and want the lead reviewer to decide who needs them.
 
 Automatic triage uses the lead reviewer to classify and route information within the existing run permissions. You can name agents in the note. A queued note is waiting for routing at a runner checkpoint. Delivery saves it for the recipient and places it after the tool history in the next model request. The inbox shows the routing decision and delivery receipts, and allows you to retry routing an undelivered note. Pending items are marked deferred if the run finishes before delivery. **Add worker** requests a separate, read-only onboarding phase followed by unanimous acknowledgement of the amended plan. The worker request links to its onboarding IPC.
 
@@ -478,9 +511,13 @@ The reviewer and stakeholders can list directories, read workspace files, and in
 | Operation | Behavior |
 | --- | --- |
 | `read_file` | Returns tagged UTF-8 lines or a byte range. Binary input automatically returns a hex and ASCII preview. |
+| `search_files` | Searches file lines by regex, or by literal text with `literal`. Narrow it with `path`, `glob`, and `ignore_case`, and add `context` lines. Rows carry the same line tags as `read_file`, so a match can be edited directly. |
+| `find_files` | Lists files matching a glob such as `*.rs` or `src/**/*.{ts,tsx}`. A pattern without a `/` matches the file name at any depth. |
 | `edit_file` | Applies one batch against a single snapshot. Use `tag` for a line, `tag..tag` for an inclusive range, `+tag` to insert before, or `tag+` to insert after. Range edits require the latest `snapshot_id`. |
 | `create_file` | Creates a file only if its destination is absent. |
-| `shell` | Requires `workdir`, an absolute or workspace-relative directory or `null` to start at the active workspace root. Runs through `/bin/sh` on Unix or `cmd.exe` on Windows, with command timeouts, bounded output, and descendant process cleanup. |
+| `shell` | Requires `workdir`, an absolute or workspace-relative directory or `null` to start at the active workspace root. Runs through `/bin/sh` on Unix or `cmd.exe` on Windows, with command timeouts, descendant process cleanup, and bounded output that keeps the start and the end of long streams. |
+
+Every role can search, including reviewers and stakeholders that have no shell. In a Git workspace the search tools skip ignored files, so build output and dependencies stay out of the results. Elsewhere they walk the directory tree. They never read `.git` or `.ratio`, and they skip binary files and files over 4 MiB. Results are sorted by path and capped. Pass the `after` value from a result to continue. A search stops after 10 seconds and returns what it found. Runs with a context window under 4,096 tokens are not offered the search tools, because every tool definition costs prompt space.
 
 Pass an array of complete shell commands, such as `{"workdir":"src","command":["git status --short","git diff --stat"]}`. Commands run in order in one shell and share its working directory, timeout, and output. Normal shell sequencing continues after a command returns a nonzero status. Ratio also accepts legacy script strings.
 
@@ -498,6 +535,17 @@ Set `forbidden_tools = ["worker_2/shell"]` under `[constraints]` to disable the 
 Tagged reads and edits support files up to 4 MiB. Ratio uses Assist-style addressing with path-seeded 64-bit tags. Repeated lines carry occurrence information. A stale tag or overlap rejects the batch. Optional `line_hints` help locate nearby current lines when an anchor goes stale. Successful edits preserve file mode and return fresh tags. A unique substring replacement is also available via `old_text` and `new_text`.
 
 If a line read encounters binary data, `read_file` returns a hex preview from byte zero. To request a precise binary range, pass `{"path":"data/image.bin","hex":true,"offset":"0x100","length":64}`. `offset` starts at zero and `length` caps the number of source bytes. Both accept integers or `0x` strings. Hex reads default to 256 bytes. The header gives the actual half-open range and file size in hexadecimal. If the output cap shortened the range, use the displayed end as the next offset. Explicit byte ranges use byte positions only. Set `hex` to `false` to require UTF-8. `max_bytes` limits rendered output.
+
+### Verification commands
+
+Set `verification_commands` and Ratio runs your checks itself after the work phase, in either mode.
+
+```toml
+[orchestration]
+verification_commands = ["npm test", "npm run lint"]
+```
+
+The lead reviewer receives each command's result and output with the worker reports, and cannot approve while a command fails. In a direct run the commands execute in the live workspace. In a staged run they execute in a separate copy of the candidate, and the receipt is bound to that candidate's digest. Up to 16 commands share an output budget that scales with the context window. Long output keeps its start and a larger share of its end, where builds and tests report failures. Commands use `command_timeout_secs`.
 
 ### Staged publication
 
@@ -553,6 +601,8 @@ Omit a limit or set it to `0` for unlimited operation. A positive value sets the
 | Active runtime in seconds | `max_run_secs` | `--max-run-secs` |
 | Plan attempts per review cycle | `max_plan_attempts` | |
 | Tool rounds per phase | `max_tool_rounds` | |
+
+An agent that reaches `max_tool_rounds` is not stopped mid-task. Its tools close for the phase and it is asked for a report of what is complete, what remains, and what it verified. The lead reviewer keeps its decision tool, so it can still submit a plan or a verdict.
 
 Ratio records usage for all runs. Provider attempts include retries and compaction. Token reservations use estimated input plus requested output and reconcile against usage when reported. Definite rate-limit and context rejections without usage release the token reservation. Ambiguous failures retain it. The active clock stops after an acknowledged pause reaches a request boundary and running tools settle.
 

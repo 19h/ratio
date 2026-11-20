@@ -15,6 +15,7 @@ context_window = 32768
 # top_p = 0.9
 # seed = 42
 # parallel_tool_calls = false
+# reasoning_effort = "medium"
 #
 # [provider.headers]
 # x-provider-project = "project-id"
@@ -36,6 +37,11 @@ context_window = 32768
 request_timeout_secs = 180
 command_timeout_secs = 120
 parallel_stakeholders = true
+# Checks Ratio runs after the work phase. A failure blocks approval.
+# verification_commands = ["cargo test --locked --workspace"]
+# Repository files added to every agent prompt. Loaded by default.
+# project_instructions = true
+# instruction_files = ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md"]
 
 [constraints]
 required_tools = ["cargo test"]

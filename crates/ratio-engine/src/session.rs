@@ -130,7 +130,12 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_task_graph: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) staging_commands: Option<Vec<String>>,
+    /// Commands a direct run checks in the live workspace after the work phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verification_commands: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) verification: Option<Verification>,
     pub dialogue: Dialogue,
@@ -527,7 +532,9 @@ impl Session {
             require_task_graph: false,
             parent_run_id: None,
             stopped: None,
+            instructions: None,
             staging_commands: None,
+            verification_commands: None,
             verification: None,
             dialogue,
             assessment: String::new(),

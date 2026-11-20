@@ -159,7 +159,7 @@ impl Orchestrator<'_> {
                 (
                     newcomer.as_str(),
                     member.name.as_str(),
-                    member.model.as_deref().unwrap_or(&self.config.worker_model),
+                    member.spec(self.config.worker_spec()),
                     format!(
                         "You are the incoming worker. Ask {mentor_id} about repository interfaces and {adviser_id} about requirements using send_message. Read the responses and confirm any constraints before finishing.\n{}",
                         member.persona
@@ -168,7 +168,7 @@ impl Orchestrator<'_> {
                 (
                     mentor_id.as_str(),
                     mentor.name.as_str(),
-                    mentor.model.as_deref().unwrap_or(&self.config.worker_model),
+                    mentor.spec(self.config.worker_spec()),
                     format!(
                         "You are the incumbent worker mentor. Use send_message to brief {newcomer} on interfaces, progress, and integration. Answer follow-up questions.\n{}",
                         mentor.persona
@@ -177,8 +177,8 @@ impl Orchestrator<'_> {
                 (
                     adviser_id.as_str(),
                     adviser.map_or("Onboarding adviser", |agent| agent.name.as_str()),
-                    adviser.map_or(self.config.reviewer_model.as_str(), |agent| {
-                        agent.model(&self.config.reviewer_model)
+                    adviser.map_or(self.config.reviewer_spec(), |agent| {
+                        agent.spec(self.config.reviewer_spec())
                     }),
                     format!(
                         "You are the read-only stakeholder for the addition. Use send_message to brief {newcomer} on requirements, acceptance, and uncertainties. Respond to clarifications.\n{}",
@@ -225,7 +225,7 @@ impl Orchestrator<'_> {
                         index,
                         id,
                         name,
-                        model,
+                        *model,
                         &format!(
                             "{role}\nRead-only onboarding. Roster:\n{}\n{}{}",
                             mailbox.roster(),
@@ -294,7 +294,7 @@ impl Orchestrator<'_> {
         let saved = restore_panel(session, &mailbox, Some(&gate), workers.len())?;
         let mut panel = workers.iter().enumerate().map(|(index, worker)| {
             self.onboarding_agent(session, workspace, saved, index, mailbox.id(index), &worker.name,
-                worker.model.as_deref().unwrap_or(&self.config.worker_model),
+                worker.spec(self.config.worker_spec()),
                 &format!("You are {}. Review this amended plan. All incumbent assignments stay frozen. Call ack_plan alone with the exact ID {} or use object_to_plan.\n{}", worker.name, candidate.plan.id, worker.persona),
                 &brief)
         }).collect::<Result<Vec<_>>>()?;
@@ -352,7 +352,7 @@ impl Orchestrator<'_> {
         index: usize,
         id: &str,
         name: &str,
-        model: &'a str,
+        model: crate::config::ModelSpec<'a>,
         role: &str,
         task: &str,
     ) -> Result<PanelAgent<'a>> {
@@ -458,7 +458,7 @@ impl Orchestrator<'_> {
                 .complete_as(
                     "lead_reviewer",
                     "Worker extension",
-                    &self.config.reviewer_model,
+                    self.config.reviewer_spec(),
                     &messages,
                     &schema,
                     self.config.output_tokens,
@@ -519,6 +519,7 @@ impl Orchestrator<'_> {
                     name: input.name,
                     persona: input.persona,
                     model: None,
+                    reasoning_effort: None,
                 };
                 ensure!(
                     input.task.worker == worker_id,

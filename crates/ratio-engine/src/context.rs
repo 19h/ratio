@@ -455,7 +455,7 @@ fn group_tokens(group: &[Message]) -> usize {
 pub struct Compact<'a> {
     pub api: &'a Api,
     pub actor: &'a str,
-    pub model: &'a str,
+    pub model: crate::config::ModelSpec<'a>,
     pub system: &'a str,
     pub tools: &'a [Value],
     pub input_budget: usize,

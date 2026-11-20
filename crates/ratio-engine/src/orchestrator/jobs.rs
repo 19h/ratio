@@ -377,6 +377,7 @@ impl Orchestrator<'_> {
                 role: role.id,
                 name: role.name,
                 model: role.model,
+                effort: role.effort,
                 instructions: role.instructions,
                 profile: role.profile,
                 dialogue,
@@ -450,10 +451,9 @@ impl Orchestrator<'_> {
         ), &job.workspace);
         self.step(
             &mut specialist.dialogue,
-            specialist
-                .model
-                .as_deref()
-                .unwrap_or(&self.config.reviewer_model),
+            self.config
+                .reviewer_spec()
+                .with(specialist.model.as_deref(), specialist.effort.as_deref()),
             access,
             &system,
             &format!("{} / {}", actor, specialist.name),
@@ -535,7 +535,7 @@ impl Orchestrator<'_> {
     pub(super) async fn step_lead_with_jobs(
         &self,
         session: &mut Session,
-        model: &str,
+        model: crate::config::ModelSpec<'_>,
         access: Access,
         system: &str,
         peer: PeerTools<'_>,

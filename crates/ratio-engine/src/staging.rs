@@ -163,7 +163,7 @@ impl Staging {
     }
 }
 
-fn git(workspace: &Path, args: &[&str]) -> Result<Vec<u8>> {
+pub(crate) fn git(workspace: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .current_dir(workspace)
         .args([

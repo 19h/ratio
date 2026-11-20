@@ -666,6 +666,7 @@ fn exercise_live_worker_addition(object: bool) {
         name: "Original implementer".into(),
         persona: "Preserve existing work.".into(),
         model: None,
+        reasoning_effort: None,
     };
     let original_plan_id = {
         let store = Store::open(root).unwrap();
@@ -1133,6 +1134,7 @@ fn parallel_result_survives_interrupt_while_another_tool_is_in_flight() {
             name: name.into(),
             persona: "Execute your assignment".into(),
             model: None,
+            reasoning_effort: None,
         });
         let mut session = Session::new("Exercise parallel checkpoint durability".into());
         let mut plan = WorkerPlan::freeze(
@@ -1242,6 +1244,7 @@ fn ready_worker_advances_while_peer_shell_runs_and_dependent_waits() {
                 name: name.into(),
                 persona: "Execute your assignment".into(),
                 model: None,
+                reasoning_effort: None,
             });
         let tasks = ["slow", "independent", "dependent"]
             .into_iter()
@@ -1390,6 +1393,7 @@ fn pausing_shell_records_its_result_and_routes_notes_before_the_next_tool() {
             name: "Owen".into(),
             persona: "Execute your assignment".into(),
             model: None,
+            reasoning_effort: None,
         }];
         let mut session = Session::new("Exercise shell pause and operator triage".into());
         let mut plan =
@@ -2798,6 +2802,7 @@ phases = ["planning"]
                 name: format!("Engineer {id}"),
                 persona: format!("Own module {id}."),
                 model: None,
+                reasoning_effort: None,
             })
             .collect::<Vec<_>>();
         let mut plan = WorkerPlan::new("Use the agreed vertical datum.".into(), 1, &workers);
@@ -2930,7 +2935,7 @@ fn exercise_worker_gate(unanimous: bool, objects: bool, graph: bool, staged: boo
 max_parallel_agents = 3
 require_task_graph = {graph}
 stage_workspace = {staged}
-verification_commands = ["git diff --check"]
+{verification}
 [[workers]]
 name = "One"
 persona = "Own worker_1.txt."
@@ -2940,7 +2945,14 @@ persona = "Own worker_2.txt."
 [[workers]]
 name = "Three"
 persona = "Own worker_3.txt."
-"#
+"#,
+            // Direct runs check these in the live workspace, which is only a
+            // Git repository in the staged variant.
+            verification = if staged {
+                "verification_commands = [\"git diff --check\"]"
+            } else {
+                ""
+            }
         ),
     )
     .unwrap();
@@ -3728,6 +3740,7 @@ fn seed_job_fixture(root: &Path, panel: bool) -> String {
             name: "Implementer".into(),
             persona: "Fixture implementation persona.".into(),
             model: None,
+            reasoning_effort: None,
         }];
         let mut plan = WorkerPlan::freeze(
             "Fixture assignment.".into(),
@@ -4298,4 +4311,439 @@ fn interrupted_background_shell_is_reported_unknown_without_replay() {
         )
         .unwrap();
     assert_eq!(deliveries.len(), 1);
+}
+
+#[test]
+fn project_instructions_are_pinned_into_every_agent_prompt() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("AGENTS.md"), "Run make lint first.\n").unwrap();
+    std::fs::write(temp.path().join("CLAUDE.md"), "Run make lint first.").unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        let system = request["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            system.contains("--- AGENTS.md ---\nRun make lint first.\n"),
+            "request {index} lacks the pinned instructions: {system}"
+        );
+        assert!(!system.contains("CLAUDE.md") && !system.contains("Rewritten"));
+        match index {
+            0 => text("Inspect the workspace."),
+            1 => calls(&[tool(
+                "rewrite",
+                "shell",
+                json!({"workdir":null,"command":"echo Rewritten> AGENTS.md"}),
+            )]),
+            2 => text("Instructions file rewritten."),
+            3 => decision("approved", "Prompts kept the starting instructions."),
+            _ => panic!("unexpected completion {index}"),
+        }
+    });
+    succeeded(&cli(
+        temp.path(),
+        &endpoint,
+        &["--goal", "Pin instructions"],
+    ));
+    server.join().unwrap();
+    assert!(
+        std::fs::read_to_string(temp.path().join("AGENTS.md"))
+            .unwrap()
+            .starts_with("Rewritten")
+    );
+}
+
+#[test]
+fn project_instructions_can_be_disabled_or_redirected() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("AGENTS.md"), "Default file.").unwrap();
+    std::fs::create_dir(temp.path().join("docs")).unwrap();
+    std::fs::write(temp.path().join("docs/RULES.md"), "Custom file.").unwrap();
+    for (settings, expected) in [
+        ("project_instructions = false", None),
+        (
+            "instruction_files = [\"docs/RULES.md\"]",
+            Some("--- docs/RULES.md ---\nCustom file.\n"),
+        ),
+    ] {
+        let config = profile.path().join("ratio.toml");
+        std::fs::write(&config, format!("[orchestration]\n{settings}\n")).unwrap();
+        let (endpoint, server) = mock(move |index, request| {
+            let system = request["messages"][0]["content"].as_str().unwrap();
+            assert!(!system.contains("Default file."));
+            assert_eq!(
+                expected.is_some_and(|text| system.contains(text)),
+                expected.is_some(),
+                "{system}"
+            );
+            match index {
+                0 => text("Inspect the workspace."),
+                1 => text("Nothing to change."),
+                2 => decision("approved", "Configuration applied."),
+                _ => panic!("unexpected completion {index}"),
+            }
+        });
+        succeeded(&cli(
+            temp.path(),
+            &endpoint,
+            &[
+                "--goal",
+                "Configure instructions",
+                "--config",
+                config.to_str().unwrap(),
+            ],
+        ));
+        server.join().unwrap();
+    }
+    let config = profile.path().join("ratio.toml");
+    std::fs::write(
+        &config,
+        "[orchestration]\ninstruction_files = [\"../x.md\"]\n",
+    )
+    .unwrap();
+    let run = cli(
+        temp.path(),
+        "http://127.0.0.1:9/v1",
+        &["--goal", "Reject", "--config", config.to_str().unwrap()],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&run.stderr).contains("instruction_files accepts"));
+}
+
+#[test]
+fn tool_round_limit_asks_for_a_report_instead_of_failing_the_run() {
+    let profile = tempfile::tempdir().unwrap();
+    let config = profile.path().join("ratio.toml");
+    std::fs::write(&config, "[orchestration]\nmax_tool_rounds = 1\n").unwrap();
+    let list = || calls(&[tool("list", "list_directory", json!({"path":"."}))]);
+    for obedient in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let (endpoint, server) = mock(move |index, request| {
+            let system = request["messages"][0]["content"].as_str().unwrap();
+            let history = request["messages"].to_string();
+            match (index, obedient) {
+                (0, _) => text("Inspect the workspace."),
+                (1, _) => {
+                    assert!(!system.contains("Tool-round limit reached"));
+                    list()
+                }
+                (2, _) => {
+                    assert!(request.get("tools").is_none(), "{}", request["tools"]);
+                    assert!(system.contains("Tools are closed for this phase"));
+                    if obedient {
+                        text("Listed files. Edits remain.")
+                    } else {
+                        list()
+                    }
+                }
+                (3, true) => {
+                    assert!(history.contains("Listed files. Edits remain."));
+                    list()
+                }
+                (4, true) => {
+                    let tools = request["tools"].as_array().unwrap();
+                    assert_eq!(tools.len(), 1, "{tools:?}");
+                    assert_eq!(tools[0]["function"]["name"], "submit_verdict");
+                    assert!(system.contains("Submit your decision now."));
+                    decision("approved", "Reported within the limit.")
+                }
+                (3, false) => {
+                    assert!(
+                        history.contains("Tool-round limit reached before this agent reported")
+                    );
+                    decision("approved", "Limit recorded.")
+                }
+                _ => panic!("unexpected completion {index}"),
+            }
+        });
+        succeeded(&cli(
+            temp.path(),
+            &endpoint,
+            &[
+                "--goal",
+                "Bounded tools",
+                "--config",
+                config.to_str().unwrap(),
+            ],
+        ));
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn reasoning_effort_reaches_both_transports_with_role_overrides() {
+    let profile = tempfile::tempdir().unwrap();
+    let config = profile.path().join("ratio.toml");
+    let effort = |request: &Value, responses: bool| {
+        if responses {
+            assert!(request.get("reasoning_effort").is_none());
+            request["reasoning"]["effort"].clone()
+        } else {
+            assert!(request.get("reasoning").is_none());
+            request["reasoning_effort"].clone()
+        }
+    };
+    // The shared flag reaches every role, and a role table overrides it.
+    for (responses, settings, worker, reviewer) in [
+        (false, "", json!("low"), json!("low")),
+        (true, "", json!("low"), json!("low")),
+        (
+            false,
+            "[worker]\nreasoning_effort = \"high\"\n",
+            json!("high"),
+            json!("low"),
+        ),
+    ] {
+        std::fs::write(&config, settings).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (endpoint, server) = mock(move |index, request| {
+            let expected = if index == 1 { &worker } else { &reviewer };
+            assert_eq!(&effort(&request, responses), expected, "request {index}");
+            let reply = |content: &str| {
+                if responses {
+                    let event = json!({"type":"response.completed","response":{"status":"completed",
+                        "output":[{"type":"message","role":"assistant","status":"completed","id":"msg",
+                            "content":[{"type":"output_text","text":content}]}],
+                        "usage":{"input_tokens":5,"output_tokens":2}}});
+                    stream_response_at_eof(&[event], false)
+                } else {
+                    text(content)
+                }
+            };
+            match index {
+                0 => reply("Inspect the workspace."),
+                1 => reply("Nothing to change."),
+                2 if responses => {
+                    let event = json!({"type":"response.completed","response":{"status":"completed",
+                        "output":[{"type":"function_call","status":"completed","id":"fc","call_id":"verdict",
+                            "name":"submit_verdict",
+                            "arguments":json!({"verdict":"approved","assessment":"Effort sent."}).to_string()}],
+                        "usage":{"input_tokens":5,"output_tokens":2}}});
+                    stream_response_at_eof(&[event], true)
+                }
+                2 => decision("approved", "Effort sent."),
+                _ => panic!("unexpected completion {index}"),
+            }
+        });
+        let mut args = vec![
+            "--goal",
+            "Send effort",
+            "--config",
+            config.to_str().unwrap(),
+            "--reasoning-effort",
+            "low",
+        ];
+        if responses {
+            args.extend(["--provider-api", "responses"]);
+        }
+        succeeded(&cli(temp.path(), &endpoint, &args));
+        server.join().unwrap();
+    }
+    // Unset by default, and malformed values stop at load.
+    std::fs::write(&config, "").unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        assert!(request.get("reasoning_effort").is_none());
+        match index {
+            0 => text("Inspect the workspace."),
+            1 => text("Nothing to change."),
+            2 => decision("approved", "No effort sent."),
+            _ => panic!("unexpected completion {index}"),
+        }
+    });
+    let unset = [
+        "--goal",
+        "Default effort",
+        "--config",
+        config.to_str().unwrap(),
+    ];
+    succeeded(&cli(temp.path(), &endpoint, &unset));
+    server.join().unwrap();
+    std::fs::write(&config, "[provider]\nreasoning_effort = \"Very High\"\n").unwrap();
+    let run = cli(temp.path(), "http://127.0.0.1:9/v1", &unset);
+    assert_eq!(run.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&run.stderr).contains("reasoning_effort must be"));
+}
+
+#[test]
+fn direct_runs_verify_the_workspace_and_a_failure_blocks_approval() {
+    let profile = tempfile::tempdir().unwrap();
+    let config = profile.path().join("ratio.toml");
+    // `git` behaves the same under sh and cmd.exe. The second command fails
+    // outside a repository.
+    for (command, passes) in [
+        ("git --version", true),
+        ("git rev-parse --verify refs/heads/ratio-missing", false),
+    ] {
+        std::fs::write(
+            &config,
+            format!("[orchestration]\nverification_commands = [\"{command}\"]\n"),
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (endpoint, server) = mock(move |index, request| {
+            let history = request["messages"].to_string();
+            match (index, passes) {
+                (0, _) => text("Inspect the workspace."),
+                (1, _) => text("Nothing to change."),
+                (2, _) => {
+                    assert!(
+                        history.contains(&format!("Workspace verification passed: {passes}")),
+                        "{history}"
+                    );
+                    assert!(history.contains(if passes {
+                        "git version"
+                    } else {
+                        "Verification 1: failed"
+                    }));
+                    assert!(!history.contains("Candidate SHA-256"));
+                    // The mock stops after a terminal verdict, and a failed
+                    // check turns this approval into a repair request.
+                    let (status, mut response) = decision("approved", "Checks reviewed.");
+                    response["test_terminal"] = json!(passes);
+                    (status, response)
+                }
+                (3, false) => {
+                    assert!(
+                        history.contains("Verification failed. Use needs_revision or rejected.")
+                    );
+                    decision("rejected", "The check failed.")
+                }
+                _ => panic!("unexpected completion {index}"),
+            }
+        });
+        let run = cli_window(
+            temp.path(),
+            &endpoint,
+            "8192",
+            &[
+                "--goal",
+                "Verify directly",
+                "--config",
+                config.to_str().unwrap(),
+            ],
+        );
+        server.join().unwrap();
+        assert_eq!(run.status.code(), Some(if passes { 0 } else { 2 }));
+        // Direct verification runs in place and leaves no staging tree behind.
+        assert!(!temp.path().join(".ratio/staging").exists());
+    }
+}
+
+#[test]
+fn search_tools_serve_reviewers_without_shell_and_feed_tagged_edits() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("src")).unwrap();
+    let notes = temp.path().join("src/notes.txt");
+    std::fs::write(&notes, "alpha\nneedle here\nomega\n").unwrap();
+    let last_result = |request: &Value| {
+        request["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (endpoint, server) = mock(move |index, request| match index {
+        0 => {
+            let names = request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert!(names.contains(&"search_files") && names.contains(&"find_files"));
+            assert!(!names.contains(&"shell") && !names.contains(&"edit_file"));
+            calls(&[
+                tool("find", "find_files", json!({"pattern":"*.txt"})),
+                tool(
+                    "search",
+                    "search_files",
+                    json!({"pattern":"NEEDLE","ignore_case":true}),
+                ),
+            ])
+        }
+        1 => {
+            let history = request["messages"].to_string();
+            assert!(
+                history.contains("Untrusted file list\\nsrc/notes.txt"),
+                "{history}"
+            );
+            assert!(last_result(&request).contains("src/notes.txt\n2 "));
+            text("Replace the needle line in src/notes.txt.")
+        }
+        2 => calls(&[tool(
+            "search",
+            "search_files",
+            json!({"pattern":"needle","literal":true,"path":"src"}),
+        )]),
+        3 => {
+            let result = last_result(&request);
+            let row = result.lines().find(|line| line.starts_with("2 ")).unwrap();
+            let tag = row[2..].split('|').next().unwrap();
+            calls(&[tool(
+                "edit",
+                "edit_file",
+                json!({"path":"src/notes.txt","edits":{tag:"needle replaced"}}),
+            )])
+        }
+        4 => text("Edited the tagged line."),
+        5 => decision("approved", "Search results located the line."),
+        _ => panic!("unexpected completion {index}"),
+    });
+    succeeded(&cli_window(
+        temp.path(),
+        &endpoint,
+        "8192",
+        &["--goal", "Replace the needle"],
+    ));
+    server.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(notes).unwrap(),
+        "alpha\nneedle replaced\nomega\n"
+    );
+}
+
+#[test]
+fn provider_check_reports_reachability_tool_calls_and_redacted_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        assert_eq!(index, 0);
+        assert_eq!(request["tools"][0]["function"]["name"], "ping");
+        let (status, mut response) = calls(&[tool("ping-1", "ping", json!({}))]);
+        response["test_terminal"] = json!(true);
+        (status, response)
+    });
+    let run = cli(temp.path(), &endpoint, &["--check-provider"]);
+    succeeded(&run);
+    server.join().unwrap();
+    let report: Value = serde_json::from_slice(&run.stdout).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 1, "{report}");
+    assert_eq!(
+        (
+            &checks[0]["model"],
+            &checks[0]["ok"],
+            &checks[0]["tool_call"]
+        ),
+        (&json!("test-model"), &json!(true), &json!(true))
+    );
+    assert!(!temp.path().join(".ratio").exists());
+
+    let (endpoint, server) = mock(|_, _| {
+        (
+            401,
+            json!({"error":{"message":"rejected key test-key"},"test_terminal":true}),
+        )
+    });
+    let run = cli(temp.path(), &endpoint, &["--check-provider"]);
+    server.join().unwrap();
+    assert_eq!(run.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&run.stdout).unwrap();
+    let check = &report["checks"][0];
+    assert_eq!(
+        (&check["ok"], &check["tool_call"]),
+        (&json!(false), &json!(false))
+    );
+    let error = check["error"].as_str().unwrap();
+    assert!(
+        error.contains("401") && !error.contains("test-key"),
+        "{error}"
+    );
 }

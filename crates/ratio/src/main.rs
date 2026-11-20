@@ -166,7 +166,17 @@ async fn run() -> Result<u8> {
     let dashboard_managed = cli.dashboard_managed;
     let plan_only = cli.plan_only;
     let check_mcp = cli.check_mcp.clone();
+    let check_provider = cli.check_provider;
     let config = Config::load(cli)?;
+    if check_provider {
+        let api = ra::api::Api::new(&config, Reporter::Silent, Budget::new(&config))?;
+        let report = api.check(&config).await;
+        println!("{report}");
+        let passed = report["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().all(|check| check["ok"] == true));
+        return Ok(u8::from(!passed));
+    }
     if let Some(server) = check_mcp {
         println!(
             "{}",

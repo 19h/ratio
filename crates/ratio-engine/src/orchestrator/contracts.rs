@@ -77,7 +77,7 @@ impl Orchestrator<'_> {
                     .complete_as(
                         "lead_reviewer",
                         "Recover worker assignment",
-                        &self.config.reviewer_model,
+                        self.config.reviewer_spec(),
                         &messages,
                         &schemas,
                         output,
