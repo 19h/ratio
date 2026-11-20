@@ -680,26 +680,35 @@ async function triageView(route) {
     ] : null), [
     workflow?.worker_addition ? section("Worker admission", node("p", {}, workflow.worker_addition),
       plan?.id ? row(caption("Amended plan"), code(plan.id)) : null,
-      workflow.active_worker_request ? go("Open onboarding IPC", runUrl("ipc", { phase: "OnboardWorker", worker_request: workflow.active_worker_request })) : null,
       plan?.ownership ? node("details", {}, node("summary", {}, "Proposed write ownership"), pre(JSON.stringify(plan.ownership, null, 2))) : null) : null,
     section({ label: "Worker requests", meta: admissions.rows.length || null, flush: true }, admissions.rows.length
-      ? table(["Request", "State", "Amended plan", "Communication"], admissions.rows.map(item =>
-        [node("div", {}, code(`#${item.id}`), pre(item.request), item.detail ? muted(item.detail) : null), pill(item.state),
+      ? table(["Request", "State", "Amended plan", "Activity"], admissions.rows.map(item => {
+        const scope = { phase: "OnboardWorker", worker_request: item.id };
+        return [node("div", {}, code(`#${item.id}`), pre(item.request), item.detail ? muted(item.detail) : null), pill(item.state),
           item.plan?.id ? node("details", {}, node("summary", {}, code(item.plan.id)), pre(JSON.stringify(item.plan.ownership, null, 2))) : "—",
-          go("Onboarding IPC", runUrl("ipc", { phase: "OnboardWorker", worker_request: item.id }))]))
+          item.has_proposal_activity || item.has_ipc ? node("div", { class: "entry-body" },
+            item.has_proposal_activity ? go("Lead proposal activity", runUrl("agent/lead_reviewer", scope)) : null,
+            item.has_ipc ? go("Onboarding IPC", runUrl("ipc", scope)) : null) : "—"];
+      }))
       : empty(readOnly ? "No worker has been requested." : "No worker has been requested. Request one while the run is in the work phase.")),
     section({ label: "Information inbox", meta: inbox.rows.length || null, flush: true },
-      inbox.rows.map(item => node("article", { class: `entry${Number(query.item) === item.id ? " selected" : ""}`, id: `inbox-${item.id}` },
-        node("header", {}, time(item.submitted_ms), code(`#${item.id}`), pill(item.state)),
-        node("div", { class: "entry-body" }, pre(item.text),
-          item.decision?.reason ? muted(item.decision.reason) : null,
-          item.decision?.recipients?.length ? row(caption("Route"), item.decision.recipients.map(id => actorLink(id))) : null,
-          item.delivered?.length ? row(caption("Delivered to"), item.delivered.map(id => actorLink(id))) : null,
-          item.decision?.worker_recommendation ? row(muted(item.decision.worker_recommendation),
-            !readOnly ? button("Use in worker request", () => openAction("add_worker", item.decision.worker_recommendation), { disabled: !working }) : null) : null,
-          !readOnly && item.state === "failed" ? row(button("Retry triage", () => sendAction("retry_triage", String(item.id)).catch(captureError), { disabled: !state.live })) : null),
-        node("footer", {}, item.decision?.category ? tag(item.decision.category, "category") : null,
-          item.decision?.priority ? tag(item.decision.priority, "priority") : null))),
+      inbox.rows.map(item => {
+        const awaitingDelivery = item.state === "routed" && !item.delivered?.length;
+        return node("article", { class: `entry${Number(query.item) === item.id ? " selected" : ""}`, id: `inbox-${item.id}` },
+          node("header", {}, time(item.submitted_ms), code(`#${item.id}`), pill(awaitingDelivery ? "Awaiting delivery" : item.state)),
+          node("div", { class: "entry-body" }, pre(item.text),
+            item.state === "queued" && state.live ? muted(state.live.paused
+              ? "Triage resumes when the run resumes."
+              : "Waiting for triage at the next runner checkpoint.") : null,
+            item.decision?.reason ? muted(item.decision.reason) : null,
+            item.decision?.recipients?.length ? row(caption("Route"), item.decision.recipients.map(id => actorLink(id))) : null,
+            item.delivered?.length ? row(caption("Delivered to"), item.delivered.map(id => actorLink(id))) : null,
+            item.decision?.worker_recommendation ? row(muted(item.decision.worker_recommendation),
+              !readOnly ? button("Use in worker request", () => openAction("add_worker", item.decision.worker_recommendation), { disabled: !working }) : null) : null,
+            !readOnly && (item.state === "failed" || awaitingDelivery) ? row(button("Retry triage", () => sendAction("retry_triage", String(item.id)).catch(captureError), { disabled: !state.live })) : null),
+          node("footer", {}, item.decision?.category ? tag(item.decision.category, "category") : null,
+            item.decision?.priority ? tag(item.decision.priority, "priority") : null));
+      }),
       !inbox.rows.length ? empty(readOnly ? "Nothing submitted yet." : "Nothing submitted yet. Submit information and the lead reviewer routes it to the right agents.") : null,
       inbox.rows.length >= 60 ? pagination("Inbox pagination", link("Older information", runUrl("triage", { inbox_before: inbox.rows.at(-1).id }))) : null),
   ]);
@@ -765,9 +774,11 @@ async function historyView(route) {
   if (page === "ipc") head.push(tabs(local, [["all", "Sequence"], ["lanes", "Agent lanes"], ["matrix", "Route matrix"]], tab, query));
   if (page === "tools") head.push(tabs(local, [["all", "All tools"], ["mcp", "MCP"], ["files", "File activity"]], tab, query));
   if (query.path && tab === "files") head.push(node("div", { class: "scope" }, caption("File"), code(query.path), go("All files", runUrl("tools", { tab: "files" }))));
-  if (page === "ipc" && (query.from || query.to || query.worker_request)) head.push(node("div", { class: "scope" },
+  if ((page === "ipc" && (query.from || query.to || query.worker_request)) ||
+      (page === "agent" && query.worker_request)) head.push(node("div", { class: "scope" },
     query.from ? pill("From " + actorName(query.from)) : null, query.to ? pill("To " + actorName(query.to)) : null,
-    query.worker_request ? pill("Worker request " + query.worker_request) : null, go("Clear route", runUrl("ipc", { tab: query.tab }))));
+    query.worker_request ? pill("Worker request " + query.worker_request) : null,
+    go(page === "ipc" ? "Clear route" : "Clear scope", runUrl(local, { tab: query.tab }))));
   head.push(filters(route, { actor: page !== "agent", kind: page === "history" }));
   if (detail && page === "history" && !rows.some(entry => entry.key === detail.event.key)) {
     rows = [detail.event, ...rows].sort((a, b) => b.sequence - a.sequence);

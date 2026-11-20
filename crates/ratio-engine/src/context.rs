@@ -29,6 +29,8 @@ pub struct Dialogue {
     #[serde(default)]
     pub guidance: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) operator_guidance: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub peer_context: String,
     pub summary: String,
     /// One assistant tool-call message followed by its results, in call order.
@@ -238,6 +240,19 @@ impl Dialogue {
     }
 
     pub fn prefix(&self, system: &str) -> Vec<Message> {
+        self.prefix_for_task(system, self.current_task())
+    }
+
+    pub(crate) fn request_context(&self, system: &str) -> (Vec<Message>, Option<Message>) {
+        let steering = (!self.operator_guidance.is_empty())
+            .then(|| Message::user(format!("User steering:\n{}", self.operator_guidance)));
+        (
+            self.prefix_for_task(system, self.task_with_guidance(&self.guidance)),
+            steering,
+        )
+    }
+
+    fn prefix_for_task(&self, system: &str, task: String) -> Vec<Message> {
         let mut prefix = vec![Message::system(system)];
         if !self.summary.is_empty() {
             prefix.push(Message::user(format!(
@@ -251,15 +266,24 @@ impl Dialogue {
                 self.peer_context
             )));
         }
-        prefix.push(Message::user(self.current_task()));
+        prefix.push(Message::user(task));
         prefix
     }
 
     pub fn current_task(&self) -> String {
-        if self.guidance.is_empty() {
+        let guidance = [self.guidance.as_str(), self.operator_guidance.as_str()]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.task_with_guidance(&guidance)
+    }
+
+    fn task_with_guidance(&self, guidance: &str) -> String {
+        if guidance.is_empty() {
             self.task.clone()
         } else {
-            format!("{}\n\nUser steering:\n{}", self.task, self.guidance)
+            format!("{}\n\nUser steering:\n{guidance}", self.task)
         }
     }
 
@@ -341,8 +365,10 @@ impl Compact<'_> {
         );
         let mut compacted = 0;
         loop {
-            let prefix = dialogue.prefix(self.system);
-            let total = estimate(&dialogue.messages(&prefix), self.tools);
+            let (prefix, steering) = dialogue.request_context(self.system);
+            let mut messages = dialogue.messages(&prefix);
+            messages.extend(steering.as_ref());
+            let total = estimate(&messages, self.tools);
             if total <= self.input_budget {
                 return Ok(compacted);
             }
@@ -352,6 +378,7 @@ impl Compact<'_> {
                 .filter_map(|(index, message)| {
                     (index != 1 || dialogue.summary.is_empty()).then_some(message)
                 })
+                .chain(steering.as_ref())
                 .collect::<Vec<_>>();
             let essential = estimate(&essential, self.tools);
             if essential > self.hard_limit && !dialogue.peer_context.is_empty() {
@@ -434,9 +461,10 @@ impl Compact<'_> {
             // JSON escaping can inflate a summary after clipping. Verify
             // progress against the actual projection before discarding history.
             let previous = std::mem::replace(&mut dialogue.summary, summary);
-            let new_prefix = dialogue.prefix(self.system);
-            let new_total =
-                estimate(&dialogue.messages(&new_prefix), self.tools).saturating_sub(tokens);
+            let (new_prefix, steering) = dialogue.request_context(self.system);
+            let mut messages = dialogue.messages(&new_prefix);
+            messages.extend(steering.as_ref());
+            let new_total = estimate(&messages, self.tools).saturating_sub(tokens);
             if new_total >= total {
                 dialogue.summary = previous;
                 if total <= self.hard_limit {

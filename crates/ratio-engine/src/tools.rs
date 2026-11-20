@@ -106,7 +106,7 @@ impl Tools<'_> {
         if self.allows_shell() {
             schemas.push(schema(
                 "shell",
-                "Shell in workdir. null uses workspace.",
+                "Shell in workdir. null uses workspace. Check status without sleeping.",
                 json!({
                     "command": {"type":"array","items":{"type":"string"}},
                     "workdir": {"type":["string","null"]}

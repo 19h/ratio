@@ -399,6 +399,12 @@ pub struct Constraints {
 }
 
 impl Constraints {
+    pub(crate) fn shell_disabled_for(&self, actor: &str) -> bool {
+        self.forbidden_tools
+            .iter()
+            .any(|entry| entry.split_once('/') == Some((actor, "shell")))
+    }
+
     pub fn prompt(&self) -> String {
         [
             ("Required tools", &self.required_tools),

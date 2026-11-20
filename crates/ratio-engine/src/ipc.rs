@@ -211,6 +211,10 @@ impl Mailbox {
         &self.members[index].id
     }
 
+    pub(crate) fn name(&self, index: usize) -> &str {
+        &self.members[index].name
+    }
+
     pub(crate) fn exchanged(&self, left: usize, right: usize) -> bool {
         let state = self.state.borrow();
         state.delivered_links.contains(&(left, right))

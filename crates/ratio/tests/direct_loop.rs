@@ -706,7 +706,7 @@ fn exercise_live_worker_addition(object: bool) {
                 "extension",
                 "submit_worker_extension",
                 json!({
-                    "name":"Diagnostics","persona":"Write diagnostic evidence","mentor":"worker_1","stakeholder":null,
+                    "name":"Diagnostics","persona":"Write diagnostic evidence","mentor":"astrophysics-advisor","stakeholder":null,
                     "paths":[{"path":"diagnostics.txt","directory":false}],
                     "task":{"id":"diagnostics","worker":"worker_2","description":"Write diagnostic evidence","depends_on":[],"acceptance":["diagnostics.txt exists"]}
                 }),
@@ -800,6 +800,28 @@ fn exercise_live_worker_addition(object: bool) {
     assert_eq!(
         admissions[0]["state"],
         if object { "declined" } else { "admitted" }
+    );
+    assert_eq!(admissions[0]["has_proposal_activity"], true);
+    assert_eq!(admissions[0]["has_ipc"], true);
+    let activity = reader
+        .audit(
+            session.run_id(),
+            ratio_engine::audit::AuditFilter {
+                actor: Some("lead_reviewer"),
+                kind: Some("proposal"),
+                phase: Some("OnboardWorker"),
+                worker_request: admissions[0]["id"].as_i64(),
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(activity.len(), 1);
+    assert!(
+        activity[0].data["text"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("mentor worker_1 (Original implementer)")
     );
     let routes = reader
         .ipc_routes_filtered(
@@ -1199,6 +1221,137 @@ fn parallel_result_survives_interrupt_while_another_tool_is_in_flight() {
     });
     succeeded(&cli_window(root, &endpoint, "8192", &["--resume"]));
     server.join().unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn pausing_shell_records_its_result_and_routes_notes_before_the_next_tool() {
+    use ra::{
+        config::Worker,
+        control::request_control,
+        session::{Phase, Session, Store, WorkerPlan},
+    };
+    use ratio_protocol::{ControlAction, ControlRequest};
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().canonicalize().unwrap();
+    let root = workspace.as_path();
+    let run_id = {
+        let store = Store::open(root).unwrap();
+        let workers = [Worker {
+            name: "Owen".into(),
+            persona: "Execute your assignment".into(),
+            model: None,
+        }];
+        let mut session = Session::new("Exercise shell pause and operator triage".into());
+        let mut plan =
+            WorkerPlan::freeze("Run the assignment".into(), 1, 1, &workers, vec![vec![]]);
+        plan.acknowledgements = vec![0];
+        session.workers = Some(workers.to_vec());
+        session.worker_plan = Some(plan);
+        session.phase = Phase::Work;
+        store.save(&session).unwrap();
+        session.run_id().to_owned()
+    };
+    let marker = root.join("second-tool");
+    let (endpoint, server) = mock(move |index, request| {
+        let history = request["messages"].to_string();
+        match index {
+            0 => calls(&[
+                tool(
+                    "slow",
+                    "shell",
+                    json!({"command":["touch shell-started","sleep 20","touch shell-finished"],"workdir":null}),
+                ),
+                tool(
+                    "next",
+                    "shell",
+                    json!({"command":["touch second-tool"],"workdir":null}),
+                ),
+            ]),
+            1 => {
+                assert!(history.contains("worker_1: Owen"));
+                assert!(!marker.exists(), "next tool ran before triage");
+                calls(&[tool(
+                    "route",
+                    "route_information",
+                    json!({"category":"constraint","priority":"high","reason":"Named recipient","recipients":["worker_1"]}),
+                )])
+            }
+            2 => {
+                let last = request["messages"].as_array().unwrap().last().unwrap();
+                assert_eq!(last["role"], "user");
+                assert!(
+                    last["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Owen, use a short status check.")
+                );
+                assert!(history.contains("shell interrupted by operator pause"));
+                assert!(marker.exists(), "queued tool did not resume");
+                text("Work complete.")
+            }
+            3 => decision("approved", "Verified the interrupted command."),
+            _ => panic!("unexpected request {index}"),
+        }
+    });
+    succeeded(&cli_window(
+        root,
+        &endpoint,
+        "8192",
+        &["--detached", "--resume"],
+    ));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let control = |action, guidance: Option<&str>| {
+        let reply = runtime
+            .block_on(request_control(
+                root,
+                &ControlRequest {
+                    action,
+                    guidance: guidance.map(str::to_owned),
+                    run_id: Some(run_id.clone()),
+                },
+            ))
+            .unwrap();
+        assert!(reply.accepted, "{}", reply.detail);
+        reply
+    };
+    let wait_for = |description: &str, condition: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(std::time::Instant::now() < deadline, "{description}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait_for("shell did not start", &|| {
+        root.join("shell-started").exists()
+    });
+    control(
+        ControlAction::Triage,
+        Some("Owen, use a short status check."),
+    );
+    assert!(control(ControlAction::Pause, None).paused);
+    wait_for("Pause did not checkpoint the interruption", &|| {
+        std::fs::read_to_string(root.join(".ratio/session.json"))
+            .unwrap()
+            .contains("shell interrupted by operator pause")
+    });
+    assert!(!root.join("second-tool").exists());
+    assert!(!control(ControlAction::Resume, None).paused);
+    server.join().unwrap();
+    let reader = Store::reader(root).unwrap();
+    wait_for("run did not finish", &|| {
+        reader.run(&run_id).unwrap().unwrap().phase == "Approved"
+    });
+    assert!(!root.join("shell-finished").exists());
+    assert_eq!(
+        reader.inbox(&run_id, None).unwrap()[0]["delivered"],
+        json!(["worker_1"])
+    );
 }
 
 #[test]
@@ -1791,6 +1944,12 @@ fn mcp_inspection_is_available_to_the_team_before_acknowledgement() {
     std::fs::write(
         &config,
         r#"
+[orchestration]
+allow_inspection_shell = true
+
+[constraints]
+forbidden_tools = ["worker_1/shell"]
+
 [[workers]]
 name = "Builder"
 persona = "Implement the assigned work."
@@ -1848,6 +2007,8 @@ instructions = "Use the work-only server during execution."
         assert!(schema("mcp_call").is_some());
         assert!(schema("inspect").is_none());
         assert!(schema("change").is_none());
+        let shell_disabled = system.starts_with("You are parallel worker worker_1,");
+        assert_eq!(schema("shell").is_none(), shell_disabled);
         let mcp = |name| tool(name, "mcp_call", json!({"server":"fixture","name":name}));
         let history = request["messages"].to_string();
         let working = system.contains("Phase: execute");
@@ -1856,9 +2017,17 @@ instructions = "Use the work-only server during execution."
         if working {
             assert!(observed.contains("acknowledgement"));
             if history.contains("fixture_changed") {
+                assert!(history.contains("REFUSED: shell is disabled for this agent"));
                 return text("Completed the work.");
             }
-            return calls(&[mcp("change")]);
+            return calls(&[
+                tool(
+                    "forbidden",
+                    "shell",
+                    json!({"command":["touch shell-ran"],"workdir":null}),
+                ),
+                mcp("change"),
+            ]);
         }
         let role = if schema("ack_plan").is_some() {
             "acknowledgement"
@@ -1928,6 +2097,7 @@ instructions = "Use the work-only server during execution."
         ],
     );
     succeeded(&run);
+    assert!(!temp.path().join("shell-ran").exists());
     server.join().unwrap();
 
     let reader = ra::session::Store::reader(temp.path()).unwrap();

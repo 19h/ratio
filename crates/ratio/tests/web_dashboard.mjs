@@ -47,6 +47,9 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
   const nextChunk = new Promise(resolve => { streamMore = resolve; });
   let finishStream;
   const usageGate = new Promise(resolve => { finishStream = resolve; });
+  let retryRouting;
+  const retryGate = new Promise(resolve => { retryRouting = resolve; });
+  let triageAttempts = 0;
   let finishWorker;
   const workGate = new Promise(resolve => { finishWorker = resolve; });
   let endFork;
@@ -74,13 +77,21 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
         workers:[{name:"Integrator",persona:"Inspect the MCP fixture"}],
         reviewers:[],stakeholders:[],acceptance:["Inspect MCP evidence"],
       }));
-      else if (tools.has("route_information")) output = completion(null,call("route_information",{
-        category:"evidence",priority:"high",reason:"Relevant to observation",recipients:["worker_1"],
-      }));
-      else if (tools.has("submit_worker_extension")) output = completion(null,call("submit_worker_extension",{
-        name:"Evidence auditor",persona:"Check integration evidence",mentor:"worker_1",stakeholder:null,paths:[],
-        task:{id:"audit",worker:"worker_2",description:"Check integration evidence.\n".repeat(35)+"Last checkpoint.",depends_on:[],acceptance:["Evidence checked"]},
-      }));
+      else if (tools.has("route_information")) {
+        assert.match(input.messages[1].content, /worker_1: Integrator/);
+        assert.match(input.messages[1].content, /Additional interface evidence for Integrator/);
+        const recipient = ++triageAttempts === 1 ? "lead_reviewer" : "worker_1";
+        output = completion(null,call("route_information",{
+          category:"evidence",priority:"high",reason:"Relevant to observation",recipients:[recipient],
+        }));
+      }
+      else if (tools.has("submit_worker_extension")) {
+        const corrected = input.messages.at(-1).content.includes("new task must be assigned to worker_2");
+        output = completion(null,call("submit_worker_extension",{
+          name:"Evidence auditor",persona:"Check integration evidence",mentor:"worker_1",stakeholder:null,paths:[],
+          task:{id:"audit",worker:corrected ? "worker_2" : "worker_3",description:"Check integration evidence.\n".repeat(35)+"Last checkpoint.",depends_on:[],acceptance:["Evidence checked"]},
+        }));
+      }
       else if (system.includes("Read-only onboarding")) {
         assert.ok(!tools.has("create_file"));
         if (input.messages.some(message => message.role === "tool")) output = completion("Onboarding evidence recorded.");
@@ -117,6 +128,9 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
           response.write('data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":5}}\n\n');
           response.end("data: [DONE]\n\n");
           return;
+        } else if (triageAttempts === 1) {
+          await retryGate;
+          output = completion(null, call("list_directory", { path: "." }, "check-before-reroute"));
         } else {
           sawGuidance = JSON.stringify(input.messages).includes("Additional interface evidence");
           await workGate;
@@ -276,14 +290,21 @@ tools = ["inspect"]
     await page.getByRole("button", { name: "Close", exact: true }).click();
     await page.locator("#navigation").getByRole("link",{name:"Triage"}).click();
     await page.getByRole("button",{name:"Submit information"}).click();
-    await page.getByLabel("Information",{exact:true}).fill("Additional interface evidence");
+    await page.getByLabel("Information",{exact:true}).fill("Additional interface evidence for Integrator");
     await page.locator("#submit-action").click();
-    await page.getByText("Additional interface evidence",{exact:true}).waitFor();
+    await page.getByText("Additional interface evidence for Integrator",{exact:true}).waitFor();
+    await page.getByText("Waiting for triage at the next runner checkpoint.", { exact: true }).waitFor();
     release();
     await page.locator('[data-token-flow="cached_input"][data-token-count="7"]').waitFor();
     finishStream();
+    await page.getByText("Awaiting delivery", { exact: true }).waitFor();
+    assert.equal(await page.getByText("Delivered to", { exact: true }).count(), 0);
+    await page.getByRole("button", { name: "Retry triage", exact: true }).click();
+    await page.getByText("Information queued for retry", { exact: true }).waitFor();
+    retryRouting();
     await page.getByText("Relevant to observation",{exact:true}).waitFor();
     await page.getByText("Delivered to",{exact:false}).waitFor();
+    assert.equal(triageAttempts, 2);
     await page.getByRole("button",{name:"Request worker",exact:true}).click();
     await page.getByLabel("Assignment and proposed scope").fill("Add an evidence auditor");
     await page.locator("#submit-action").click();
@@ -291,6 +312,10 @@ tools = ["inspect"]
     finishWorker();
     await page.getByText("Admitted",{exact:true}).waitFor();
     await shot("triage");
+    await page.getByRole("link",{name:"Lead proposal activity",exact:true}).click();
+    await page.locator('[data-kind="contract_error"]').getByText(/proposal attempt 1: new task must be assigned to worker_2/).waitFor();
+    await page.locator('[data-kind="proposal"]').getByText(/proposed Evidence auditor \(worker_2\) with mentor worker_1/).waitFor();
+    await page.locator("#navigation").getByRole("link",{name:"Triage"}).click();
     await page.getByRole("link",{name:"Onboarding IPC",exact:true}).click();
     await page.getByText("evidence: request acceptance",{exact:true}).first().waitFor();
     await shot("sequence");
@@ -470,6 +495,7 @@ tools = ["inspect"]
     streamMore();
     release();
     finishStream();
+    retryRouting();
     finishWorker();
     endFork();
     if (browser) await browser.close();

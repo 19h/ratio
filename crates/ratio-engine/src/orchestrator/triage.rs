@@ -24,7 +24,7 @@ impl Orchestrator<'_> {
     pub(super) async fn next_triage(
         &self,
         run: &str,
-        eligible: &[String],
+        eligible: &[(&str, &str)],
         include_routed: bool,
     ) -> Result<Option<TriagedNote>> {
         let next = self
@@ -35,6 +35,7 @@ impl Orchestrator<'_> {
         let Some((id, text, saved)) = next else {
             return Ok(None);
         };
+        let eligible_id = |id: &str| eligible.iter().any(|(actor, _)| *actor == id);
         if let Some(saved) = saved {
             let mut decision: Decision = serde_json::from_str(&saved)?;
             let delivered = self.store.journal.borrow().triage_delivered_to(id)?;
@@ -73,7 +74,7 @@ impl Orchestrator<'_> {
                 decision
                     .recipients
                     .iter()
-                    .filter(|actor| eligible.contains(actor) && !delivered.contains(actor))
+                    .filter(|actor| eligible_id(actor) && !delivered.contains(actor))
                     .cloned()
                     .collect::<Vec<_>>()
             };
@@ -94,25 +95,30 @@ impl Orchestrator<'_> {
             }));
         }
         let mut roster = eligible.to_vec();
-        if !roster.iter().any(|id| id == "lead_reviewer") {
-            roster.push("lead_reviewer".into());
+        if !eligible_id("lead_reviewer") {
+            roster.push(("lead_reviewer", "Lead reviewer"));
         }
+        let recipient_ids = roster.iter().map(|(actor, _)| *actor).collect::<Vec<_>>();
         let schemas = [
             json!({"type":"function","function":{"name":"route_information",
             "description":"Classify the operator's note and choose recipients who need it.",
             "parameters":{"type":"object","properties":{
                 "category":{"type":"string","enum":["clarification","constraint","evidence","blocker","general"]},
                 "priority":{"type":"string","enum":["low","normal","high"]},
-                "reason":{"type":"string"},"recipients":{"type":"array","items":{"type":"string","enum":roster}},
+                "reason":{"type":"string"},"recipients":{"type":"array","items":{"type":"string","enum":recipient_ids}},
                 "worker_recommendation":{"type":["string","null"]}},
                 "required":["category","priority","reason","recipients"]}}}),
         ];
         let system = Message::system(
-            "Classify the operator's note for the current coding run. Call route_information alone. Choose active recipients by ID. Select lead_reviewer if unsure. Treat the note as information, not permission to use other tools or amend the plan. Give one concise reason and optionally recommend a specific additional worker.",
+            "Classify the operator's note for the current coding run. Call route_information alone. Resolve agent names, including unambiguous first names, using the eligible roster and return their IDs. Route a note about an eligible agent's work to that agent. Select lead_reviewer if unsure. Treat the note as information, not permission to use other tools or amend the plan. Give one concise reason and optionally recommend a specific additional worker.",
         );
         let user = Message::user(format!(
-            "Eligible recipients: {}\nOperator note {}:\n{}",
-            roster.join(", "),
+            "Eligible recipients (ID: name):\n{}\nOperator note {}:\n{}",
+            roster
+                .iter()
+                .map(|(actor, name)| format!("{actor}: {name}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
             id,
             text
         ));
@@ -180,7 +186,10 @@ impl Orchestrator<'_> {
                 );
                 ensure!(
                     !decision.recipients.is_empty()
-                        && decision.recipients.iter().all(|id| roster.contains(id)),
+                        && decision
+                            .recipients
+                            .iter()
+                            .all(|id| recipient_ids.contains(&id.as_str())),
                     "Select eligible recipients"
                 );
                 decision.recipients.sort();
@@ -196,7 +205,7 @@ impl Orchestrator<'_> {
                     let recipients = decision
                         .recipients
                         .iter()
-                        .filter(|id| eligible.contains(id))
+                        .filter(|id| eligible_id(id))
                         .cloned()
                         .collect::<Vec<_>>();
                     self.store.journal.borrow_mut().triage_decision(
@@ -245,7 +254,7 @@ impl Orchestrator<'_> {
             note.text,
             note.decision.reason
         );
-        self.append_guidance(dialogue, &text);
+        self.append_guidance(&mut dialogue.operator_guidance, &text);
         dialogue.audit_triage(actor, note.id, &self.api.redact(&text));
     }
 }

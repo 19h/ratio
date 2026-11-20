@@ -331,7 +331,7 @@ impl Orchestrator<'_> {
             ipc.mailbox.insert_worker(workers.len() - 1);
         }
         for progress in &mut session.worker_progress {
-            self.append_guidance(&mut progress.dialogue, &format!("Active amended plan ID: {}. {newcomer} was added. Your prior assignment, write paths and dependencies are unchanged.", plan.id));
+            self.append_guidance(&mut progress.dialogue.guidance, &format!("Active amended plan ID: {}. {newcomer} was added. Your prior assignment, write paths and dependencies are unchanged.", plan.id));
         }
         session.worker_progress.push(WorkerProgress {
             dialogue,
@@ -399,33 +399,46 @@ impl Orchestrator<'_> {
 
     async fn propose_extension(
         &self,
-        session: &Session,
+        session: &mut Session,
         workspace: &std::path::Path,
         request: &str,
         workers: &[Worker],
         stakeholders: &[crate::config::Stakeholder],
     ) -> Result<WorkerOnboarding> {
+        let request_id = session
+            .active_worker_request
+            .context("missing active worker request")?;
         let previous = session
             .worker_plan
             .as_ref()
             .context("missing incumbent plan")?;
         let worker_id = format!("worker_{}", workers.len() + 1);
+        let mentors = workers
+            .iter()
+            .enumerate()
+            .map(|(index, worker)| (format!("worker_{}", index + 1), worker))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let advisers = stakeholders
+            .iter()
+            .enumerate()
+            .map(|(index, adviser)| (format!("stakeholder_{}", index + 1), adviser))
+            .collect::<std::collections::BTreeMap<_, _>>();
         let system = Message::system(format!(
-            "Propose an append-only worker assignment. Call submit_worker_extension alone. Existing tasks and ownership are frozen. The new task owner is {worker_id}. Choose a mentor from incumbent worker IDs and a matching stakeholder if available. Use null for a temporary adviser. Paths must be disjoint. Only use predecessor task IDs from the prior graph, or no predecessors when the graph is absent. Original goal:\n{}",
+            "Propose an append-only worker assignment. Call submit_worker_extension alone. Existing tasks and ownership are frozen. The new task owner is {worker_id}. For mentor, return an incumbent worker ID. For stakeholder, return a stakeholder ID or null for a temporary adviser. Use the IDs from the two rosters. Paths must be disjoint. Only use predecessor task IDs from the prior graph, or no predecessors when the graph is absent. Original goal:\n{}",
             session.goal
         ));
         let task = Message::user(format!(
-            "Operator request:\n{request}\nExisting frozen plan:\n{}\nExisting ownership by worker index:\n{}\nTask graph:\n{}\nWorker names in ID order:\n{}\nStakeholders in ID order:\n{}",
+            "Operator request:\n{request}\nExisting frozen plan:\n{}\nExisting ownership by worker index:\n{}\nTask graph:\n{}\nIncumbent workers by ID (mentor):\n{}\nStakeholders by ID (stakeholder):\n{}",
             previous.text,
             serde_json::to_string(&previous.ownership)?,
             serde_json::to_string(&previous.graph)?,
-            serde_json::to_string(workers)?,
-            serde_json::to_string(stakeholders)?
+            serde_json::to_string(&mentors)?,
+            serde_json::to_string(&advisers)?
         ));
         let schema = [
             json!({"type":"function","function":{"name":"submit_worker_extension","description":"Propose one worker without changing existing assignments.","parameters":{
-            "type":"object","properties":{"name":{"type":"string"},"persona":{"type":"string"},"mentor":{"type":"string","enum":(1..=workers.len()).map(|i| format!("worker_{i}")).collect::<Vec<_>>()},
-            "stakeholder":{"type":["string","null"]},"paths":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"directory":{"type":"boolean"}},"required":["path","directory"]}},
+            "type":"object","properties":{"name":{"type":"string"},"persona":{"type":"string"},"mentor":{"type":"string","enum":mentors.keys().collect::<Vec<_>>()},
+            "stakeholder":{"type":["string","null"],"enum":advisers.keys().map(Some).chain(std::iter::once(None)).collect::<Vec<_>>()},"paths":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"directory":{"type":"boolean"}},"required":["path","directory"]}},
             "task":{"type":"object","properties":{"id":{"type":"string"},"worker":{"type":"string","enum":[worker_id]},"description":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"}},"acceptance":{"type":"array","items":{"type":"string"}}},"required":["id","worker","description","depends_on","acceptance"]}},
             "required":["name","persona","mentor","stakeholder","paths","task"]}}}),
         ];
@@ -462,7 +475,7 @@ impl Orchestrator<'_> {
                     ),
                     "submit a complete concise extension"
                 );
-                let Message::Assistant { tool_calls, .. } = completion.message else {
+                let Message::Assistant { tool_calls, .. } = &completion.message else {
                     anyhow::bail!("expected assistant")
                 };
                 let [call] = tool_calls.as_slice() else {
@@ -481,11 +494,25 @@ impl Orchestrator<'_> {
                             .all(|worker| !worker.name.eq_ignore_ascii_case(input.name.trim())),
                     "new worker needs a unique name and assignment"
                 );
-                let mentor = member_index(&input.mentor, "worker_", workers.len())?;
+                let mentor = if workers.len() == 1 {
+                    0
+                } else {
+                    member_index(
+                        &input.mentor,
+                        "worker",
+                        workers.iter().map(|worker| worker.name.as_str()),
+                    )?
+                };
                 let stakeholder = input
                     .stakeholder
                     .as_deref()
-                    .map(|id| member_index(id, "stakeholder_", stakeholders.len()))
+                    .map(|id| {
+                        member_index(
+                            id,
+                            "stakeholder",
+                            stakeholders.iter().map(|agent| agent.name.as_str()),
+                        )
+                    })
                     .transpose()?;
                 let worker = Worker {
                     name: input.name,
@@ -547,23 +574,81 @@ impl Orchestrator<'_> {
                 })
             })();
             match extension {
-                Ok(extension) => return Ok(extension),
-                Err(error) if repairs < 2 => {
-                    repairs += 1;
-                    correction = Message::user(format!("Correct the extension: {error:#}"))
+                Ok(extension) => {
+                    let adviser = extension.stakeholder.map_or_else(
+                        || "temporary adviser".into(),
+                        |index| format!("stakeholder_{} ({})", index + 1, stakeholders[index].name),
+                    );
+                    session.dialogue.audit_note(
+                        "lead_reviewer",
+                        "proposal",
+                        &self.api.redact(&format!(
+                            "Worker request #{request_id} proposed {} ({worker_id}) with mentor worker_{} ({}) and {adviser}",
+                            extension.worker.name,
+                            extension.mentor + 1,
+                            workers[extension.mentor].name,
+                        )),
+                    );
+                    return Ok(extension);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let response = match &completion.message {
+                        Message::Assistant {
+                            content,
+                            tool_calls,
+                            ..
+                        } => {
+                            json!({"text": content, "tool_calls": tool_calls})
+                        }
+                        _ => json!(null),
+                    };
+                    session.dialogue.audit_note(
+                        "lead_reviewer",
+                        "contract_error",
+                        &self.api.redact(&format!(
+                            "Worker request #{request_id}, proposal attempt {}: {error:#}\n\n{response}",
+                            repairs + 1
+                        )),
+                    );
+                    self.store.save(session)?;
+                    if repairs == 2 {
+                        return Err(error);
+                    }
+                    repairs += 1;
+                    correction = Message::user(format!("Correct the extension: {error:#}"));
+                }
             }
         }
     }
 }
 
-fn member_index(id: &str, prefix: &str, count: usize) -> Result<usize> {
+fn member_index<'a>(
+    id: &str,
+    role: &str,
+    names: impl ExactSizeIterator<Item = &'a str>,
+) -> Result<usize> {
+    let id = id.trim();
+    let count = names.len();
     let index = id
-        .strip_prefix(prefix)
+        .strip_prefix(role)
+        .and_then(|suffix| suffix.strip_prefix('_'))
         .and_then(|suffix| suffix.parse::<usize>().ok())
-        .and_then(|index| index.checked_sub(1));
-    index
-        .filter(|index| *index < count)
-        .with_context(|| format!("unknown mentor {id}"))
+        .and_then(|index| index.checked_sub(1))
+        .filter(|index| *index < count);
+    if let Some(index) = index {
+        return Ok(index);
+    }
+    let mut matching = names
+        .enumerate()
+        .filter_map(|(index, name)| name.eq_ignore_ascii_case(id).then_some(index));
+    let first = matching.next();
+    ensure!(
+        matching.next().is_none(),
+        "ambiguous {role} name {id}: use the ID"
+    );
+    first.with_context(|| match count {
+        0 => format!("unknown {role} ID {id}: no configured {role}s"),
+        1 => format!("unknown {role} ID {id}: use {role}_1"),
+        _ => format!("unknown {role} ID {id}: use {role}_1 through {role}_{count}"),
+    })
 }

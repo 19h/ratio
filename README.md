@@ -263,6 +263,8 @@ allow_inspection_shell = true
 
 This defaults to `false`. With the option enabled, shell commands run with the operator's host permissions and can modify files. Native `create_file` and `edit_file` still require work access.
 
+Set `forbidden_tools = ["worker_2/shell"]` under `[constraints]` to disable the native shell tool for specific actor IDs throughout the run. The runner also refuses shell calls already queued in a saved conversation.
+
 Tagged reads and edits support files up to 4 MiB. Ratio uses Assist-style addressing with path-seeded 64-bit tags. Repeated lines carry occurrence information. A stale tag or overlap rejects the batch. Optional `line_hints` help locate nearby current lines when an anchor goes stale. Successful edits preserve file mode and return fresh tags. A unique substring replacement is also available via `old_text` and `new_text`.
 
 If a line read encounters binary data, `read_file` returns a hex preview from byte zero. To request a precise binary range, pass `{"path":"data/image.bin","hex":true,"offset":"0x100","length":64}`. `offset` starts at zero and `length` caps the number of source bytes. Both accept integers or `0x` strings. Hex reads default to 256 bytes. The header gives the actual half-open range and file size in hexadecimal. If the output cap shortened the range, use the displayed end as the next offset. Explicit byte ranges use byte positions only. Set `hex` to `false` to require UTF-8. `max_bytes` limits rendered output.
@@ -327,7 +329,7 @@ Open the private URL printed by Ratio. The dashboard binds to `127.0.0.1` and ch
 
 The journal preserves tool invocations and receipts independently of conversation compaction. Expand **Full result** for the captured audit payload and **Model-visible result** for what the model received. Payloads can contain source and command output. Per-tool limits apply within the 8 MiB per-payload ceiling, with omission markers for truncated captures. Older journals expose the messages and tool receipts their checkpoints retained.
 
-Automatic triage uses the lead reviewer to classify and route information within the existing run permissions. The inbox shows the decision, recipients, and delivery receipts. Pending items are marked deferred if the run finishes before delivery. **Add worker** requests a separate, read-only onboarding phase followed by unanimous acknowledgement of the amended plan. The worker request links to its onboarding IPC.
+Automatic triage uses the lead reviewer to classify and route information within the existing run permissions. You can name agents in the note. A queued note is waiting for routing at a runner checkpoint. Delivery saves it for the recipient and places it after the tool history in the next model request. The inbox shows the routing decision and delivery receipts, and allows you to retry routing an undelivered note. Pending items are marked deferred if the run finishes before delivery. **Add worker** requests a separate, read-only onboarding phase followed by unanimous acknowledgement of the amended plan. The worker request links to its onboarding IPC.
 
 Press `1` to `6` to switch views and `/` to search the run. In the message sequence, the arrow keys or `j` and `k` move the selection.
 
@@ -357,7 +359,7 @@ Each run has one active link. **Replace link** invalidates the previous URL, and
 | PgUp / PgDn in Activity | Scroll the shared transcript |
 | Ctrl+T in Communication | Switch between Sequence and Routes |
 | Ctrl+F in Communication | Filter all traffic, IPC, or handoffs |
-| Ctrl+P or click Pause / Resume | Pause or resume model requests. Pausing cancels active generations. |
+| Ctrl+P or click Pause / Resume | Pause or resume model requests. Pausing interrupts active generations and agent shell commands. Interrupted commands receive a tool result so the agent can inspect partial effects after resuming. |
 | Ctrl+N, click Add worker, or type `/add-worker REQUEST` | Request an additional worker during execution |
 | Ctrl-C | During inline generation, cancel and pause. While paused or between generations, exit. |
 | Esc | Cancel a setup request or detach from an attached run |

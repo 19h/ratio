@@ -154,7 +154,12 @@ impl Journal {
     }
 
     pub(crate) fn retry_triage(&self, run: &str, id: i64) -> Result<bool> {
-        Ok(self.0.execute("UPDATE triage_inbox SET state='queued',decision=NULL WHERE run_id=?1 AND id=?2 AND state='failed'", params![run,id])? != 0)
+        Ok(self.0.execute(
+            "UPDATE triage_inbox SET state='queued',decision=NULL
+             WHERE run_id=?1 AND id=?2 AND state IN ('failed','routed')
+               AND NOT EXISTS (SELECT 1 FROM triage_deliveries WHERE item=?2)",
+            params![run, id],
+        )? != 0)
     }
 
     pub(crate) fn defer_triage(&self, run: &str) -> Result<()> {
@@ -386,7 +391,6 @@ impl Journal {
             let mut data = serde_json::to_value(message)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             data["attempt"] = serde_json::json!(details.workflow.plan_attempt);
-            data["worker_request"] = serde_json::json!(details.workflow.active_worker_request);
             observations.push(Observation {
                 key: format!("ipc-{sequence}-{index}"),
                 kind: "ipc",
@@ -394,7 +398,10 @@ impl Journal {
                 data,
             });
         }
-        for observation in observations {
+        for mut observation in observations {
+            if let Some(request) = details.workflow.active_worker_request {
+                observation.data["worker_request"] = serde_json::json!(request);
+            }
             if observation.kind == "triage_delivery" {
                 let item = observation.data["item"].as_i64();
                 transaction.execute(
@@ -556,13 +563,19 @@ impl RunReader {
             return Ok(Vec::new());
         }
         let mut statement = self.0.prepare("SELECT r.id,r.request,
-            coalesce(a.state,CASE WHEN r.finished=0 THEN 'queued' ELSE 'finished' END),a.detail,a.plan,a.updated_ms
+            coalesce(a.state,CASE WHEN r.finished=0 THEN 'queued' ELSE 'finished' END),a.detail,a.plan,a.updated_ms,
+            EXISTS(SELECT 1 FROM audit_events e WHERE e.run_id=r.run_id AND e.phase='OnboardWorker'
+                AND e.actor='lead_reviewer' AND e.kind IN ('proposal','contract_error')
+                AND json_extract(e.data,'$.worker_request')=r.id),
+            EXISTS(SELECT 1 FROM audit_events e WHERE e.run_id=r.run_id AND e.phase='OnboardWorker'
+                AND e.kind='ipc' AND json_extract(e.data,'$.worker_request')=r.id)
             FROM worker_requests r LEFT JOIN worker_admission a ON r.id=a.request
             WHERE r.run_id=?1 ORDER BY r.id DESC LIMIT 60")?;
         statement.query_map([run], |row| {
             let plan: Option<String> = row.get(4)?;
             Ok(serde_json::json!({"id":row.get::<_,i64>(0)?,"request":row.get::<_,String>(1)?,"state":row.get::<_,String>(2)?,
-                "detail":row.get::<_,Option<String>>(3)?,"plan":plan.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok()),"timestamp_ms":row.get::<_,Option<u64>>(5)?}))
+                "detail":row.get::<_,Option<String>>(3)?,"plan":plan.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok()),"timestamp_ms":row.get::<_,Option<u64>>(5)?,
+                "has_proposal_activity":row.get::<_,bool>(6)?,"has_ipc":row.get::<_,bool>(7)?}))
         })?.collect()
     }
     pub fn inbox(&self, run: &str, before: Option<i64>) -> Result<Vec<serde_json::Value>> {

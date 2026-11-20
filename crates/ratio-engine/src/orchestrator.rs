@@ -311,26 +311,40 @@ impl<'a> Orchestrator<'a> {
                         );
                     }
                     loop {
+                        let ready = self.api.wait_for_generation().await;
                         if session.dialogue.pending()?.is_none() {
-                            let ready = self.api.wait_for_generation().await;
                             self.receive_guidance(&mut session, guidance.as_ref())?;
-                            ready?;
-                            let actor = if phase == Phase::Work {
-                                "worker_1"
-                            } else {
-                                "lead_reviewer"
-                            };
-                            if let Some(note) = self
-                                .next_triage(
-                                    session.run_id(),
-                                    &[actor.into()],
-                                    actor == "lead_reviewer",
-                                )
-                                .await?
-                            {
-                                self.apply_triage(&mut session.dialogue, actor, &note);
-                                self.store.save(&session)?;
-                            }
+                        }
+                        if session.dialogue.in_flight
+                            && ready
+                                .as_ref()
+                                .is_err_and(|error| error.is::<crate::events::CheckpointExit>())
+                        {
+                            // This call was marked for dispatch but has not started.
+                            session.dialogue.in_flight = false;
+                            self.store.save(&session)?;
+                        }
+                        ready?;
+                        let (actor, name) = if phase == Phase::Work {
+                            let name = session
+                                .workers
+                                .as_deref()
+                                .and_then(|workers| workers.first())
+                                .map_or("Worker", |worker| worker.name.as_str());
+                            ("worker_1", name)
+                        } else {
+                            ("lead_reviewer", "Lead reviewer")
+                        };
+                        if let Some(note) = self
+                            .next_triage(
+                                session.run_id(),
+                                &[(actor, name)],
+                                actor == "lead_reviewer",
+                            )
+                            .await?
+                        {
+                            self.apply_triage(&mut session.dialogue, actor, &note);
+                            self.store.save(&session)?;
                         }
                         match self
                             .step(
@@ -437,7 +451,7 @@ impl<'a> Orchestrator<'a> {
                                     &message,
                                 );
                                 self.append_guidance(
-                                    &mut session.dialogue,
+                                    &mut session.dialogue.guidance,
                                     &format!("Protocol correction: {message}"),
                                 );
                                 self.store.save(&session)?;
@@ -549,7 +563,7 @@ impl<'a> Orchestrator<'a> {
         let Some(note) = read_guidance(input) else {
             return Ok(false);
         };
-        self.append_guidance(&mut session.dialogue, &note);
+        self.append_guidance(&mut session.dialogue.operator_guidance, &note);
         session
             .dialogue
             .audit_note("user", "guidance", &self.api.redact(&note));
@@ -558,15 +572,12 @@ impl<'a> Orchestrator<'a> {
         Ok(true)
     }
 
-    fn append_guidance(&self, dialogue: &mut Dialogue, note: &str) {
-        if !dialogue.guidance.is_empty() {
-            dialogue.guidance.push('\n');
+    fn append_guidance(&self, guidance: &mut String, note: &str) {
+        if !guidance.is_empty() {
+            guidance.push('\n');
         }
-        dialogue.guidance.push_str(note);
-        dialogue.guidance = clip(
-            &dialogue.guidance,
-            (self.config.context_window / 4).min(4096),
-        );
+        guidance.push_str(note);
+        *guidance = clip(guidance, (self.config.context_window / 4).min(4096));
     }
 
     fn role(&self, phase: Phase) -> (&str, Access, String) {
@@ -730,6 +741,7 @@ impl<'a> Orchestrator<'a> {
         peer: PeerTools<'_>,
     ) -> Result<Step> {
         dialogue.audit_brief(peer.author, |text| self.api.redact(text));
+        let shell_disabled = self.config.constraints.shell_disabled_for(peer.author);
         // Keep individual results bounded before they enter history.
         let tools = Tools {
             workspace: peer.workspace,
@@ -741,6 +753,13 @@ impl<'a> Orchestrator<'a> {
             ownership: peer.ownership,
         };
         if let Some(call) = dialogue.pending()?.cloned() {
+            let mut shell_control = (call.function.name == "shell")
+                .then(|| self.reporter.generation_control())
+                .flatten();
+            let shell_state = shell_control.as_ref().map(|control| *control.borrow());
+            if shell_state.is_some_and(|state| state.paused) {
+                return Ok(Step::Continue);
+            }
             if peer.final_review && call.function.name == "submit_verdict" {
                 let verdict = parse_verdict(&call)?;
                 self.reporter.agent(
@@ -842,6 +861,19 @@ impl<'a> Orchestrator<'a> {
                     )
                     .await,
                 ),
+                ("shell", _) if shell_disabled => same(
+                    "REFUSED: shell is disabled for this agent. Use the configured tools for this operation.".into()
+                ),
+                ("shell", _) => match shell_control.as_mut().zip(shell_state) {
+                    Some((control, state)) => tokio::select! {
+                        biased;
+                        _ = control.wait_for(|current| current.epoch != state.epoch) => same(
+                            "Tool error: shell interrupted by operator pause. The command may have made partial changes. Check its effects before retrying.".into()
+                        ),
+                        result = tools.execute_audited(&call) => result,
+                    },
+                    None => tools.execute_audited(&call).await,
+                },
                 _ => tools.execute_audited(&call).await,
             };
             let mcp_error = full
@@ -875,6 +907,9 @@ impl<'a> Orchestrator<'a> {
             return Ok(Step::Continue);
         }
         let mut schemas = tools.schemas();
+        if shell_disabled {
+            schemas.retain(|schema| schema["function"]["name"] != "shell");
+        }
         let servers = &self.config.mcp_servers;
         schemas.extend(memory::schemas());
         schemas.extend(crate::tools::skills::schema(&self.config.skills));
@@ -912,10 +947,16 @@ impl<'a> Orchestrator<'a> {
                 "\nRunner resumed. Fetch current MCP schemas with tool_search. Reopen external session handles as needed.",
             );
         }
-        if !peer.repairing && matches!(access, Access::Inspect) && tools.allow_inspection_shell {
-            system.to_mut().push_str(
-                "\nUse shell to inspect or verify. Preserve workspace files during inspection.",
-            );
+        if !peer.repairing {
+            if shell_disabled {
+                system
+                    .to_mut()
+                    .push_str("\nShell is disabled for this agent.");
+            } else if matches!(access, Access::Inspect) && tools.allow_inspection_shell {
+                system.to_mut().push_str(
+                    "\nUse shell to inspect or verify. Preserve workspace files during inspection.",
+                );
+            }
         }
         let window_budget = self.config.context_window - self.config.output_tokens;
         let mut hard_limit = window_budget;
@@ -957,8 +998,9 @@ impl<'a> Orchestrator<'a> {
                     )),
                 );
             }
-            let prefix = dialogue.prefix(&system);
-            let messages = dialogue.messages(&prefix);
+            let (prefix, steering) = dialogue.request_context(&system);
+            let mut messages = dialogue.messages(&prefix);
+            messages.extend(steering.as_ref());
             let projected = estimate(&messages, &schemas);
             self.mcp.model_turn(peer.author, peer.workspace);
             let completion = match self
@@ -1020,7 +1062,7 @@ impl<'a> Orchestrator<'a> {
                 length_retries += 1;
                 length_target = Some(length_target.unwrap_or(projected).min(projected) * 3 / 4);
                 if length_retries == 1 {
-                    self.append_guidance(dialogue, "Previous completion hit the output limit. Keep text and tool arguments short. Submit one complete tool call at a time.");
+                    self.append_guidance(&mut dialogue.guidance, "Previous completion hit the output limit. Keep text and tool arguments short. Submit one complete tool call at a time.");
                 }
                 self.progress("[context] Completion hit the output limit. Retrying with a smaller prompt where possible.");
                 continue;
@@ -1279,7 +1321,7 @@ impl<'a> Orchestrator<'a> {
             if let Some(note) = read_guidance(options.guidance) {
                 let workers = options.stakeholder_start.unwrap_or(panel.len());
                 for agent in &mut panel[..workers] {
-                    self.append_guidance(&mut agent.dialogue, &note);
+                    self.append_guidance(&mut agent.dialogue.operator_guidance, &note);
                     agent.reopen(limit);
                 }
                 self.progress("[steer] Added user guidance to the worker team");
@@ -1297,19 +1339,12 @@ impl<'a> Orchestrator<'a> {
                 checkpoint(&panel.iter().map(PanelAgent::snapshot).collect::<Vec<_>>())?;
             }
             ready?;
-            if let Some(run) = options.triage_run.filter(|_| {
-                panel.iter().all(|agent| {
-                    agent
-                        .dialogue
-                        .pending()
-                        .is_ok_and(|pending| pending.is_none())
-                })
-            }) {
+            if let Some(run) = options.triage_run {
                 let eligible = panel
                     .iter()
                     .enumerate()
                     .filter(|(_, agent)| agent.assessment.is_none() && !agent.failed)
-                    .map(|(index, _)| mailbox.id(index).to_owned())
+                    .map(|(index, _)| (mailbox.id(index), mailbox.name(index)))
                     .collect::<Vec<_>>();
                 if let Some(note) = self.next_triage(run, &eligible, false).await? {
                     let mut changed = false;
