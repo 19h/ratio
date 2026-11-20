@@ -1,10 +1,10 @@
 # Ratio
 
-Ratio runs a team of coding agents on your repository and keeps a record of everything they do. Give it a goal, an OpenAI-compatible endpoint, and a workspace. A lead reviewer plans the work, workers agree on who writes which files before anything is edited, stakeholders answer questions mid-run, and a typed verdict decides whether the result reaches your worktree. Watch it live in a browser or a terminal, or run it headless in CI.
+Ratio runs a team of coding agents on your repository and keeps a record of everything they do. Point it at an OpenAI-compatible endpoint, open the dashboard in your browser, and describe what you want. A lead reviewer plans the work, workers agree on who writes which files before anything is edited, stakeholders answer questions mid-run, and a typed verdict decides whether the result reaches your worktree. You watch and steer the whole run from the browser.
 
 ![Run overview in the web dashboard, showing the goal, the phase rail, two agents generating, and token usage](docs/screenshots/overview.png)
 
-<sub>A live run in `ra --web`. Two workers are generating, a third is blocked on their tasks, and the status bar meters tokens as they stream. The screenshots in this README come from a [scripted demo run](#development).</sub>
+<sub>A live run in the dashboard. Two workers are generating, a third is blocked on their tasks, and the status bar meters tokens as they stream. The screenshots in this README come from a [scripted demo run](#development).</sub>
 
 - **One request becomes a team.** Ratio proposes workers, reviewers, stakeholders, and acceptance criteria, or uses the roster you configure.
 - **Nobody writes before the plan is frozen.** The lead reviewer freezes assignments and write paths. Every worker acknowledges the exact plan ID, and one objection sends the team back to coordination.
@@ -13,24 +13,204 @@ Ratio runs a team of coding agents on your repository and keeps a record of ever
 - **Everything is on the record.** Messages, tool calls, results, and budgets go to a local SQLite journal that you can search, export, resume, and fork.
 - **Any OpenAI-compatible model.** Use Chat Completions or Responses, streamed or not, with a different model per role or per agent.
 
-**Contents:** [Quick start](#quick-start) | [A run in pictures](#a-run-in-pictures) | [How a run works](#how-a-run-works) | [Running Ratio](#running-ratio) | [Provider configuration](#provider-configuration) | [Teams, communication, and review](#teams-communication-and-review) | [Workspace and publication](#workspace-and-publication) | [Interfaces and run history](#interfaces-and-run-history) | [Context, limits, and automation](#context-limits-and-automation) | [Local extensions](#local-extensions) | [Development](#development)
+**Contents:** [Quick start](#quick-start) | [Configuration](#configuration) | [A run in pictures](#a-run-in-pictures) | [The dashboard](#the-dashboard) | [How a run works](#how-a-run-works) | [Teams, communication, and review](#teams-communication-and-review) | [Workspace and publication](#workspace-and-publication) | [Context, limits, and automation](#context-limits-and-automation) | [Local extensions](#local-extensions) | [Terminal and headless use](#terminal-and-headless-use) | [Development](#development)
 
 ## Quick start
 
-Build with Rust 1.85 or later. Git is required for staged execution and Git inspection tools.
+You need Rust 1.85 or later, Git, and an OpenAI-compatible API whose model supports function (tool) calling.
+
+**1. Install.** This puts the `ra` binary in `~/.cargo/bin`.
 
 ```sh
+git clone https://github.com/19h/ratio.git
+cd ratio
 cargo install --locked --path crates/ratio
-
-export RATIO_API_KEY='<provider key>'
-ra -C /path/to/project \
-  --endpoint https://provider.example/v1 \
-  --model provider-model \
-  --context-window 32768 \
-  --goal 'Fix the parser regression and verify all supported inputs.'
 ```
 
-That runs in the terminal UI. Replace `--goal '...'` with `--web` to serve the dashboard and enter the request there, or add `--headless` for scripts and CI.
+**2. Describe your provider.** Create `~/.config/ratio/config.toml`. On Windows, use `%APPDATA%\ratio\config.toml`.
+
+```toml
+endpoint = "https://api.openai.com/v1"  # base URL of your OpenAI-compatible API
+model = "your-model-id"                 # must support function (tool) calling
+context_window = 128000                 # the model's context size in tokens
+```
+
+`model` and `context_window` have no default, and a run does not start without them. [Configuration](#configuration) explains each setting and lists endpoints for common providers.
+
+**3. Provide the key.** Export it in the shell where you will start Ratio. Skip this step for a local server that needs no key.
+
+```sh
+export RATIO_API_KEY='<provider key>'
+```
+
+**4. Open the dashboard.**
+
+```sh
+ra -C /path/to/project --web
+```
+
+Ratio prints a private URL such as `http://127.0.0.1:52814/#access=...`. Open it in your browser, click **Start run**, and describe the outcome you want. Ratio proposes a team, plans, works, and reviews while you watch.
+
+Three things to know before the first run:
+
+- **Workers edit the project in place by default**, and their shell commands run with your permissions. Start on a clean Git branch, or enable [staged publication](#staged-publication) so nothing reaches your worktree before review.
+- **Runs have no limits by default.** Set token and time caps in [your first profile](#a-good-first-profile) before a long run.
+- **Ratio keeps its journal in `PROJECT/.ratio/`.** It contains transcripts and workspace data, so add `.ratio/` to the project's `.gitignore`.
+
+If **Start run** reports an error, see [When a run does not start](#when-a-run-does-not-start).
+
+## Configuration
+
+### Where settings come from
+
+Ratio reads one profile, a TOML file. It uses `--config FILE` when you pass it. Otherwise it uses the global profile.
+
+| Platform | Global profile |
+| --- | --- |
+| Linux and macOS | `$XDG_CONFIG_HOME/ratio/config.toml`, or `~/.config/ratio/config.toml` when `XDG_CONFIG_HOME` is unset |
+| Windows | `%APPDATA%\ratio\config.toml` |
+
+A setting can come from four places. The first one that provides a value wins.
+
+1. Flags on the `ra` command line, such as `--model` or `--endpoint`
+2. `RATIO_*` environment variables
+3. The profile
+4. `OPENAI_BASE_URL` and `OPENAI_API_KEY`, as a fallback for the endpoint and the key
+
+Three details save a lot of confusion:
+
+- **`--config` replaces the global profile.** The two files are not merged, so a project profile must repeat the endpoint, model, and context window.
+- **The profile is strict.** An unknown or misplaced key stops Ratio with `invalid config`, naming the key.
+- **Each run reads the profile when it starts.** Edit the file and click **Start run** again. Restart `ra --web` only to change flags or environment variables, because the dashboard passes its own flags and environment to every run it starts.
+
+### The settings every profile needs
+
+| Setting | What to put there | Default |
+| --- | --- | --- |
+| `endpoint` | The API base URL up to the version prefix, such as `https://provider.example/v1`. Ratio appends `/chat/completions`. A full method URL is also accepted. | `https://api.openai.com/v1` |
+| `model` | The model ID exactly as your provider lists it. The model must support function (tool) calling, because agents plan, edit, and submit verdicts through tool calls. | None. Required. |
+| `context_window` | The number of tokens the model accepts in one request. For a local server, use the context size the server loaded the model with, which can be smaller than the model's maximum. With several models in one run, use the smallest. | None. Required. |
+| `output_tokens` | The cap on a single reply. It must be smaller than the context window. | A quarter of the context window, at most 4096 |
+| Key | Set `RATIO_API_KEY` in the environment. `api_key = "..."` in the profile also works. Keep that file private. | None. Optional for servers without authentication. |
+
+The default reply cap of 4096 tokens is conservative. If your model supports longer replies, raise `output_tokens`. A reply that reaches the cap is discarded and retried with a request for brevity, which costs time and tokens.
+
+### Endpoints for common providers
+
+| Provider | `endpoint` | Key |
+| --- | --- | --- |
+| OpenAI | `https://api.openai.com/v1` (the default) | `OPENAI_API_KEY` is picked up automatically |
+| OpenRouter | `https://openrouter.ai/api/v1` | `RATIO_API_KEY` |
+| MorphLLM | `https://api.morphllm.com/v1` | `RATIO_API_KEY` |
+| Ollama | `http://localhost:11434/v1` | Not needed |
+| LM Studio | `http://localhost:1234/v1` | Not needed |
+| llama.cpp `llama-server` | `http://localhost:8080/v1` | Not needed |
+| vLLM | `http://localhost:8000/v1` | Not needed |
+
+The local ports are each server's default. Any other OpenAI-compatible gateway works the same way. If yours rejects a request field, see [When a run does not start](#when-a-run-does-not-start).
+
+### A good first profile
+
+```toml
+endpoint = "https://provider.example/v1"
+model = "your-model-id"
+context_window = 128000
+output_tokens = 8192
+
+[orchestration]
+# Stop a run that goes too far. Omit a limit or set it to 0 for unlimited.
+max_review_cycles = 3
+max_total_tokens = 8000000
+max_run_secs = 3600
+```
+
+A run that reaches a cap ends as **Exhausted** and keeps its history. Raise the cap and click **Resume saved** to continue the same run. [Limits](#limits) lists every cap.
+
+To use different models per role, add `[worker]` and `[reviewer]` tables with their own `model`. To skip team generation for a small task, start the dashboard with `--fixed-team`. Ratio then uses your configured roster, or one built-in worker when the profile has none.
+
+### Project profiles
+
+Settings that belong to one project, such as verification commands, a fixed roster, or MCP servers, go in a profile you pass explicitly.
+
+```toml
+# PROJECT/ratio.toml
+endpoint = "https://provider.example/v1"
+model = "your-model-id"
+context_window = 128000
+
+[orchestration]
+stage_workspace = true
+verification_commands = ["npm test"]
+```
+
+```sh
+ra -C PROJECT --config PROJECT/ratio.toml --web
+```
+
+This profile turns on [staged publication](#staged-publication). Workers edit private copies, `npm test` runs on the merged candidate, and your worktree changes only after the reviewer approves a candidate that passed. Staging needs the root of a Git worktree and at least one verification command.
+
+More starting points:
+
+- [`ratio.example.toml`](ratio.example.toml) lists the common settings with comments. It also sets a `goal` and Rust-specific constraints, so edit those before you reuse it.
+- The [stakeholder example](examples/fullstack-stakeholders.toml) configures separate application and UX perspectives.
+- The [estuary simulation example](examples/morph-dsv41flash-abliterated.toml) uses MorphLLM and a staged three-worker DAG. The numerical kernels and parallel solver can run concurrently. The integration and verification worker depends on both. Its request is part of the profile, so it runs without the dashboard. Use an empty Git workspace with the credential in `RATIO_API_KEY`.
+
+```sh
+workspace="$(mktemp -d)"
+git -C "$workspace" init
+ra --headless --config examples/morph-dsv41flash-abliterated.toml -C "$workspace"
+```
+
+### Check the setup
+
+```sh
+ra -C /path/to/project --plan-only 'Add a --version flag to the CLI'
+```
+
+This asks the model to propose a team for the request, prints the proposal as JSON, and exits. It writes nothing to the project. A printed proposal means the endpoint, key, model ID, and function calling all work. Otherwise it prints the provider's error.
+
+### When a run does not start
+
+Each run the dashboard starts writes a log to `PROJECT/.ratio/runner-*.log`. A run that fails after starting also shows a **Failure** entry on its Overview.
+
+| What you see | Cause | Fix |
+| --- | --- | --- |
+| **Start run** shows `detached process exited during startup ... See .../.ratio/runner-....log` | The run could not load its settings. The log names the reason. | `set --model or --worker-model` means no model is configured. `set --context-window to the model's token limit` means `context_window` is missing. Add the setting to the profile and click **Start run** again. |
+| `ra: invalid config ...: unknown field` | A key is misspelled or sits in the wrong table, such as a limit outside `[orchestration]`. | Fix the key. The message lists the keys Ratio accepts at that level. |
+| The run stays in the Team phase, the log repeats `Provider retry`, and the run fails with `Connection refused` | The endpoint is unreachable. | Check the URL and port, and that the local server is running. |
+| The provider answers 401 or 403 | The key is missing, wrong, or not visible to the dashboard. | Export `RATIO_API_KEY` in the same shell, then restart `ra --web`. |
+| The provider rejects `stream_options` | The gateway does not report usage on streams. | Set `stream_usage = false` under `[provider]`. |
+| The provider rejects `max_completion_tokens` | The gateway predates that field. | Set `legacy_max_tokens = true` at the top level of the profile. |
+| The provider cannot stream | The endpoint returns JSON only. | Set `stream = false` under `[provider]`. |
+| The provider reports that the context is too long | `context_window` is larger than what the server accepts. | Lower `context_window` to the server's real limit. |
+| The model answers in prose and never calls a tool | The model or server does not support function calling. | Choose a tool-capable model, or enable tool calling on the server. |
+| The browser shows `Invalid dashboard host` | The page was opened through `localhost` or another hostname. | Open the `http://127.0.0.1:PORT/...` URL exactly as printed. |
+| The browser shows `Open the private URL printed by ra --web` | This tab has no access token. Each dashboard start prints a new token, and each tab keeps its own. | Open the full printed URL, including `#access=...`. |
+| **Start run** shows `This workspace already has an active run` | A workspace runs one run at a time. | Open the active run and click **Stop**, or use a second checkout for a parallel run. |
+
+### Provider reference
+
+| Setting | CLI | Environment | TOML |
+| --- | --- | --- | --- |
+| Endpoint | `--endpoint`, `--base-url` | `RATIO_ENDPOINT`, `OPENAI_BASE_URL` | `endpoint` |
+| Credential | `--api-key` | `RATIO_API_KEY`, `OPENAI_API_KEY` | `api_key` |
+| Default model | `--model` | `RATIO_MODEL` | `model` |
+| Role models | `--worker-model`, `--reviewer-model` | | `[worker].model`, `[reviewer].model` |
+| Context window | `--context-window` | `RATIO_CONTEXT_WINDOW` | `context_window` |
+| Output cap | `--output-tokens` | | `output_tokens` |
+| Transport | `--provider-api chat-completions\|responses` | | `[provider].api` |
+| Streaming | `--stream true\|false` | | `[provider].stream`, `[provider].stream_usage` |
+| Sampling | `--temperature`, `--top-p`, `--seed` | | `[provider].temperature`, `top_p`, `seed` |
+| Provider tool batching | `--parallel-tool-calls true\|false` | | `[provider].parallel_tool_calls` |
+| Extra HTTP headers | | | `[provider.headers]` |
+
+Role-specific and per-agent model settings can override the shared model. Set the context window to a token budget supported by every model in the run.
+
+Chat Completions is the default. Pass the base URL or full method URL for the selected transport. Choose Responses with `--provider-api responses` or `[provider].api = "responses"`. Both transports support function tools and SSE, with complete JSON accepted as a fallback. Ratio waits for a complete model reply before dispatching any tool. Responses uses `store: false` and carries returned reasoning items alongside the corresponding tool results.
+
+For Chat Completions gateways that reject `stream_options`, set `[provider].stream_usage = false`. Use `--stream false` for JSON-only endpoints. `--legacy-max-tokens` selects `max_tokens` for older Chat Completions gateways. `seed` is a Chat Completions setting whose effect depends on the provider. Provider tool batching controls calls within one completion. Ratio's agent concurrency is configured separately.
+
+Ratio sends a Bearer header when a key is configured. A custom `Authorization` header takes precedence. Standard credential header values and custom header values of at least eight UTF-8 bytes are masked in provider errors and live previews.
 
 ## A run in pictures
 
@@ -60,18 +240,86 @@ The timeline merges conversations, tool calls, messages, phase changes, and oper
 
 The run ends with a typed verdict. In staged mode, the overview also shows the verification receipt for the exact candidate that was published.
 
-### The same run in a terminal
+## The dashboard
 
-![Terminal UI Activity tab with a grid of agent cards above the shared transcript](docs/screenshots/tui-activity.png)
+```sh
+ra -C PROJECT --web
+ra -C PROJECT --config ratio.toml --web --web-port 7350
+```
 
-![Terminal UI Communication tab with the message sequence and inspector](docs/screenshots/tui-communication.png)
+Open the private URL printed by Ratio. The dashboard binds to `127.0.0.1` and chooses a free port by default. Use `--web-port` for a stable address. Use **Start run** to enter a request, or select a run from workspace history.
 
-The terminal UI shows the same run without a browser. Its sequence also draws handoffs (`CTX` rows): briefs, reports, and verdicts passed between the lead reviewer and the team.
+| View | Use it to |
+| --- | --- |
+| Overview | Inspect the live roster, task dependencies, ownership, acknowledgements, verification, and verdict |
+| Timeline | Search recorded conversations, IPC, tools, phases, and operator actions |
+| Agents | Follow each agent's conversation, file operations, tools, and incoming or outgoing messages |
+| Communication | Switch between message sequence, agent lanes, and the route matrix. Inspect reply links and each recipient's delivery. |
+| Tools & files | Browse MCP and native tools, expand arguments and captured output, and jump to the exact assistant turn |
+| Triage | Submit information for automatic routing, retry failed classification, or track a worker request |
+
+Press `1` to `6` to switch views and `/` to search the run. In the message sequence, the arrow keys or `j` and `k` move the selection.
+
+### Steering a run
+
+| Control | Effect |
+| --- | --- |
+| **Pause** / **Resume** | Interrupt active generations and hold the run, then continue it |
+| **Stop** | Cancel active work and keep the last checkpoint |
+| **Add worker** | Request an additional worker during the work phase. See [Adding a worker mid-run](#adding-a-worker-mid-run). |
+| **Submit information** in the Triage view | Give the team new information. The lead reviewer routes it to the right agents. |
+| **Resume saved** | Continue a stopped run from its latest checkpoint with the current configuration |
+| **Fork** | Start a new run with the same roster, optionally with a new request |
+
+Automatic triage uses the lead reviewer to classify and route information within the existing run permissions. You can name agents in the note. A queued note is waiting for routing at a runner checkpoint. Delivery saves it for the recipient and places it after the tool history in the next model request. The inbox shows the routing decision and delivery receipts, and allows you to retry routing an undelivered note. Pending items are marked deferred if the run finishes before delivery. **Add worker** requests a separate, read-only onboarding phase followed by unanimous acknowledgement of the amended plan. The worker request links to its onboarding IPC.
+
+### Closing, resuming, and changing configuration
+
+Closing the dashboard leaves its runner active. Start `ra -C PROJECT --web` again and select the run to return to it.
+
+To apply configuration changes to a run in progress, pause the run, restart the dashboard using the profile you want, open the same run, and click **Resume**. Ratio lets the paused dashboard runner exit at a checkpoint before launching its replacement. If the runner has already exited, click **Resume saved**. Both paths keep the run ID, roster, work plan, and committed conversations while loading the current profile and CLI overrides.
+
+### Reading the record
+
+The journal preserves tool invocations and receipts independently of conversation compaction. Expand **Full result** for the captured audit payload and **Model-visible result** for what the model received. Payloads can contain source and command output. Per-tool limits apply within the 8 MiB per-payload ceiling, with omission markers for truncated captures. Older journals expose the messages and tool receipts their checkpoints retained.
+
+The footer shows outgoing input, cached input, and incoming output. Cached input is included in the outgoing count. `~` marks an estimate, `+` marks a subtotal with missing records, and a dash indicates unavailable data. Incoming usage updates as chunks arrive. The `tok/s` readout estimates aggregate streamed output across agents over the last two seconds. The total settles to provider-reported usage when available. If a provider omits usage, Ratio retains its conservative budget charge.
+
+### Reach a dashboard on another machine
+
+The dashboard accepts requests for `127.0.0.1` only. To use one that runs on a remote machine, forward the same port over SSH.
+
+```sh
+ra -C PROJECT --web --web-port 7350          # on the remote machine
+ssh -L 7350:127.0.0.1:7350 user@remote       # on your machine
+```
+
+Then open the printed `http://127.0.0.1:7350/#access=...` URL in your local browser. Keep the local port identical to the remote one.
+
+### Share a run through Tailscale Funnel
+
+```sh
+ra -C PROJECT --config ratio.toml --web --web-port 7350 \
+  --web-share-port 7351 --web-share-origin https://YOUR-NODE.YOUR-TAILNET.ts.net
+tailscale funnel --bg http://127.0.0.1:7351
+```
+
+Point Funnel at the separate read-only port, `7351` in this example. Open the private dashboard URL printed by Ratio, select a run, and choose **Share** → **Create link**. Copy the link from the dialog. [Tailscale Funnel command reference](https://tailscale.com/docs/reference/tailscale-cli/funnel)
+
+Anyone holding the link can view that run’s live activity and recorded history, including prompts, messages, tool arguments and outputs, and operator notes. The public listener serves only run-scoped reads and denies API access to controls, other runs, and the checkpoint archive.
+
+Each run has one active link. **Replace link** invalidates the previous URL, and **Revoke link** also disconnects active visitors. Links remain valid across dashboard restarts when the same workspace and public origin are used. To preview sharing locally, omit `--web-share-origin` and use a fixed `--web-share-port`.
+
+### Run journal
+
+The SQLite WAL journal at `.ratio/runs.sqlite3` stores run state, IPC, tool outcomes, and budgets. An interrupted workspace tool is recorded as having an unknown outcome and requires inspection before relying on its effects. Interrupted IPC, memory, and acknowledgement operations can resume from their checkpoints. Ratio can import legacy format-2 JSON checkpoints and still maintains a format-2 mirror. Keep `.ratio/` private and outside version control because it contains transcripts and workspace data.
+
+Each resumed model request uses the current native tool schemas and access settings. For example, an updated `allow_inspection_shell` takes effect in inspection. For MCP, Ratio opens fresh connections and uses the current server policy. Resumed agents fetch current schemas with `tool_search` before calling external tools. Service-side handles that lived only in the previous connection may need to be reopened.
 
 ## How a run works
 
 ```text
-  Request from the CLI, terminal setup, or web dashboard
+  Request from the web dashboard or the command line
                                       |
                                       v
                Propose a team, use a configured roster, or run solo
@@ -130,6 +378,8 @@ The terminal UI shows the same run without a browser. Its sequence also draws ha
 
 Planning and review panels are optional. The write gate applies when a worker roster is configured. Coordination and acknowledgement expose workspace inspection tools. After the gate opens, workers can create and edit files or run commands. The digest binds the exact plan, roster, cycle, attempt, write ownership, and task graph when present. An objection invalidates the plan and uses another planning attempt. Run budgets can stop execution independently of the verdict.
 
+With a provider profile and no configured worker roster, Ratio proposes workers, reviewers, stakeholders, and acceptance criteria. An explicit worker roster takes precedence. Use `--fixed-team` to select the built-in single worker when the profile has no worker roster.
+
 ### Architecture
 
 ```text
@@ -161,54 +411,7 @@ Planning and review panels are optional. The write gate applies when a worker ro
                                              Web dashboard / attached TUI / CLI exports
 ```
 
-[`ra`](crates/ratio) owns the CLI, terminal UI, browser dashboard, and process control. [`ratio-engine`](crates/ratio-engine) owns execution and persistence. [`ratio-protocol`](crates/ratio-protocol) defines the task graph, run events, and control messages. The browser dashboard and attached TUI read the journal and send live controls through the active runner's private endpoint.
-
-## Running Ratio
-
-For repeat use, save your provider settings in `$XDG_CONFIG_HOME/ratio/config.toml` or `~/.config/ratio/config.toml`. On Windows, use `%APPDATA%\ratio\config.toml`. An explicit `--config` selects a different file. With a provider profile and no configured worker roster, Ratio proposes workers, reviewers, stakeholders, and acceptance criteria. Use `--web` to enter a request in a browser, or supply it directly through the CLI.
-
-```sh
-ra -C PROJECT 'Implement the solver and verify convergence'
-ra -C PROJECT --review-plan 'Implement the solver and verify convergence'
-ra -C PROJECT --plan-only 'Implement the solver and verify convergence'
-cat request.txt | ra -C PROJECT --headless --goal-stdin
-```
-
-In a terminal, start `ra` to enter a request. Use `--review-plan` to inspect and refine the proposal before starting with **Run proposal** or Ctrl+R. `--plan-only` prints the proposed team as JSON and exits before implementation. For CI or scripts, `--headless` writes progress to stderr and the final assessment to stdout. An explicit worker roster takes precedence. Use `--fixed-team` to select the built-in single worker when the profile has no worker roster.
-
-Use [`ratio.example.toml`](ratio.example.toml) as a starting point and pass `--config path/to/ratio.toml`. The [stakeholder example](examples/fullstack-stakeholders.toml) configures separate application and UX perspectives. The [estuary simulation example](examples/morph-dsv41flash-abliterated.toml) uses MorphLLM and a staged three-worker DAG. The numerical kernels and parallel solver can run concurrently. The integration and verification worker depends on both. Run it in an empty Git workspace with the credential available in `RATIO_API_KEY`.
-
-```sh
-workspace="$(mktemp -d)"
-git -C "$workspace" init
-ra --headless --config examples/morph-dsv41flash-abliterated.toml -C "$workspace"
-```
-
-## Provider configuration
-
-| Setting | CLI | Environment | TOML |
-| --- | --- | --- | --- |
-| Endpoint | `--endpoint`, `--base-url` | `RATIO_ENDPOINT`, `OPENAI_BASE_URL` | `endpoint` |
-| Credential | `--api-key` | `RATIO_API_KEY`, `OPENAI_API_KEY` | `api_key` |
-| Default model | `--model` | `RATIO_MODEL` | `model` |
-| Role models | `--worker-model`, `--reviewer-model` | | `[worker].model`, `[reviewer].model` |
-| Context window | `--context-window` | `RATIO_CONTEXT_WINDOW` | `context_window` |
-| Output cap | `--output-tokens` | | `output_tokens` |
-| Transport | `--provider-api chat-completions\|responses` | | `[provider].api` |
-| Streaming | `--stream true\|false` | | `[provider].stream`, `[provider].stream_usage` |
-| Sampling | `--temperature`, `--top-p`, `--seed` | | `[provider].temperature`, `top_p`, `seed` |
-| Provider tool batching | `--parallel-tool-calls true\|false` | | `[provider].parallel_tool_calls` |
-| Extra HTTP headers | | | `[provider.headers]` |
-
-Explicit flags take precedence over `RATIO_*` variables, then TOML, then `OPENAI_*` fallbacks where applicable. Set the context window to a token budget supported by every model in the run. Role-specific and per-agent model settings can override the shared model.
-
-Chat Completions is the default. Pass the base URL or full method URL for the selected transport. Choose Responses with `--provider-api responses` or `[provider].api = "responses"`. Both transports support function tools and SSE, with complete JSON accepted as a fallback. Ratio waits for a complete model reply before dispatching any tool. Responses uses `store: false` and carries returned reasoning items alongside the corresponding tool results.
-
-For Chat Completions gateways that reject `stream_options`, set `[provider].stream_usage = false`. Use `--stream false` for JSON-only endpoints. `--legacy-max-tokens` selects `max_tokens` for older Chat Completions gateways. `seed` is a Chat Completions setting whose effect depends on the provider. Provider tool batching controls calls within one completion. Ratio's agent concurrency is configured separately.
-
-The web dashboard footer shows outgoing input, cached input, and incoming output. Cached input is included in the outgoing count. `~` marks an estimate, `+` marks a subtotal with missing records, and a dash indicates unavailable data. Incoming usage updates as chunks arrive. The `tok/s` readout estimates aggregate streamed output across agents over the last two seconds. The total settles to provider-reported usage when available. If a provider omits usage, Ratio retains its conservative budget charge.
-
-Ratio sends a Bearer header when a key is configured. A custom `Authorization` header takes precedence. Standard credential header values and custom header values of at least eight UTF-8 bytes are masked in provider errors and live previews.
+[`ra`](crates/ratio) owns the CLI, browser dashboard, terminal UI, and process control. [`ratio-engine`](crates/ratio-engine) owns execution and persistence. [`ratio-protocol`](crates/ratio-protocol) defines the task graph, run events, and control messages. The browser dashboard and attached TUI read the journal and send live controls through the active runner's private endpoint.
 
 ## Teams, communication, and review
 
@@ -246,6 +449,27 @@ A stakeholder addresses the reply to the requester. Ratio broadcasts it to all w
 Agents can use `list_specialists` to find research, synthesis, adviser, memory, and tool operator roles, plus consultations using the configured workers' personas. `delegate` starts a separate conversation with a task and optional evidence references. Specialists can consult each other and return compact results. The tool operator uses configured MCP access within the caller's permissions.
 
 `start_tool` runs an authorized shell or MCP call in the background. Both submission tools return a job ID. An agent can continue working, check `job_status`, or use `await_jobs` to release its agent slot until the jobs finish. Results enter the caller's context at a model request boundary. Tight context windows can use a single `jobs` tool with an operation and arguments. The **Jobs** tab under **Tools & files** links back to the calling turn and to each specialist conversation.
+
+### Adding a worker mid-run
+
+During execution under a frozen worker plan, Ratio can queue one additional-worker request at a time. Click **Add worker** in the dashboard and describe the role and scope. Ratio finishes pending tool batches, proposes disjoint write paths and a new assignment, and requires read-only IPC exchanges with an incumbent worker and a stakeholder or temporary adviser. Every worker then acknowledges the amended plan ID before execution resumes. A declined request returns the incumbent team to its existing plan. The Triage view tracks the request and its result.
+
+```text
+  Work under plan A
+    |
+    +-- operator requests worker --> settle pending tool batches
+          |
+          v
+        Propose one assignment with disjoint write paths
+          |
+          v
+        Incumbent mentor <-- BWP --> New worker <-- BWP --> Stakeholder
+          |
+          v
+        Every worker acknowledges plan B
+          +-- unanimous --> Work under plan B with the expanded team
+          `-- declined ---> Work under plan A with the incumbent team
+```
 
 ## Workspace and publication
 
@@ -312,111 +536,6 @@ verification_commands = ["cargo test --locked --workspace"]
 Staging snapshots tracked edits and unignored untracked files. Worker deltas are merged in worker order within each completion wave. Verification runs in a separate copy and must pass against the candidate manifest for publication. Publication checks affected files against the baseline, leaves Git history and the index intact, and preserves unrelated local edits. Use regular files and UTF-8 paths, and ignore generated artifacts. File replacement is individually atomic where supported. An external process can still race the final check.
 
 Shell commands and local MCP subprocesses inherit the operator's host permissions. Staged ownership checks cover changes in the staged tree. Shell can act outside that tree or bypass native path ownership in a direct run. Keep the workspace, commands, and local Git configuration within your trust boundary.
-
-## Interfaces and run history
-
-### Web dashboard
-
-```sh
-ra -C PROJECT --web
-ra -C PROJECT --config ratio.toml --web --web-port 7350
-```
-
-Open the private URL printed by Ratio. The dashboard binds to `127.0.0.1` and chooses a free port by default. Use **Start run** to enter a request, or select a run from workspace history. Closing the dashboard leaves its runner active. To apply configuration changes, pause the run, restart the dashboard using the profile you want, open the same run, and click **Resume**. Ratio lets the paused dashboard runner exit at a checkpoint before launching its replacement. If the runner has already exited, click **Resume saved**. Both paths keep the run ID, roster, work plan, and committed conversations while loading the current profile and CLI overrides.
-
-| View | Use it to |
-| --- | --- |
-| Overview | Inspect the live roster, task dependencies, ownership, acknowledgements, verification, and verdict |
-| Timeline | Search recorded conversations, IPC, tools, phases, and operator actions |
-| Agents | Follow each agent's conversation, file operations, tools, and incoming or outgoing messages |
-| Communication | Switch between message sequence, agent lanes, and the route matrix. Inspect reply links and each recipient's delivery. |
-| Tools & files | Browse MCP and native tools, expand arguments and captured output, and jump to the exact assistant turn |
-| Triage | Submit information for automatic routing, retry failed classification, or track a worker request |
-
-The journal preserves tool invocations and receipts independently of conversation compaction. Expand **Full result** for the captured audit payload and **Model-visible result** for what the model received. Payloads can contain source and command output. Per-tool limits apply within the 8 MiB per-payload ceiling, with omission markers for truncated captures. Older journals expose the messages and tool receipts their checkpoints retained.
-
-Automatic triage uses the lead reviewer to classify and route information within the existing run permissions. You can name agents in the note. A queued note is waiting for routing at a runner checkpoint. Delivery saves it for the recipient and places it after the tool history in the next model request. The inbox shows the routing decision and delivery receipts, and allows you to retry routing an undelivered note. Pending items are marked deferred if the run finishes before delivery. **Add worker** requests a separate, read-only onboarding phase followed by unanimous acknowledgement of the amended plan. The worker request links to its onboarding IPC.
-
-Press `1` to `6` to switch views and `/` to search the run. In the message sequence, the arrow keys or `j` and `k` move the selection.
-
-#### Share a run through Tailscale Funnel
-
-```sh
-ra -C PROJECT --config ratio.toml --web --web-port 7350 \
-  --web-share-port 7351 --web-share-origin https://YOUR-NODE.YOUR-TAILNET.ts.net
-tailscale funnel --bg http://127.0.0.1:7351
-```
-
-Point Funnel at the separate read-only port, `7351` in this example. Open the private dashboard URL printed by Ratio, select a run, and choose **Share** → **Create link**. Copy the link from the dialog. [Tailscale Funnel command reference](https://tailscale.com/docs/reference/tailscale-cli/funnel)
-
-Anyone holding the link can view that run’s live activity and recorded history, including prompts, messages, tool arguments and outputs, and operator notes. The public listener serves only run-scoped reads and denies API access to controls, other runs, and the checkpoint archive.
-
-Each run has one active link. **Replace link** invalidates the previous URL, and **Revoke link** also disconnects active visitors. Links remain valid across dashboard restarts when the same workspace and public origin are used. To preview sharing locally, omit `--web-share-origin` and use a fixed `--web-share-port`.
-
-### Terminal UI
-
-**Activity** shows a grid of agent cards above the shared transcript. Each card shows its current generation, running tool, or latest observed result. Active agents appear first. Use Up/Down or the mouse wheel over the grid to see more agents. **Communication** shows the message sequence, route matrix, and inspector. **Workflow** shows acknowledgements, task state, acceptance criteria, compaction, and verification evidence.
-
-| Key | Action |
-| --- | --- |
-| Enter | Refine a proposal during setup or queue guidance during a run |
-| Ctrl+R or click Run proposal | Approve the setup proposal and start |
-| Tab, Shift+Tab, or click a tab | Switch between Activity, Communication, and Workflow |
-| PgUp / PgDn in Activity | Scroll the shared transcript |
-| Ctrl+T in Communication | Switch between Sequence and Routes |
-| Ctrl+F in Communication | Filter all traffic, IPC, or handoffs |
-| Ctrl+P or click Pause / Resume | Pause or resume model requests. Pausing interrupts active generations and agent shell commands. Interrupted commands receive a tool result so the agent can inspect partial effects after resuming. |
-| Ctrl+N, click Add worker, or type `/add-worker REQUEST` | Request an additional worker during execution |
-| Ctrl-C | During inline generation, cancel and pause. While paused or between generations, exit. |
-| Esc | Cancel a setup request or detach from an attached run |
-
-In Communication, use arrows to navigate and Ctrl+Up or Ctrl+Down to scroll the inspector. End follows new traffic in Sequence. An IPC delivery marker records context insertion. Handoff rows show briefs, reports, and verdicts. Inline views keep the latest 512 observed exchanges. An attached live run displays generation previews over the private control endpoint. An attached historical run shows recorded IPC and tool observations from the journal.
-
-### Detached runs and control
-
-```sh
-ra -C PROJECT --detached --config ratio.toml --goal 'Implement the solver'
-ra -C PROJECT --list-runs
-ra -C PROJECT --events RUN_ID --after 0 --follow
-ra -C PROJECT --attach RUN_ID
-ra -C PROJECT --control status
-ra -C PROJECT --control guide --guidance 'Keep the reference solver available'
-ra -C PROJECT --control add-worker --worker-request 'Add a worker to own profiler fixtures'
-ra -C PROJECT --control pause
-ra -C PROJECT --control resume
-ra -C PROJECT --control cancel
-ra -C PROJECT --config ratio.toml --resume --run-id RUN_ID
-ra -C PROJECT --config ratio.toml --fork RUN_ID --goal 'Evaluate a second approach'
-```
-
-Inline, foreground headless, and detached runs expose execution controls through a private Unix socket or a Windows named pipe restricted to the operator and SYSTEM. The detached launch response provides the combined progress and assessment log path and the run ID when the process is still active. `--events` emits checkpoint records as JSON Lines. `--resume` defaults to the latest run. A fork starts a new conversation and budget from the recorded roster and goal, using the current workspace as its baseline. Supply `--goal` to override the inherited goal.
-
-### Adding a worker mid-run
-
-During execution under a frozen worker plan, Ratio can queue one additional-worker request at a time. It finishes pending tool batches, proposes disjoint write paths and a new assignment, and requires read-only IPC exchanges with an incumbent worker and a stakeholder or temporary adviser. Every worker then acknowledges the amended plan ID before execution resumes. A declined request returns the incumbent team to its existing plan. The Workflow pane records the result.
-
-```text
-  Work under plan A
-    |
-    +-- operator requests worker --> settle pending tool batches
-          |
-          v
-        Propose one assignment with disjoint write paths
-          |
-          v
-        Incumbent mentor <-- BWP --> New worker <-- BWP --> Stakeholder
-          |
-          v
-        Every worker acknowledges plan B
-          +-- unanimous --> Work under plan B with the expanded team
-          `-- declined ---> Work under plan A with the incumbent team
-```
-
-### Run journal
-
-The SQLite WAL journal at `.ratio/runs.sqlite3` stores run state, IPC, tool outcomes, and budgets. An interrupted workspace tool is recorded as having an unknown outcome and requires inspection before relying on its effects. Interrupted IPC, memory, and acknowledgement operations can resume from their checkpoints. Ratio can import legacy format-2 JSON checkpoints and still maintains a format-2 mirror. Keep `.ratio/` private and outside version control because it contains transcripts and workspace data.
-
-Each resumed model request uses the current native tool schemas and access settings. For example, an updated `allow_inspection_shell` takes effect in inspection. For MCP, Ratio opens fresh connections and uses the current server policy. Resumed agents fetch current schemas with `tool_search` before calling external tools. Service-side handles that lived only in the previous connection may need to be reopened.
 
 ## Context, limits, and automation
 
@@ -508,9 +627,77 @@ The [MorphLLM + Assist example](examples/morph-assist.toml) uses `morph-dsv41fla
 ```sh
 ra --config examples/morph-assist.toml --check-mcp assist
 ra -C PROJECT --config examples/morph-assist.toml --web
-ra -C PROJECT --config examples/morph-assist.toml --fixed-team \
-  'Use Assist to identify the open IDA database and summarize its segments and imports.'
 ```
+
+In the dashboard, start a run with a request such as `Use Assist to identify the open IDA database and summarize its segments and imports.` Add `--fixed-team` to the second command to run it with a single worker.
+
+## Terminal and headless use
+
+Everything above also works without a browser. The same profile, flags, and environment variables apply. Runs started here appear in the dashboard's run history for the same workspace.
+
+### Running from the command line
+
+```sh
+ra -C PROJECT 'Implement the solver and verify convergence'
+ra -C PROJECT --review-plan 'Implement the solver and verify convergence'
+ra -C PROJECT --plan-only 'Implement the solver and verify convergence'
+cat request.txt | ra -C PROJECT --headless --goal-stdin
+```
+
+A request on the command line runs in the terminal UI. Start `ra` without a request to enter one there. Use `--review-plan` to inspect and refine the proposal before starting with **Run proposal** or Ctrl+R. `--plan-only` prints the proposed team as JSON and exits before implementation. For CI or scripts, `--headless` writes progress to stderr and the final assessment to stdout.
+
+A run needs no profile when the flags carry the provider settings.
+
+```sh
+export RATIO_API_KEY='<provider key>'
+ra -C /path/to/project \
+  --endpoint https://provider.example/v1 \
+  --model provider-model \
+  --context-window 32768 \
+  --headless --goal 'Fix the parser regression and verify all supported inputs.'
+```
+
+### Detached runs and control
+
+```sh
+ra -C PROJECT --detached --config ratio.toml --goal 'Implement the solver'
+ra -C PROJECT --list-runs
+ra -C PROJECT --events RUN_ID --after 0 --follow
+ra -C PROJECT --attach RUN_ID
+ra -C PROJECT --control status
+ra -C PROJECT --control guide --guidance 'Keep the reference solver available'
+ra -C PROJECT --control add-worker --worker-request 'Add a worker to own profiler fixtures'
+ra -C PROJECT --control pause
+ra -C PROJECT --control resume
+ra -C PROJECT --control cancel
+ra -C PROJECT --config ratio.toml --resume --run-id RUN_ID
+ra -C PROJECT --config ratio.toml --fork RUN_ID --goal 'Evaluate a second approach'
+```
+
+Inline, foreground headless, and detached runs expose execution controls through a private Unix socket or a Windows named pipe restricted to the operator and SYSTEM. The `--control` commands also reach a run the dashboard started. The detached launch response provides the combined progress and assessment log path and the run ID when the process is still active. `--events` emits checkpoint records as JSON Lines. `--resume` defaults to the latest run. A fork starts a new conversation and budget from the recorded roster and goal, using the current workspace as its baseline. Supply `--goal` to override the inherited goal.
+
+### Terminal UI
+
+![Terminal UI Activity tab with a grid of agent cards above the shared transcript](docs/screenshots/tui-activity.png)
+
+![Terminal UI Communication tab with the message sequence and inspector](docs/screenshots/tui-communication.png)
+
+The terminal UI shows a run without a browser. **Activity** shows a grid of agent cards above the shared transcript. Each card shows its current generation, running tool, or latest observed result. Active agents appear first. Use Up/Down or the mouse wheel over the grid to see more agents. **Communication** shows the message sequence, route matrix, and inspector. Its sequence also draws handoffs (`CTX` rows): briefs, reports, and verdicts passed between the lead reviewer and the team. **Workflow** shows acknowledgements, task state, acceptance criteria, compaction, and verification evidence.
+
+| Key | Action |
+| --- | --- |
+| Enter | Refine a proposal during setup or queue guidance during a run |
+| Ctrl+R or click Run proposal | Approve the setup proposal and start |
+| Tab, Shift+Tab, or click a tab | Switch between Activity, Communication, and Workflow |
+| PgUp / PgDn in Activity | Scroll the shared transcript |
+| Ctrl+T in Communication | Switch between Sequence and Routes |
+| Ctrl+F in Communication | Filter all traffic, IPC, or handoffs |
+| Ctrl+P or click Pause / Resume | Pause or resume model requests. Pausing interrupts active generations and agent shell commands. Interrupted commands receive a tool result so the agent can inspect partial effects after resuming. |
+| Ctrl+N, click Add worker, or type `/add-worker REQUEST` | Request an additional worker during execution |
+| Ctrl-C | During inline generation, cancel and pause. While paused or between generations, exit. |
+| Esc | Cancel a setup request or detach from an attached run |
+
+In Communication, use arrows to navigate and Ctrl+Up or Ctrl+Down to scroll the inspector. End follows new traffic in Sequence. An IPC delivery marker records context insertion. Handoff rows show briefs, reports, and verdicts. Inline views keep the latest 512 observed exchanges. An attached live run displays generation previews over the private control endpoint. An attached historical run shows recorded IPC and tool observations from the journal. The Workflow pane records the result of a mid-run worker request.
 
 ## Development
 
