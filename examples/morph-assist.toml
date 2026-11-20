@@ -7,6 +7,10 @@ output_tokens = 32000
 [orchestration]
 allow_inspection_shell = true
 
+[constraints]
+# Route the second worker's process operations through MCP.
+forbidden_tools = ["worker_2/shell"]
+
 [mcp_servers.assist]
 # Resolve Assist through PATH, or set the executable path in a local profile.
 command = "assist"
@@ -14,7 +18,10 @@ args = ["--mcp"]
 protocol = "2025-11-25"
 lifetime = "worker"
 allow_all = true
-instructions = "Use tool_search to inspect Assist tool schemas. For unloaded binaries, call file_load_facts via mcp_call with an absolute arguments.path. For open IDA databases, use the matching list_databases hash as arguments.target for get_binary_type, get_segments, get_imports or list_functions. For managed instances, use list_instances then instance_info. Use read_file for raw bytes."
+instructions = """
+Plan and execute IDA lifecycle through Assist MCP, including when a saved plan specifies a CLI harness. In Work, fetch schemas with tool_search and use mcp_call for launch_instance, instance_info, save_instance, and terminate_instance. Launch with wait_seconds=0, check status directly, and do other work while analysis runs. Manage only instances you launch. Do not write, start, or poll shell-based IDA runners. Report MCP lifecycle failures as blockers.
+For unloaded binaries use file_load_facts with an absolute path. Use list_databases hashes as targets for open databases and list_instances to discover managed instances. Use read_file for raw bytes.
+"""
 # Also available to agents during inspection phases, including before plan ACK.
 inspection_tools = [
     "file_load_facts",

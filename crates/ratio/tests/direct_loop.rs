@@ -1225,6 +1225,154 @@ fn parallel_result_survives_interrupt_while_another_tool_is_in_flight() {
 
 #[test]
 #[cfg(unix)]
+fn ready_worker_advances_while_peer_shell_runs_and_dependent_waits() {
+    use ra::{
+        config::Worker,
+        session::{Phase, Session, Store, WorkerPlan, WritePath},
+    };
+    use ratio_protocol::{Task, TaskGraph};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let config = root.join("ratio.toml");
+    std::fs::write(&config, "[orchestration]\nmax_parallel_agents = 2\n").unwrap();
+    {
+        let workers =
+            ["Shell worker", "Independent worker", "Dependent worker"].map(|name| Worker {
+                name: name.into(),
+                persona: "Execute your assignment".into(),
+                model: None,
+            });
+        let tasks = ["slow", "independent", "dependent"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| Task {
+                id: id.into(),
+                worker: format!("worker_{}", index + 1),
+                description: format!("Run {id} work"),
+                depends_on: if index == 2 {
+                    vec!["slow".into()]
+                } else {
+                    vec![]
+                },
+                acceptance: vec!["Report the result".into()],
+            })
+            .collect::<Vec<_>>();
+        let mut plan = WorkerPlan::freeze(
+            "Run independent work while the shell worker is busy".into(),
+            1,
+            1,
+            &workers,
+            vec![
+                vec![],
+                vec![WritePath {
+                    path: "release".into(),
+                    directory: false,
+                }],
+                vec![],
+            ],
+        )
+        .bind_graph(Some(TaskGraph(tasks)), 1, &workers);
+        plan.acknowledgements = vec![0, 1, 2];
+        let mut session = Session::new("Exercise continuous worker scheduling".into());
+        session.phase = Phase::Work;
+        session.workers = Some(workers.to_vec());
+        session.worker_plan = Some(plan);
+        Store::open(root).unwrap().save(&session).unwrap();
+    }
+    let workspace = root.to_path_buf();
+    let mut independent_advanced = false;
+    let mut dependent_started = false;
+    let (endpoint, server) = mock(move |_, request| {
+        let messages = request["messages"].as_array().unwrap();
+        let system = messages[0]["content"].as_str().unwrap();
+        let last = messages.last().unwrap();
+        let result = last["content"].as_str().unwrap_or_default();
+        let wait_for = |marker| {
+            format!(
+                "i=0; until test -f {marker}; do i=$((i + 1)); test \"$i\" -lt 200 || exit 1; sleep 0.03; done"
+            )
+        };
+        if system.starts_with("You are parallel worker worker_1,") {
+            if last["tool_call_id"] == "slow-shell" {
+                assert!(result.contains("shell released"), "{result}");
+                text("Shell worker finished.")
+            } else {
+                calls(&[tool(
+                    "slow-shell",
+                    "shell",
+                    json!({
+                        "command": format!("touch slow-started; {}; echo shell released", wait_for("release")),
+                        "workdir": null
+                    }),
+                )])
+            }
+        } else if system.starts_with("You are parallel worker worker_2,") {
+            match last["tool_call_id"].as_str() {
+                Some("observe-shell") => {
+                    assert!(result.contains("observed shell start"), "{result}");
+                    let checkpoint: Value = serde_json::from_slice(
+                        &std::fs::read(workspace.join(".ratio/session.json")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        checkpoint["worker_progress"][0]["dialogue"]["in_flight"],
+                        true
+                    );
+                    assert!(!dependent_started);
+                    independent_advanced = true;
+                    calls(&[tool(
+                        "release-shell",
+                        "create_file",
+                        json!({
+                            "path": "release", "content": "independent work complete"
+                        }),
+                    )])
+                }
+                Some("release-shell") => {
+                    assert!(result.contains("Created release"), "{result}");
+                    text("Independent worker finished.")
+                }
+                _ => calls(&[tool(
+                    "observe-shell",
+                    "shell",
+                    json!({
+                        "command": format!("{}; echo observed shell start", wait_for("slow-started")),
+                        "workdir": null
+                    }),
+                )]),
+            }
+        } else if system.starts_with("You are parallel worker worker_3,") {
+            let checkpoint: Value = serde_json::from_slice(
+                &std::fs::read(workspace.join(".ratio/session.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(independent_advanced);
+            assert_eq!(
+                checkpoint["worker_progress"][0]["assessment"],
+                "Shell worker finished."
+            );
+            dependent_started = true;
+            text("Dependent worker finished.")
+        } else {
+            assert!(dependent_started);
+            decision(
+                "approved",
+                "Verified independent progress and dependency order.",
+            )
+        }
+    });
+    succeeded(&cli_window(
+        root,
+        &endpoint,
+        "8192",
+        &["--resume", "--config", config.to_str().unwrap()],
+    ));
+    server.join().unwrap();
+}
+
+#[test]
+#[cfg(unix)]
 fn pausing_shell_records_its_result_and_routes_notes_before_the_next_tool() {
     use ra::{
         config::Worker,
@@ -2841,9 +2989,10 @@ persona = "Own worker_3.txt."
                         }),
                     )]);
                     (response, !coordinated.iter().all(|&received| received))
-                } else {
-                    assert!(all_messages.contains("Untrusted peer IPC context"));
+                } else if all_messages.contains("Untrusted peer IPC context") {
                     (text(&format!("Assignment agreed for {own_file}.")), false)
+                } else {
+                    (text("Sent my proposed scope. Awaiting peer input."), false)
                 }
             } else if system.contains("Phase: acknowledge") {
                 assert!(mutators.iter().all(|tool| !tools.contains(tool)));
@@ -2994,7 +3143,9 @@ persona = "Own worker_3.txt."
         } else if task.starts_with("Write the final execution plan") {
             freeze_attempts += 1;
             assert!(coordinated.iter().all(|&active| active));
-            assert!(task.contains("Assignment agreed for worker_3.txt."));
+            for worker in 1..=3 {
+                assert!(task.contains(&format!("Assignment agreed for worker_{worker}.txt.")));
+            }
             if staged && graph && freeze_attempts == 1 {
                 let (status, stream) = stream_response(
                     &[stream_event(json!({"content":"partial"}), Some("length"))],

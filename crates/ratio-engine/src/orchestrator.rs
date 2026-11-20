@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 mod contracts;
 mod onboarding;
 mod triage;
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use ratio_protocol::{RunStop, TaskGraph};
 use serde_json::{Value, json};
 
@@ -1311,247 +1311,347 @@ impl<'a> Orchestrator<'a> {
         mut checkpoint: impl FnMut(&[WorkerProgress]) -> Result<()>,
     ) -> Result<()> {
         let limit = mailbox.inbox_bytes();
+        let workers = options.stakeholder_start.unwrap_or(panel.len());
+        let mut saved = panel.iter().map(PanelAgent::snapshot).collect::<Vec<_>>();
+        let mut idle = panel.iter_mut().map(Some).collect::<Vec<_>>();
+        let candidate = &tokio::sync::RwLock::new(());
+        let mut active = FuturesUnordered::new();
+        let control = self.reporter.generation_control();
+        let paused = || control.as_ref().is_some_and(|state| state.borrow().paused);
+        let mut cursor = 0;
+        let mut first_error = None;
         loop {
-            let ready =
-                if panel.iter().any(|agent| agent.assessment.is_none()) || mailbox.has_pending() {
+            if first_error.is_none() {
+                let ready = if active.is_empty() {
                     self.api.wait_for_generation().await
                 } else {
                     Ok(())
                 };
-            if let Some(note) = read_guidance(options.guidance) {
-                let workers = options.stakeholder_start.unwrap_or(panel.len());
-                for agent in &mut panel[..workers] {
-                    self.append_guidance(&mut agent.dialogue.operator_guidance, &note);
-                    agent.reopen(limit);
-                }
-                self.progress("[steer] Added user guidance to the worker team");
-                checkpoint(&panel.iter().map(PanelAgent::snapshot).collect::<Vec<_>>())?;
-            }
-            if ready
-                .as_ref()
-                .is_err_and(|error| error.is::<crate::events::CheckpointExit>())
-            {
-                // The previous wave settled. Any remaining marked call was queued
-                // for dispatch in a subsequent wave, so it can still run on resume.
-                for agent in panel.iter_mut() {
-                    agent.dialogue.in_flight = false;
-                }
-                checkpoint(&panel.iter().map(PanelAgent::snapshot).collect::<Vec<_>>())?;
-            }
-            ready?;
-            if let Some(run) = options.triage_run {
-                let eligible = panel
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, agent)| agent.assessment.is_none() && !agent.failed)
-                    .map(|(index, _)| (mailbox.id(index), mailbox.name(index)))
-                    .collect::<Vec<_>>();
-                if let Some(note) = self.next_triage(run, &eligible, false).await? {
-                    let mut changed = false;
-                    for (index, agent) in panel.iter_mut().enumerate() {
-                        let id = mailbox.id(index);
-                        if note.recipients.iter().any(|recipient| recipient == id) {
-                            self.apply_triage(&mut agent.dialogue, id, &note);
-                            changed = true;
+                if let Some(note) = read_guidance(options.guidance) {
+                    for (slot, progress) in idle[..workers].iter_mut().zip(&mut saved[..workers]) {
+                        if let Some(agent) = slot {
+                            self.append_guidance(&mut agent.dialogue.operator_guidance, &note);
+                            agent.reopen(limit);
+                            *progress = agent.snapshot();
+                        } else {
+                            // Keep steering durable while the agent is still running its step.
+                            self.append_guidance(&mut progress.dialogue.operator_guidance, &note);
                         }
                     }
-                    if changed {
-                        checkpoint(&panel.iter().map(PanelAgent::snapshot).collect::<Vec<_>>())?;
-                    }
+                    self.progress("[steer] Added user guidance to the worker team");
+                    checkpoint(&saved)?;
                 }
-            }
-            for (index, agent) in panel.iter_mut().enumerate() {
-                if !agent.failed && agent.dialogue.pending()?.is_none() {
-                    if options.ipc {
-                        agent.deliver(mailbox.drain(index, &self.reporter), limit);
+                if ready
+                    .as_ref()
+                    .is_err_and(|error| error.is::<crate::events::CheckpointExit>())
+                {
+                    // Every dispatched step has settled. Any remaining marked call
+                    // was checkpointed before dispatch and can still run on resume.
+                    for (slot, progress) in idle.iter_mut().zip(&mut saved) {
+                        let agent = slot.as_mut().expect("panel is idle");
+                        agent.dialogue.in_flight = false;
+                        *progress = agent.snapshot();
                     }
-                    if options.gate.is_some_and(|gate| gate.responded(index))
-                        && agent.assessment.is_none()
-                    {
-                        agent.assessment = Some(
-                            if options.gate.is_some_and(|gate| gate.accepted(index)) {
-                                "Acknowledged the frozen plan."
-                            } else {
-                                "Requested replanning."
-                            }
-                            .into(),
-                        );
-                        self.reporter.agent(
-                            mailbox.id(index),
-                            Kind::Agent,
-                            "Plan response",
-                            agent.assessment.as_deref().unwrap_or_default(),
-                        );
-                    }
+                    checkpoint(&saved)?;
                 }
-            }
-            if let Some((staging, cycle)) = options.staging {
-                let workers = options.stakeholder_start.unwrap_or(panel.len());
-                let mut integrated = false;
-                for (index, agent) in panel[..workers].iter_mut().enumerate() {
-                    if agent.assessment.is_some() && agent.artifact_sha256.is_none() {
-                        self.mcp.close_worker(mailbox.id(index));
-                        let stage = staging.clone();
-                        let ownership = options
-                            .ownership
-                            .and_then(|paths| paths.get(index))
-                            .cloned();
-                        let digest = tokio::task::spawn_blocking(move || {
-                            stage.merge(cycle, index, ownership.as_deref())
-                        })
-                        .await??;
-                        agent.artifact_sha256 = Some(digest);
-                        integrated = true;
-                    }
-                }
-                if integrated {
-                    checkpoint(&panel.iter().map(PanelAgent::snapshot).collect::<Vec<_>>())?;
-                }
-            }
-            if panel.iter().all(|agent| agent.assessment.is_some()) && !mailbox.has_pending() {
-                break;
-            }
-            let mut saved = panel.iter().map(PanelAgent::snapshot).collect::<Vec<_>>();
-            if options.ipc || options.gate.is_some() {
-                // Commit drained mail together with the receiving dialogue.
-                checkpoint(&saved)?;
-            }
-            let admitting = self.worker_admission_pending(options.admission_run)?;
-            if admitting {
-                let mut outstanding = false;
-                for agent in panel.iter() {
-                    outstanding |= agent.dialogue.pending()?.is_some();
-                }
-                if !outstanding {
-                    break;
-                }
-            }
-            let ready: Vec<_> = panel
-                .iter()
-                .enumerate()
-                .map(|(index, agent)| {
-                    (!admitting || agent.dialogue.pending().is_ok_and(|call| call.is_some()))
-                        && agent.assessment.is_none()
-                        && options
-                            .dependencies
-                            .and_then(|all| all.get(index))
-                            .is_none_or(|parents| {
-                                parents.iter().all(|&parent| {
-                                    if options.staging.is_some() {
-                                        saved[parent].artifact_sha256.is_some()
-                                    } else {
-                                        saved[parent].assessment.is_some()
-                                    }
-                                })
-                            })
-                })
-                .collect();
-            ensure!(
-                ready.contains(&true),
-                "task scheduler has no runnable agents"
-            );
-            let jobs = panel
-                .iter_mut()
-                .enumerate()
-                .filter(|(index, _)| ready[*index])
-                .map(|(sender, agent)| async move {
-                    let stakeholder = options
-                        .stakeholder_start
-                        .is_some_and(|start| sender >= start);
-                    let mut access = options.access;
-                    let mut system = std::borrow::Cow::Borrowed(agent.system.as_str());
-                    let mut private_workspace = None;
-                    if let Some((staging, cycle)) = options.staging.filter(|_| !stakeholder) {
-                        if staging.merged(cycle, sender) {
-                            access = Access::Inspect;
-                        }
-                        let stage = staging.clone();
-                        match tokio::task::spawn_blocking(move || stage.worker(cycle, sender)).await
-                        {
-                            Ok(Ok(workspace)) => {
-                                system = std::borrow::Cow::Owned(system.replacen(
-                                    &format!("Working directory: {}", options.workspace.display()),
-                                    &format!("Working directory: {}", workspace.display()),
-                                    1,
-                                ));
-                                private_workspace = Some(workspace);
-                            }
-                            Ok(Err(error)) => return (sender, agent.snapshot(), Err(error)),
-                            Err(error) => return (sender, agent.snapshot(), Err(error.into())),
-                        }
-                    }
-                    let defer = (|| -> Result<bool> {
-                        Ok(agent.dialogue.pending()?.is_none()
-                            && self.worker_admission_pending(options.admission_run)?)
-                    })();
-                    match defer {
-                        Ok(false) => {}
-                        Ok(true) => return (sender, agent.snapshot(), Ok(())),
-                        Err(error) => return (sender, agent.snapshot(), Err(error)),
-                    }
-                    let peer = PeerTools {
-                        route: options.ipc.then_some(Route { mailbox, sender }),
-                        ack: options.gate.map(|gate| (gate, sender)),
-                        memory: options.memory,
-                        author: mailbox.id(sender),
-                        final_review: false,
-                        plan_workers: None,
-                        ownership: options
-                            .ownership
-                            .and_then(|paths| paths.get(sender).map(Vec::as_slice)),
-                        workspace: private_workspace.as_deref().unwrap_or(options.workspace),
-                        allow_approval: false,
-                        require_task_graph: false,
-                        repairing: false,
-                    };
-                    let result = match self
-                        .step(
-                            &mut agent.dialogue,
-                            agent.model,
-                            if stakeholder { Access::Inspect } else { access },
-                            &system,
-                            &agent.scope,
-                            peer,
+                ready?;
+
+                // Triage observes a settled panel and commits steering before the next
+                // worker step. Wait for that boundary only when a note is queued.
+                let triage_waiting = match options.triage_run {
+                    Some(run) if !active.is_empty() && !paused() => self
+                        .store
+                        .journal
+                        .borrow()
+                        .next_triage(run, false)?
+                        .is_some(),
+                    _ => false,
+                };
+                if !paused() && !triage_waiting {
+                    if self
+                        .prepare_idle_agents(
+                            &mut idle,
+                            &mut saved,
+                            mailbox,
+                            options,
+                            active.is_empty(),
                         )
-                        .await
+                        .await?
                     {
-                        Ok(Step::Continue) => Ok(()),
-                        Ok(Step::Verdict(_, _) | Step::Plan(_) | Step::Repair(_)) => {
-                            unreachable!("panel has no decision tool")
+                        checkpoint(&saved)?;
+                    }
+                    if paused() {
+                        continue;
+                    }
+
+                    let admitting = self.worker_admission_pending(options.admission_run)?;
+                    // Rotate after each dispatch so that a fast agent cannot keep a
+                    // slot ahead of another agent that has been ready longer.
+                    for sender in (cursor..idle.len()).chain(0..cursor) {
+                        if active.len() == options.width {
+                            break;
                         }
-                        Ok(Step::Finished(result)) => {
-                            self.reporter
-                                .agent(peer.author, Kind::Agent, "Report", &result);
-                            agent.assessment = Some(result);
-                            Ok(())
+                        let Some(agent) = &idle[sender] else { continue };
+                        let integrating = options.staging.is_some()
+                            && sender < workers
+                            && agent.assessment.is_some()
+                            && agent.artifact_sha256.is_none();
+                        if !integrating {
+                            if agent.assessment.is_some()
+                                || (admitting && agent.dialogue.pending()?.is_none())
+                            {
+                                continue;
+                            }
+                            if options
+                                .dependencies
+                                .and_then(|all| all.get(sender))
+                                .is_some_and(|parents| {
+                                    parents.iter().any(|&parent| {
+                                        if options.staging.is_some() {
+                                            saved[parent].artifact_sha256.is_none()
+                                        } else {
+                                            saved[parent].assessment.is_none()
+                                        }
+                                    })
+                                })
+                            {
+                                continue;
+                            }
                         }
-                        Err(error) if options.tolerate_failures || stakeholder => {
-                            let detail = format!("Consultation unavailable: {error:#}");
-                            self.reporter
-                                .agent(peer.author, Kind::Info, "Consultation", &detail);
-                            agent.assessment = Some(detail);
-                            agent.failed = true;
-                            mailbox.close(sender);
-                            Ok(())
+                        let agent = idle[sender].take().expect("ready agent");
+                        active.push(async move {
+                            let result = if integrating {
+                                self.integrate_worker(agent, sender, mailbox, options, candidate)
+                                    .await
+                            } else {
+                                self.step_panel(agent, sender, mailbox, options, candidate)
+                                    .await
+                            };
+                            (sender, agent, result)
+                        });
+                        cursor = (sender + 1) % idle.len();
+                    }
+
+                    if active.is_empty() {
+                        if admitting {
+                            let pending =
+                                idle.iter().flatten().try_fold(false, |pending, agent| {
+                                    Ok::<_, anyhow::Error>(
+                                        pending || agent.dialogue.pending()?.is_some(),
+                                    )
+                                })?;
+                            if !pending {
+                                break;
+                            }
                         }
-                        Err(error) => Err(error),
-                    };
-                    (sender, agent.snapshot(), result)
-                });
-            let mut results = stream::iter(jobs).buffer_unordered(options.width);
-            let mut first_error = None;
-            while let Some((sender, progress, result)) = results.next().await {
-                saved[sender] = progress;
-                checkpoint(&saved)?;
-                if let Err(error) = result {
-                    first_error.get_or_insert(error);
+                        ensure!(
+                            saved.iter().all(|agent| agent.assessment.is_some())
+                                && !mailbox.has_pending(),
+                            "task scheduler has no runnable agents"
+                        );
+                        break;
+                    }
                 }
             }
-            if let Some(error) = first_error {
-                return Err(error);
+
+            let Some((sender, agent, result)) = active.next().await else {
+                if let Some(error) = first_error {
+                    return Err(error);
+                }
+                continue;
+            };
+            if agent.dialogue.operator_guidance != saved[sender].dialogue.operator_guidance {
+                agent.dialogue.operator_guidance =
+                    std::mem::take(&mut saved[sender].dialogue.operator_guidance);
+                agent.reopen(limit);
+            }
+            saved[sender] = agent.snapshot();
+            idle[sender] = Some(agent);
+            checkpoint(&saved)?;
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
             }
         }
         Ok(())
+    }
+
+    async fn prepare_idle_agents(
+        &self,
+        idle: &mut [Option<&mut PanelAgent<'_>>],
+        saved: &mut [WorkerProgress],
+        mailbox: &Mailbox,
+        options: PanelOptions<'_>,
+        settled: bool,
+    ) -> Result<bool> {
+        let mut changed = false;
+        if settled && let Some(run) = options.triage_run {
+            let eligible = idle
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| {
+                    slot.as_ref()
+                        .is_some_and(|agent| agent.assessment.is_none() && !agent.failed)
+                })
+                .map(|(index, _)| (mailbox.id(index), mailbox.name(index)))
+                .collect::<Vec<_>>();
+            if let Some(note) = self.next_triage(run, &eligible, false).await? {
+                for (index, slot) in idle.iter_mut().enumerate() {
+                    let id = mailbox.id(index);
+                    if note.recipients.iter().any(|recipient| recipient == id) {
+                        let agent = slot.as_mut().expect("panel is idle");
+                        self.apply_triage(&mut agent.dialogue, id, &note);
+                        saved[index] = agent.snapshot();
+                        changed = true;
+                    }
+                }
+            }
+        }
+        for (index, slot) in idle.iter_mut().enumerate() {
+            let Some(agent) = slot else { continue };
+            if agent.failed || agent.dialogue.pending()?.is_some() {
+                continue;
+            }
+            let messages = if options.ipc {
+                mailbox.drain(index, &self.reporter)
+            } else {
+                Vec::new()
+            };
+            let delivered = !messages.is_empty();
+            agent.deliver(messages, mailbox.inbox_bytes());
+            let responded = options.gate.is_some_and(|gate| gate.responded(index))
+                && agent.assessment.is_none();
+            if responded {
+                let response = if options.gate.is_some_and(|gate| gate.accepted(index)) {
+                    "Acknowledged the frozen plan."
+                } else {
+                    "Requested replanning."
+                };
+                agent.assessment = Some(response.into());
+                self.reporter
+                    .agent(mailbox.id(index), Kind::Agent, "Plan response", response);
+            }
+            if delivered || responded {
+                saved[index] = agent.snapshot();
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn integrate_worker(
+        &self,
+        agent: &mut PanelAgent<'_>,
+        sender: usize,
+        mailbox: &Mailbox,
+        options: PanelOptions<'_>,
+        candidate: &tokio::sync::RwLock<()>,
+    ) -> Result<()> {
+        let (stage, cycle) = options.staging.expect("staged worker");
+        self.mcp.close_worker(mailbox.id(sender));
+        let stage = stage.clone();
+        let ownership = options
+            .ownership
+            .and_then(|paths| paths.get(sender))
+            .cloned();
+        let _candidate = candidate.write().await;
+        let digest =
+            tokio::task::spawn_blocking(move || stage.merge(cycle, sender, ownership.as_deref()))
+                .await??;
+        agent.artifact_sha256 = Some(digest);
+        Ok(())
+    }
+
+    async fn step_panel(
+        &self,
+        agent: &mut PanelAgent<'_>,
+        sender: usize,
+        mailbox: &Mailbox,
+        options: PanelOptions<'_>,
+        candidate: &tokio::sync::RwLock<()>,
+    ) -> Result<()> {
+        let stakeholder = options
+            .stakeholder_start
+            .is_some_and(|start| sender >= start);
+        let mut access = if stakeholder {
+            Access::Inspect
+        } else {
+            options.access
+        };
+        let mut system = Cow::Borrowed(agent.system.as_str());
+        let mut private_workspace = None;
+        if let Some((stage, cycle)) = options.staging.filter(|_| !stakeholder) {
+            if stage.merged(cycle, sender) {
+                access = Access::Inspect;
+            }
+            let stage = stage.clone();
+            let _candidate = candidate.read().await;
+            let workspace =
+                tokio::task::spawn_blocking(move || stage.worker(cycle, sender)).await??;
+            system = Cow::Owned(system.replacen(
+                &format!("Working directory: {}", options.workspace.display()),
+                &format!("Working directory: {}", workspace.display()),
+                1,
+            ));
+            private_workspace = Some(workspace);
+        }
+        let pending = agent.dialogue.pending()?.is_some();
+        if !pending && self.worker_admission_pending(options.admission_run)? {
+            return Ok(());
+        }
+        // Private worker trees can continue running tools while integration
+        // writes the candidate. Inspectors read the shared candidate directly.
+        let _candidate = if stakeholder && options.staging.is_some() && pending {
+            Some(candidate.read().await)
+        } else {
+            None
+        };
+        let peer = PeerTools {
+            route: options.ipc.then_some(Route { mailbox, sender }),
+            ack: options.gate.map(|gate| (gate, sender)),
+            memory: options.memory,
+            author: mailbox.id(sender),
+            final_review: false,
+            plan_workers: None,
+            ownership: options
+                .ownership
+                .and_then(|paths| paths.get(sender).map(Vec::as_slice)),
+            workspace: private_workspace.as_deref().unwrap_or(options.workspace),
+            allow_approval: false,
+            require_task_graph: false,
+            repairing: false,
+        };
+        match self
+            .step(
+                &mut agent.dialogue,
+                agent.model,
+                access,
+                &system,
+                &agent.scope,
+                peer,
+            )
+            .await
+        {
+            Ok(Step::Continue) => Ok(()),
+            Ok(Step::Verdict(_, _) | Step::Plan(_) | Step::Repair(_)) => {
+                unreachable!("panel has no decision tool")
+            }
+            Ok(Step::Finished(result)) => {
+                self.reporter
+                    .agent(peer.author, Kind::Agent, "Report", &result);
+                agent.assessment = Some(result);
+                Ok(())
+            }
+            Err(error) if options.tolerate_failures || stakeholder => {
+                let detail = format!("Consultation unavailable: {error:#}");
+                self.reporter
+                    .agent(peer.author, Kind::Info, "Consultation", &detail);
+                agent.assessment = Some(detail);
+                agent.failed = true;
+                mailbox.close(sender);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn worker_admission_pending(&self, run: Option<&str>) -> Result<bool> {
