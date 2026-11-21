@@ -25,7 +25,7 @@ const stages = [
   ["Publish", ["Publish"]],
 ];
 const endings = ["Approved", "Rejected", "Exhausted"];
-const state = { runs: [], summary: null, live: null, config: null, providerCheck: null, route: {}, version: 0, stream: null, follow: true, refreshPending: false };
+const state = { runs: [], displayRuns: [], summary: null, live: null, config: null, providerCheck: null, route: {}, version: 0, follow: true, refreshPending: false };
 const number = new Intl.NumberFormat();
 const clock = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
 
@@ -99,9 +99,18 @@ function runUrl(page = "overview", query = {}, id = state.route.run) {
   const params = new URLSearchParams(Object.entries(query).filter(([, value]) => value !== undefined && value !== null && value !== ""));
   return id ? `/run/${encodeURIComponent(id)}/${page}${params.size ? "?" + params : ""}` : "/";
 }
-function apiRun(view, query = {}) {
-  const params = new URLSearchParams(Object.entries(query).filter(([, value]) => value !== undefined && value !== null && value !== ""));
-  return `/api/run/${encodeURIComponent(state.route.run)}/${view}${params.size ? "?" + params : ""}`;
+const queryKeys = {
+  history: ["actor", "after", "before", "collapse_tools", "cycle", "from", "kind", "legacy", "path", "phase", "q", "to", "worker_request"],
+  routes: ["actor", "cycle", "from", "phase", "q", "to", "worker_request"],
+  inbox: ["before"], checkpoints: ["after"], checkpoint: ["sequence"],
+};
+function apiRun(view, query = {}, run = state.route.run) {
+  const params = new URLSearchParams();
+  for (const key of queryKeys[view] ?? []) {
+    const value = query[key];
+    if (value !== undefined && value !== null && value !== "") params.set(key, value);
+  }
+  return `/api/run/${encodeURIComponent(run)}/${view}${params.size ? "?" + params : ""}`;
 }
 function roster() { return (state.summary?.event?.workflow?.agents ?? []).filter(agent => agent.id !== "user"); }
 function actorName(id) { return state.summary?.event?.workflow?.agents?.find(agent => agent.id === id)?.name ?? id; }
@@ -123,17 +132,278 @@ function notify(text, tone = "receipt") {
 }
 function captureError(error) { notify(error.message, "error"); }
 
-async function api(path, options = {}) {
-  const response = await fetch(path, { ...options, headers: { Authorization: "Bearer " + (token ?? ""), ...options.headers } });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    const error = new Error(payload.error ?? `Request failed (${response.status})`);
-    error.status = response.status;
-    throw error;
-  }
-  return response.json();
+const warmViews = new Set([
+  "overview", "live", "metrics", "history?collapse_tools=1", "history?kind=ipc", "history?kind=tool",
+  "history?kind=mcp", "history?kind=job", "history?kind=tool&path=*", "routes", "inbox", "admissions",
+  "checkpoints", "share",
+]);
+const terminalToolStates = new Set(["completed", "failed", "refused", "unknown"]);
+const values = new Map();
+const waiting = new Map();
+const queries = new Map();
+const actions = new Map();
+let socket, connected = false, reconnectTimer, retry = 0, nextQuery = 0, selected;
+let flushScheduled = false;
+let activeReads = new Set();
+let rendered = false;
+let liveChangePending = false;
+let targetedRefresh = false;
+
+function warm(path) {
+  return path === "/api/runs" || path === "/api/config" ||
+    warmViews.has(path.replace(/^\/api\/run\/[^/]+\//, ""));
 }
 
+function valueOf(result) {
+  if (result.error !== undefined) throw new Error(result.error);
+  return result.data;
+}
+
+function send(message) {
+  if (!connected || socket?.readyState !== WebSocket.OPEN) return false;
+  socket.send(JSON.stringify(message));
+  return true;
+}
+
+function selectRun(run) {
+  if (selected === run) return;
+  for (const [path, waiter] of waiting) {
+    if (!path.startsWith("/api/run/")) continue;
+    waiter.reject(new Error("Run selection changed"));
+    waiting.delete(path);
+  }
+  for (const [id, paths] of queries) {
+    if (paths.some(path => path.startsWith("/api/run/"))) queries.delete(id);
+  }
+  for (const path of values.keys()) {
+    if (path.startsWith("/api/run/")) values.delete(path);
+  }
+  selected = run;
+  send({ type: "select", run });
+}
+
+function flushQueries() {
+  flushScheduled = false;
+  if (!connected) return;
+  const paths = [...waiting].filter(([, item]) => item.query && !item.sent).map(([path]) => path);
+  while (paths.length && queries.size < 4) {
+    const batch = paths.splice(0, 12);
+    const id = ++nextQuery;
+    if (!send({ type: "query", id, paths: batch })) return;
+    for (const path of batch) waiting.get(path).sent = true;
+    queries.set(id, batch);
+  }
+}
+
+function queueQueries() {
+  if (flushScheduled) return;
+  flushScheduled = true;
+  queueMicrotask(flushQueries);
+}
+
+async function api(path, { refresh = false } = {}) {
+  activeReads.add(path);
+  if (!refresh && values.has(path)) return valueOf(values.get(path));
+  if (!waiting.has(path)) {
+    let resolve, reject;
+    const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+    waiting.set(path, { promise, resolve, reject, query: refresh || !warm(path), sent: false });
+    queueQueries();
+  }
+  return waiting.get(path).promise;
+}
+
+function settle(path, result) {
+  const waiter = waiting.get(path);
+  if (!waiter) return;
+  waiting.delete(path);
+  if (result.error !== undefined) waiter.reject(new Error(result.error));
+  else waiter.resolve(result.data);
+}
+
+function shareUnavailable() {
+  clearTimeout(reconnectTimer);
+  socket?.close();
+  socket = null;
+  connected = false;
+  for (const waiter of waiting.values()) waiter.reject(new Error("Invalid or revoked run share link"));
+  waiting.clear();
+  queries.clear();
+  values.clear();
+  state.version++;
+  state.summary = null;
+  state.live = null;
+  renderNavigation();
+  fill(main, view(heading(readOnly ? "Share unavailable" : "Run unavailable"), section("Access",
+    muted(readOnly ? "Invalid or revoked run share link" : "Open the private URL printed by ra --web"))));
+  main.inert = false;
+  main.setAttribute("aria-busy", "false");
+}
+
+function onStreamMessage(message) {
+  switch (message.type) {
+    case "welcome":
+      connected = true;
+      retry = 0;
+      document.body.removeAttribute("data-stream-stale");
+      liveChangePending = true;
+      scheduleUpdate();
+      const wantedRun = state.route.run ?? null;
+      if (!readOnly && selected !== wantedRun) selectRun(wantedRun);
+      queueQueries();
+      for (const action of actions.values()) send(action.message);
+      break;
+    case "unauthorized":
+      shareUnavailable();
+      break;
+    case "query": {
+      const paths = queries.get(message.id);
+      if (!paths) break;
+      queries.delete(message.id);
+      for (const path of paths) {
+        const result = message.values[path] ?? { error: "Dashboard result is unavailable" };
+        if ((warm(path) || activeReads.has(path)) && result.error === undefined) values.set(path, result);
+        settle(path, result);
+      }
+      queueQueries();
+      break;
+    }
+    case "receipt": {
+      const action = actions.get(message.id);
+      if (!action) break;
+      actions.delete(message.id);
+      if (message.result.error !== undefined) action.reject(new Error(message.result.error));
+      else action.resolve(message.result.data);
+      break;
+    }
+    case "data": {
+      if (message.scope !== null && message.scope !== selected) break;
+      let refresh = false;
+      for (const [path, result] of Object.entries(message.values)) {
+        if (path.endsWith("/revision")) {
+          targetedRefresh = true;
+          continue;
+        }
+        const hadValue = values.has(path);
+        values.set(path, result);
+        settle(path, result);
+        if (path === "/api/config" && result.error === undefined) state.config = result.data;
+        if (!activeReads.has(path) || !hadValue || !rendered) continue;
+        if (path.endsWith("/live") && result.error === undefined) {
+          const previous = state.live;
+          state.live = result.data;
+          liveChangePending = true;
+          if (Boolean(previous) !== Boolean(state.live) || previous?.paused !== state.live?.paused) refresh = true;
+        } else {
+          refresh = true;
+        }
+      }
+      if (refresh) state.refreshPending = true;
+      scheduleUpdate();
+      break;
+    }
+  }
+}
+
+function connectDashboard() {
+  clearTimeout(reconnectTimer);
+  const url = new URL("/api/dashboard/socket", location.href);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  const stream = new WebSocket(url);
+  let initialRun;
+  socket = stream;
+  stream.binaryType = "arraybuffer";
+  let decoding = Promise.resolve();
+  let chunks = [], length = 0;
+  stream.addEventListener("open", () => {
+    initialRun = selected ?? null;
+    stream.send(JSON.stringify({ type: "hello", version: 1, token: token ?? "",
+      run: initialRun, gzip: typeof DecompressionStream === "function" }));
+  });
+  stream.addEventListener("message", event => {
+    decoding = decoding.then(async () => {
+      if (socket !== stream) return;
+      if (typeof event.data === "string") {
+        const message = JSON.parse(event.data);
+        if (message.type === "welcome" && initialRun !== selected && !readOnly) {
+          connected = true;
+          send({ type: "select", run: selected });
+        }
+        onStreamMessage(message);
+        return;
+      }
+      const bytes = new Uint8Array(event.data);
+      const flags = bytes[0];
+      const sequence = Number(new DataView(event.data).getBigUint64(1));
+      let body = bytes.subarray(9);
+      if (flags & 1) {
+        const reader = new Blob([body]).stream().pipeThrough(new DecompressionStream("gzip"));
+        body = new Uint8Array(await new Response(reader).arrayBuffer());
+      }
+      if (socket !== stream) return;
+      length += body.length;
+      if (length > 64 * 1024 * 1024) throw new Error("Dashboard message is too large");
+      chunks.push(body);
+      if (flags & 2) {
+        const joined = new Uint8Array(length);
+        let offset = 0;
+        for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.length; }
+        chunks = [];
+        length = 0;
+        onStreamMessage(JSON.parse(new TextDecoder().decode(joined)));
+      }
+      if (stream.readyState === WebSocket.OPEN) stream.send(JSON.stringify({ type: "ack", sequence }));
+    }).catch(() => stream.close());
+  });
+  stream.addEventListener("close", () => {
+    if (socket !== stream) return;
+    connected = false;
+    document.body.setAttribute("data-stream-stale", "");
+    liveChangePending = true;
+    scheduleUpdate();
+    queries.clear();
+    for (const waiter of waiting.values()) waiter.sent = false;
+    reconnectTimer = setTimeout(connectDashboard, Math.min(5000, 250 * 2 ** Math.min(retry++, 5)));
+  });
+}
+
+let updateScheduled = false;
+
+function detailCanChange(detail) {
+  const { event, outcome } = detail;
+  if (event?.kind === "ipc") return true;
+  if (event?.kind !== "tool" && event?.kind !== "tool_result") return false;
+  return !terminalToolStates.has((outcome ?? event).data?.state);
+}
+
+function scheduleUpdate() {
+  if (updateScheduled) return;
+  updateScheduled = true;
+  requestAnimationFrame(() => {
+    updateScheduled = false;
+    if (liveChangePending) {
+      liveChangePending = false;
+      renderLive();
+    }
+    if (targetedRefresh) {
+      targetedRefresh = false;
+      for (const path of activeReads) {
+        if (!warm(path) && path.startsWith("/api/run/") && !path.includes("/checkpoint?")) {
+          const previous = values.get(path);
+          if (!previous) continue;
+          if (path.includes("/entry/") && !detailCanChange(previous.data)) continue;
+          api(path, { refresh: true }).then(value => {
+            if (activeReads.has(path) && JSON.stringify(previous.data) !== JSON.stringify(value)) {
+              state.refreshPending = true;
+              scheduleUpdate();
+            }
+          }).catch(() => {});
+        }
+      }
+    }
+    refreshLivePage();
+  });
+}
 function route() {
   const [, prefix, run, page, actor] = location.pathname.split("/");
   let decoded;
@@ -156,8 +426,10 @@ function renderNavigation() {
   const selected = state.route.run;
   const current = state.route.page;
   const select = $("#run-select");
+  const runs = state.summary?.run && !state.runs.some(run => run.run_id === selected)
+    ? [state.summary.run, ...state.runs] : state.runs;
   fill(select, node("option", { value: "" }, "All runs"),
-    state.runs.map(run => node("option", { value: run.run_id }, `${title(run.phase)} · ${run.run_id.slice(-10)}`)));
+    runs.map(run => node("option", { value: run.run_id }, `${title(run.phase)} · ${run.run_id.slice(-10)}`)));
   select.value = selected ?? "";
   $("#navigation").hidden = !selected;
   fill($("#navigation"), Object.entries(views).map(([page, name], index) =>
@@ -189,13 +461,14 @@ function generation(id) { return state.live?.generations?.find(item => item.acto
 
 function renderLive() {
   const connection = $("#connection");
-  const status = state.live ? state.live.paused ? "paused" : "live" : "history";
+  const stale = document.body.hasAttribute("data-stream-stale");
+  const status = stale ? "stale" : state.live ? state.live.paused ? "paused" : "live" : "history";
   connection.dataset.state = status;
-  $("span", connection).textContent = state.live
+  $("span", connection).textContent = stale ? "Reconnecting" : state.live
     ? state.live.paused ? "Paused" : `Live · ${state.live.generations?.length ?? 0} generating`
     : state.route.run ? "Recorded run" : readOnly ? "Shared run" : "Local workspace";
   const controls = $("#controls");
-  const actions = readOnly ? [] : state.live ? [
+  const actions = readOnly || stale ? [] : state.live ? [
     button("Guide", () => openAction("guide")),
     button("Add worker", () => openAction("add_worker"), { disabled: state.summary?.run?.phase !== "Work" }),
     button(state.live.paused ? "Resume" : "Pause", () => sendAction(state.live.paused ? "resume" : "pause").catch(captureError)),
@@ -209,7 +482,7 @@ function renderLive() {
   const phase = state.summary?.run?.phase ?? "";
   const currentRun = state.route.run ?? "";
   if (controls.dataset.mode !== status || controls.dataset.phase !== phase || controls.dataset.run !== currentRun) {
-    if (!readOnly && sharingEnabled && state.summary) actions.push(button("Share", () => openShare().catch(captureError)));
+    if (!readOnly && !stale && sharingEnabled && state.summary) actions.push(button("Share", () => openShare().catch(captureError)));
     fill(controls, actions);
     controls.dataset.mode = status;
     controls.dataset.phase = phase;
@@ -217,8 +490,9 @@ function renderLive() {
   }
   for (const card of document.querySelectorAll("[data-preview-actor]")) {
     const active = generation(card.dataset.previewActor);
-    card.hidden = !active;
-    card.textContent = active?.text || (active ? active.label : "");
+    if (card.hidden === Boolean(active)) card.hidden = !active;
+    const text = active?.text || (active ? active.label : "");
+    if (card.textContent !== text) card.textContent = text;
   }
   for (const dot of document.querySelectorAll("[data-agent-dot]")) dot.classList.toggle("live", Boolean(generation(dot.dataset.agentDot)));
   renderStatus();
@@ -234,7 +508,7 @@ function renderStatus() {
   const cell = (text, name) => node("span", { class: name }, text);
   const tone = !run ? "idle" : endings.includes(run.phase) ? run.phase.toLowerCase() : state.live?.paused ? "paused" : "active";
   const mode = node("span", { class: "status-mode", "data-tone": tone }, run ? title(run.phase) : "Workspace");
-  fill($("#status"), mode, run ? [
+  const items = run ? [
     cell(`cycle ${run.cycle}`), cell(`run ${run.run_id}`, "wide"),
     spacer(),
     node("span", { "data-token-usage": tokens, title: usage?.estimated ? "Includes estimated in-flight tokens" : "Metered tokens" },
@@ -247,7 +521,8 @@ function renderStatus() {
     cell(`${number.format(metrics.tool_receipts ?? 0)} tool calls`, "wide"),
     cell(`${number.format(metrics.ipc_deliveries ?? 0)} deliveries`, "wide"),
     cell([node("kbd", {}, "/"), " search ", node("kbd", {}, "1–6"), " views"], "keys"),
-  ] : [cell(`${state.runs.length} runs`), spacer()]);
+  ] : [cell(`${state.runs.length}${state.runs.length === 100 ? "+" : ""} runs`), spacer()];
+  patchChildren($("#status"), children([mode, items]));
 }
 
 function tokenCount(count) {
@@ -288,7 +563,11 @@ function providerCheck() {
 function configPanel() {
   const config = state.config;
   if (!config) return null;
-  const actions = row(button("Recheck", () => { state.providerCheck = null; load(false); }),
+  const actions = row(button("Recheck", async () => {
+    state.providerCheck = null;
+    try { await api("/api/config", { refresh: true }); await load(false); }
+    catch (error) { captureError(error); }
+  }),
     config.ok ? button("Test provider", () => testProvider(), { disabled: Boolean(state.providerCheck?.pending) }) : null);
   const note = muted("Each run reads the profile when it starts. Flags and environment variables are fixed when the dashboard starts.");
   if (!config.ok) {
@@ -320,15 +599,20 @@ function configPanel() {
 }
 
 function workspace() {
-  if (!state.runs.length) {
+  const runs = state.displayRuns;
+  const older = state.route.query.runs_before;
+  if (!older && !runs.length) {
     return view(heading("Runs"), [node("button", { type: "button", class: "empty-drop", onclick: () => openAction("start") },
       node("strong", {}, "Start a run"),
       node("span", {}, "Describe the outcome and its constraints. Ratio proposes a team, plans the work, and records every step here.")),
     configPanel()]);
   }
-  return view(heading("Runs", `${state.runs.length} in this workspace`), [
-    section({ label: "Run history", flush: true }, table(["Run", "Phase", "Cycle", "Last checkpoint"], state.runs.map(run =>
+  return view(heading("Runs"), [
+    section({ label: "Run history", flush: true }, table(["Run", "Phase", "Cycle", "Last checkpoint"], runs.map(run =>
       [link(run.run_id, runUrl("overview", {}, run.run_id)), pill(run.phase), run.cycle, code(run.last_sequence)]))),
+    pagination("Run history pagination",
+      older ? link("Latest runs", "/") : null,
+      runs.length === 100 ? link("Older runs", "/?runs_before=" + runs.at(-1).last_sequence) : null),
     configPanel()]);
 }
 
@@ -407,7 +691,7 @@ function overview() {
           ["Assessment", data.assessment ? pre(data.assessment) : null],
           ["Failure", data.latest_error ? [pre(data.latest_error.data.text), go("Open failure in timeline", entryUrl(data.latest_error.key))] : null],
         ])),
-        section("Usage", facts(Object.entries(metrics).flatMap(([name, value]) => name === "token_breakdown"
+        section("Usage", data.metricsPending ? muted("Indexing checkpoint totals…") : null, facts(Object.entries(metrics).flatMap(([name, value]) => name === "token_breakdown"
           ? Object.entries(value).map(([flow, count]) => [title(flow) + " tokens", tokenCount(count)])
           : [[title(name), number.format(value)]])) ?? muted("Nothing metered yet.")))),
     executionPlan(tasks, flow, data),
@@ -811,7 +1095,10 @@ async function historyView(route) {
   // Inspect the first message in the sequence until the operator selects another.
   const diagram = page === "ipc" && tab === "all";
   const focus = query.entry ?? (diagram ? messages[0]?.event.key : undefined);
-  const detail = chosen ?? (focus && !query.entry ? await api(apiRun("entry/" + encodeURIComponent(focus))).catch(() => null) : null);
+  const firstMessage = diagram && !query.entry ? messages[0] : null;
+  const detail = chosen ?? (firstMessage ? { event: firstMessage.event, deliveries: [...firstMessage.to].map(([to, state]) => ({
+    to, state, key: firstMessage.event.key, timestamp_ms: firstMessage.event.timestamp_ms,
+  })) } : null);
   const head = [];
   if (page === "agent") {
     const flow = state.summary.event?.workflow;
@@ -899,7 +1186,42 @@ async function archive(route) {
 }
 
 function hasPageInteraction() {
-  return $("#action-dialog").open || $("#share-dialog").open || main.contains(document.activeElement) || $("details[open]", main);
+  const active = document.activeElement;
+  return main.contains(active) && active.matches("input, textarea, select");
+
+}
+
+function patchChildren(parent, desired) {
+  const prior = [...parent.childNodes];
+  const keyed = new Map(prior.filter(child => child.nodeType === Node.ELEMENT_NODE && child.id)
+    .map(child => [child.id, child]));
+  const claimed = new Set();
+  for (const [index, next] of desired.entries()) {
+    const existing = next.id ? keyed.get(next.id) : prior[index];
+    let current = next;
+    if (existing && !claimed.has(existing) && existing.nodeType === next.nodeType &&
+        existing.nodeName === next.nodeName && (existing.id ?? "") === (next.id ?? "")) {
+      if (existing.isEqualNode(next)) current = existing;
+      else if (existing.nodeType === Node.TEXT_NODE) {
+        existing.textContent = next.textContent;
+        current = existing;
+      } else if (!existing.matches("a, button, input, textarea, select, option") &&
+          existing.className === next.className) {
+        const open = existing.tagName === "DETAILS" && existing.open;
+        for (const name of existing.getAttributeNames()) {
+          if (!next.hasAttribute(name) && !(name === "open" && open)) existing.removeAttribute(name);
+        }
+        for (const name of next.getAttributeNames()) {
+          if (existing.getAttribute(name) !== next.getAttribute(name)) existing.setAttribute(name, next.getAttribute(name));
+        }
+        patchChildren(existing, [...next.childNodes]);
+        current = existing;
+      }
+    }
+    claimed.add(current);
+    if (parent.childNodes[index] !== current) parent.insertBefore(current, parent.childNodes[index] ?? null);
+  }
+  for (const child of [...parent.childNodes]) if (!claimed.has(child)) child.remove();
 }
 
 async function load(restart = true, preserveInteraction = false) {
@@ -909,24 +1231,31 @@ async function load(restart = true, preserveInteraction = false) {
   const wanted = state.route;
   if (restart) {
     state.refreshPending = false;
-    state.stream?.abort();
-    state.stream = null;
+    selectRun(wanted.run ?? null);
     main.inert = true;
     if (previous !== wanted.run) { state.summary = null; state.live = null; }
   }
   main.setAttribute("aria-busy", "true");
+  activeReads = new Set();
+  for (const path of values.keys()) {
+    if (!warm(path) && (restart || !path.startsWith("/api/run/" + wanted.run + "/"))) values.delete(path);
+  }
   try {
-    const [runs, summary, live, config] = await Promise.all([
+    const [runs, summary, live, config, olderRuns, usage] = await Promise.all([
       readOnly ? { runs: [] } : api("/api/runs"),
       wanted.run ? api(apiRun("overview")) : null,
       wanted.run ? api(apiRun("live")).catch(() => null) : null,
       wanted.run || readOnly ? state.config : api("/api/config").catch(() => null),
+      !wanted.run && !readOnly && wanted.query.runs_before
+        ? api("/api/runs?before=" + encodeURIComponent(wanted.query.runs_before)) : null,
+      wanted.run ? api(apiRun("metrics")).catch(() => null) : null,
     ]);
     if (version !== state.version) return;
     state.config = config;
     const navigationChanged = navigationKey(state.runs, state.summary) !== navigationKey(runs.runs, summary);
     state.runs = runs.runs;
-    state.summary = summary;
+    state.displayRuns = olderRuns?.runs ?? runs.runs;
+    state.summary = summary ? { ...summary, metrics: usage?.metrics, metricsPending: usage?.pending } : null;
     state.live = live;
     if (restart || navigationChanged || !wanted.run) renderNavigation();
     else renderLive();
@@ -945,7 +1274,8 @@ async function load(restart = true, preserveInteraction = false) {
     state.spot = spot;
     const scrolls = restart && !settled ? [] : [main, ...main.querySelectorAll("[data-scroll]")].map(element =>
       [element.dataset.scroll, element.scrollLeft, element.scrollTop]);
-    fill(main, nodes);
+    if (!restart && settled) patchChildren(main, children(nodes));
+    else fill(main, nodes);
     for (const [key, left, top] of scrolls) {
       const element = key ? $(`[data-scroll="${key}"]`, main) : main;
       if (!element || (restart && key === "inspector")) continue;
@@ -957,63 +1287,23 @@ async function load(restart = true, preserveInteraction = false) {
     if (restart && wanted.page === "triage" && wanted.query.item) {
       document.getElementById("inbox-" + wanted.query.item)?.scrollIntoView({ block: "center" });
     }
-    if (wanted.run && !state.stream) connect(wanted.run, summary);
+    rendered = true;
   } catch (error) {
     if (version === state.version) fill(main, view(heading("Run unavailable"), section("Connection", muted(error.message), !readOnly ? go("Workspace runs", "/") : null)));
   } finally {
     if (version === state.version) {
+      rendered = true;
       main.inert = false;
       main.setAttribute("aria-busy", "false");
+      if (state.refreshPending) scheduleUpdate();
     }
-  }
-}
-
-async function connect(run, summary) {
-  const controller = new AbortController();
-  state.stream = controller;
-  let checkpoint = summary.run.last_sequence;
-  let after = summary.head;
-  while (!controller.signal.aborted) {
-    try {
-      const stream = await fetch(`/api/run/${encodeURIComponent(run)}/stream?checkpoint=${checkpoint}&after=${after}`,
-        { headers: { Authorization: "Bearer " + token }, signal: controller.signal });
-      if (stream.status >= 500) {
-        await stream.body?.cancel();
-        throw new Error(`Live stream unavailable (${stream.status})`);
-      }
-      if (!stream.ok || !stream.body) break;
-      const reader = stream.body.pipeThrough(new TextDecoderStream()).getReader();
-      let pending = "";
-      for (;;) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        pending += chunk.value;
-        let boundary;
-        while ((boundary = pending.indexOf("\n\n")) >= 0) {
-          const packet = pending.slice(0, boundary);
-          pending = pending.slice(boundary + 2);
-          const line = packet.split("\n").find(line => line.startsWith("data: "));
-          if (!line) continue;
-          const update = JSON.parse(line.slice(6));
-          checkpoint = update.checkpoint;
-          after = update.cursor;
-          if (state.route.run === run) {
-            state.refreshPending = true;
-            refreshLivePage();
-          }
-        }
-      }
-    } catch (error) {
-      if (controller.signal.aborted) break;
-    }
-    if (!controller.signal.aborted) await new Promise(resolve => setTimeout(resolve, 1200));
   }
 }
 
 function refreshLivePage() {
-  const { page, query } = state.route;
-  if (!state.refreshPending || (page === "history" && !state.follow) || query.before || query.entry
-    || hasPageInteraction()) return;
+  const { page } = state.route;
+  if (main.getAttribute("aria-busy") === "true") return;
+  if (!state.refreshPending || (page === "history" && !state.follow) || hasPageInteraction()) return;
   state.refreshPending = false;
   load(false, true);
 }
@@ -1055,8 +1345,14 @@ function openAction(name, initial = "") {
 }
 
 function postAction(action, text, run = state.route.run, id = crypto.randomUUID()) {
-  return api("/api/action", { method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action, text, run, id }) });
+  const message = { type: "action", action: { action, text, run, id } };
+  return new Promise((resolve, reject) => {
+    if (!send(message)) {
+      reject(new Error("Dashboard stream is reconnecting"));
+      return;
+    }
+    actions.set(id, { message, resolve, reject });
+  });
 }
 
 async function sendAction(action, text, run = state.route.run, id = crypto.randomUUID()) {
@@ -1125,7 +1421,7 @@ document.addEventListener("click", event => {
   if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
   const anchor = event.target.closest("a[href]");
   const href = anchor?.getAttribute("href");
-  if (href === "/" || href?.startsWith("/run/")) {
+  if (href === "/" || href?.startsWith("/?") || href?.startsWith("/run/")) {
     event.preventDefault();
     $(".side").classList.remove("open");
     $("#menu").setAttribute("aria-expanded", "false");
@@ -1173,42 +1469,6 @@ document.addEventListener("keydown", event => {
     $("#global-search input").focus();
   } else if (page && event.key.trim()) navigate(runUrl(page));
 });
-let lastTriageRefresh = 0;
-async function pollLive() {
-  const run = state.route.run;
-  const version = state.version;
-  try {
-    if (!run || (readOnly && !state.summary)) return;
-    const live = await api(apiRun("live"));
-    if (version !== state.version) return;
-    if (!live && state.live?.token_usage) {
-      const summary = await api(apiRun("overview"));
-      if (version !== state.version) return;
-      state.summary.metrics = summary.metrics;
-    }
-    state.live = live;
-    renderLive();
-    if (state.route.page === "triage" && performance.now() - lastTriageRefresh >= 1400) {
-      state.refreshPending = true;
-      lastTriageRefresh = performance.now();
-    }
-    refreshLivePage();
-  } catch (error) {
-    if (readOnly && error.status === 401 && version === state.version) {
-      state.version++;
-      state.stream?.abort();
-      state.stream = null;
-      state.summary = null;
-      state.live = null;
-      renderNavigation();
-      fill(main, view(heading("Share unavailable"), section("Access", muted(error.message))));
-      main.inert = false;
-      main.setAttribute("aria-busy", "false");
-    }
-  } finally {
-    setTimeout(pollLive, readOnly ? 1500 : state.live?.generations?.length ? 180 : 1000);
-  }
-}
-
+for (const event of ["focusout", "toggle", "close"]) document.addEventListener(event, scheduleUpdate, true);
 load();
-setTimeout(pollLive, 1000);
+connectDashboard();

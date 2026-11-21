@@ -1,3 +1,4 @@
+import { gunzipSync } from "node:zlib";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -38,7 +39,7 @@ function forLines() {
 }
 `;
 
-test("run dashboard manages a live run, triage, and deep-linked MCP audit", { timeout: 60_000 }, async () => {
+test("run dashboard manages a live run, triage, and deep-linked MCP audit", { timeout: 90_000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(),"ratio-web-"));
   const profile = join(dir,"ratio.toml");
   let release;
@@ -195,6 +196,20 @@ tools = ["inspect"]
     const page = await browser.newPage({viewport:{width:1440,height:900}});
     page.setDefaultTimeout(10_000);
     const exceptions = [];
+    const browserRequests = [];
+    page.on("request", request => {
+      if (new URL(request.url()).pathname.startsWith("/api/")) browserRequests.push(request.url());
+    });
+    const streamTraffic = [];
+    let compressedFrames = 0;
+    page.on("websocket", websocket => {
+      websocket.on("framesent", ({ payload }) => {
+        if (typeof payload === "string") streamTraffic.push(JSON.parse(payload).type);
+      });
+      websocket.on("framereceived", ({ payload }) => {
+        if (Buffer.isBuffer(payload) && (payload[0] & 1)) compressedFrames++;
+      });
+    });
     page.on("pageerror", error => exceptions.push(error.message));
     page.on("console", message => {
       if (message.type() === "error" && /Content Security Policy/.test(message.text())) exceptions.push(message.text());
@@ -239,6 +254,18 @@ tools = ["inspect"]
     }, {initialTokens, initialIncoming});
     await shot("overview");
     const run = new URL(page.url()).pathname.split("/")[2];
+    const queryCount = streamTraffic.filter(type => type === "query").length;
+    for (const name of ["Agents", "Timeline", "Communication", "Tools & files", "Triage", "Overview"]) {
+      await page.locator("#navigation").getByRole("link", { name, exact: true }).click();
+      await page.getByRole("heading", { name: name === "Overview" ? "Run overview" : name, exact: true }).waitFor();
+    }
+    assert.equal(streamTraffic.filter(type => type === "query").length, queryCount, "warm navigation uses cached datasets");
+    const asset = await fetch(address.origin + "/dashboard.js", { headers: { "Accept-Encoding": "gzip" } });
+    assert.equal(asset.headers.get("content-encoding"), "gzip");
+    assert.match(await asset.text(), /connectDashboard/);
+    const identity = await fetch(address.origin + "/dashboard.js", { headers: { "Accept-Encoding": "gzip;q=0, *;q=1" } });
+    assert.equal(identity.headers.get("content-encoding"), null);
+    await identity.arrayBuffer();
     const response = await fetch(address.origin+`/api/run/${run}/stream?after=0`,{
       headers:{Authorization:"Bearer "+token},signal:AbortSignal.timeout(5_000),
     });
@@ -356,15 +383,26 @@ tools = ["inspect"]
     assert.equal(await page.locator(".seq-row:first-of-type.selected").count(), 1);
     assert.equal(await page.locator(".view-scroll").evaluate(element => element.scrollTop), 0);
     const sequencePage = await browser.newPage({ viewport: { width: 1500, height: 900 } });
-    await sequencePage.route(`**/api/run/${run}/overview`, async route => {
-      const response = await route.fetch();
-      const summary = await response.json();
-      const agents = summary.event.workflow.agents;
-      while (agents.length < 14) {
-        const id = `stakeholder_${agents.length}`;
-        agents.push({ id, name: id });
-      }
-      await route.fulfill({ response, json: summary });
+    await sequencePage.routeWebSocket("**/api/dashboard/socket", socket => {
+      const upstream = socket.connectToServer();
+      let multipart = false;
+      upstream.onMessage(bytes => {
+        if (typeof bytes === "string") return socket.send(bytes);
+        const first = !multipart;
+        multipart = !(bytes[0] & 2);
+        if (!first || multipart) return socket.send(bytes);
+        const content = bytes.subarray(9);
+        const update = JSON.parse((bytes[0] & 1 ? gunzipSync(content) : content).toString());
+        const agents = update.values?.[`/api/run/${run}/overview`]?.data?.event?.workflow?.agents;
+        if (!agents) return socket.send(bytes);
+        while (agents.length < 14) {
+          const id = `stakeholder_${agents.length}`;
+          agents.push({ id, name: id });
+        }
+        const header = Buffer.from(bytes.subarray(0, 9));
+        header[0] = 2;
+        socket.send(Buffer.concat([header, Buffer.from(JSON.stringify(update))]));
+      });
     });
     const sequenceUrl = new URL(page.url());
     sequenceUrl.hash = address.hash;
@@ -456,6 +494,7 @@ tools = ["inspect"]
     await page.locator(".inspector").getByRole("link",{name:"Jump to chat"}).click();
     await page.locator(".entry.selected").getByText("Inspect tool metadata and evidence.").waitFor();
     assert.equal(await page.locator(".entry.selected .highlight").textContent(),"mcp_call");
+    assert.equal(streamTraffic.filter(type => type === "hello").length, 1);
     await page.reload();
     await page.locator(".entry.selected .highlight").waitFor();
     await shot("timeline");
@@ -545,6 +584,10 @@ tools = ["inspect"]
     await controls.getByRole("button",{name:"Stop",exact:true}).click();
     await page.locator("#submit-action").click();
     await controls.getByRole("button",{name:"Resume saved",exact:true}).waitFor();
+    assert.deepEqual(browserRequests, [], "the dashboard should use no HTTP data endpoints");
+    assert.equal(streamTraffic.filter(type => type === "hello").length, 2);
+    assert.ok(streamTraffic.includes("action"));
+    assert.ok(compressedFrames > 0, "realtime data was compressed");
     assert.deepEqual(exceptions,[]);
   } finally {
     streamMore();
@@ -586,6 +629,26 @@ test("a broken profile is reported before a run starts", { timeout: 60_000 }, as
     await page.goto(launch);
     await page.getByText("set --context-window to the model's token limit", { exact: true }).waitFor();
     assert.equal(await page.getByRole("button", { name: "Test provider", exact: true }).count(), 0);
+    const escapedRequest = await page.evaluate(token => new Promise((resolve, reject) => {
+      const socket = new WebSocket(location.origin.replace(/^http/, "ws") + "/api/dashboard/socket");
+      socket.addEventListener("close", () => reject(new Error("The large request closed the stream")));
+      socket.addEventListener("open", () => {
+        socket.send(JSON.stringify({ type: "hello", version: 1, token, run: null, gzip: false }));
+      });
+      socket.addEventListener("message", event => {
+        if (typeof event.data !== "string") return;
+        const message = JSON.parse(event.data);
+        if (message.type === "welcome") {
+          socket.send(JSON.stringify({ type: "action", action: {
+            id: "escaped-start", action: "start", text: "z" + "\u0000".repeat(65534) + "z",
+          } }));
+        } else if (message.type === "receipt" && message.id === "escaped-start") {
+          resolve(message.result.error);
+          socket.close();
+        }
+      });
+    }), token);
+    assert.equal(escapedRequest, "set --context-window to the model's token limit");
     await page.locator("#new-run").click();
     assert.equal(await page.locator("#submit-action").isDisabled(), true);
     await page.getByRole("button", { name: "Cancel", exact: true }).click();
@@ -757,13 +820,11 @@ instructions = "${updated ? "Current" : "Initial"} fixture instructions."
     browser = await chromium.launch();
     const visitor = await browser.newPage();
     let streamRequests = 0;
-    await visitor.route("**/stream?*", route => {
-      return ++streamRequests === 1 ? route.fulfill({ status: 502 }) : route.continue();
+    await visitor.routeWebSocket("**/api/dashboard/socket", socket => {
+      if (++streamRequests === 1) socket.close({ code: 1011 });
+      else socket.connectToServer();
     });
-    await Promise.all([
-      visitor.waitForResponse(response => response.url().includes("/stream?") && response.ok(), { timeout: 5_000 }),
-      visitor.goto(shareUrl.href),
-    ]);
+    await visitor.goto(shareUrl.href);
     await visitor.getByRole("heading", { name: "Run overview" }).waitFor({ timeout: 10_000 });
     await visitor.getByText("Read only", { exact: true }).waitFor();
     assert.equal(streamRequests, 2);

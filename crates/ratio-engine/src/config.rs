@@ -683,7 +683,7 @@ impl Config {
             .flatten()
     }
 
-    fn profile(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
+    pub fn profile_candidate(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
         if let Some(path) = explicit {
             return Some(path.to_owned());
         }
@@ -695,8 +695,12 @@ impl Config {
                 .filter(|path| path.is_absolute())
                 .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         }?;
-        let path = base.join("ratio").join("config.toml");
-        path.try_exists().unwrap_or(true).then_some(path)
+        Some(base.join("ratio").join("config.toml"))
+    }
+
+    fn profile(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
+        Self::profile_candidate(explicit)
+            .filter(|path| explicit.is_some() || path.try_exists().unwrap_or(true))
     }
 
     fn read_file(path: Option<&std::path::Path>) -> Result<FileConfig> {

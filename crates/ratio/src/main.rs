@@ -20,9 +20,23 @@ use ratio_protocol::{ControlAction, ControlRequest, Evaluation, RunStop};
 
 mod web;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
-    match run().await {
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let mut runtime = if cli.web {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        // Bulk read, projection, and encoding lanes can occupy 16 blocking threads.
+        // Leave room for runner actions and the journal observer at that limit.
+        builder.worker_threads(2).max_blocking_threads(24);
+        builder
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    match runtime
+        .enable_all()
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| runtime.block_on(run(cli)))
+    {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             eprintln!("ra: {error:#}");
@@ -31,8 +45,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<u8> {
-    let mut cli = Cli::parse();
+async fn run(mut cli: Cli) -> Result<u8> {
     if cli.web {
         return web::serve(
             Config::history_workspace(&cli)?,
@@ -250,6 +263,26 @@ async fn run() -> Result<u8> {
         }
         store.save(session.as_ref().expect("managed run has a session"))?;
     }
+    let observer = if interactive {
+        None
+    } else {
+        control::Listener::bind_telemetry(&config.cwd).ok()
+    };
+    let telemetry_state = generation.subscribe();
+    let telemetry = async {
+        if let Some(observer) = observer {
+            let _ = control::serve_telemetry(
+                observer,
+                &active_run,
+                dashboard_managed,
+                telemetry_state,
+                &live_generations,
+                &budget,
+            )
+            .await;
+        }
+        std::future::pending::<()>().await;
+    };
     let run = async {
         if interactive {
             return ui::run(&config, &store, session.take(), budget.clone()).await;
@@ -284,6 +317,7 @@ async fn run() -> Result<u8> {
     };
     let outcome = tokio::select! {
         result = run => result,
+        _ = telemetry => unreachable!("telemetry does not stop the runner"),
         result = controls => {
             result.map(|_| ui::Outcome::Interrupted)
         }

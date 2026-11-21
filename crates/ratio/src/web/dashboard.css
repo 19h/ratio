@@ -86,8 +86,8 @@ time { white-space: nowrap; }
 .connection i { width: 0.5rem; height: 0.5rem; flex: none; background: var(--ink-300); }
 .connection[data-state="live"] { color: var(--sig-ok); }
 .connection[data-state="live"] i { background: var(--sig-ok); animation: pulse 2s ease-in-out infinite; }
-.connection[data-state="paused"] { color: var(--sig-warn); }
-.connection[data-state="paused"] i { background: var(--sig-warn); }
+.connection:is([data-state="paused"], [data-state="stale"]) { color: var(--sig-warn); }
+.connection:is([data-state="paused"], [data-state="stale"]) i { background: var(--sig-warn); }
 .run-controls { display: flex; gap: 0.375rem; }
 .run-controls:empty { display: none; }
 [data-read-only] [data-operator-only] { display: none; }

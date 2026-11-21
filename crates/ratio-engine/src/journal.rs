@@ -32,6 +32,7 @@ const SCHEMA: &str = "
         first_sequence INTEGER NOT NULL REFERENCES events(sequence),
         last_sequence INTEGER NOT NULL REFERENCES events(sequence)
     ) WITHOUT ROWID;
+    CREATE INDEX runs_latest ON runs(last_sequence);
     CREATE TABLE budgets (
         run_id TEXT PRIMARY KEY,
         content BLOB NOT NULL
@@ -51,7 +52,7 @@ const SCHEMA: &str = "
 ";
 
 pub struct Journal(Connection);
-pub struct RunReader(Connection);
+pub struct RunReader(pub(crate) Connection);
 
 const AUDIT_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS audit_events (
@@ -246,6 +247,13 @@ impl Journal {
         transaction.execute_batch("CREATE TABLE IF NOT EXISTS worker_requests (
             id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, request TEXT NOT NULL, finished INTEGER NOT NULL DEFAULT 0
         ); CREATE UNIQUE INDEX IF NOT EXISTS one_worker_request ON worker_requests(run_id) WHERE finished=0;")?;
+        transaction
+            .execute_batch("CREATE INDEX IF NOT EXISTS runs_latest ON runs(last_sequence);")?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS dashboard_overviews (
+               run_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, data TEXT NOT NULL
+             ) WITHOUT ROWID;",
+        )?;
         transaction.execute_batch(AUDIT_SCHEMA)?;
         transaction.execute_batch(WORKER_AUDIT_SCHEMA)?;
         transaction.commit()?;
@@ -437,6 +445,13 @@ impl Journal {
                  last_sequence = excluded.last_sequence",
             params![run_id, phase, cycle, sequence],
         )?;
+        if let Some(overview) = details.overview {
+            transaction.execute(
+                "INSERT INTO dashboard_overviews VALUES (?1,?2,?3)
+                 ON CONFLICT(run_id) DO UPDATE SET sequence=excluded.sequence,data=excluded.data",
+                params![run_id, sequence, encode_json(&overview)?],
+            )?;
+        }
         transaction.commit()?;
         Ok(sequence as u64)
     }
@@ -479,6 +494,7 @@ pub(crate) struct CheckpointDetails {
     pub ipc: Vec<IpcEvent>,
     pub workflow: Workflow,
     pub audit: Vec<Observation>,
+    pub overview: Option<serde_json::Value>,
 }
 
 fn encode_json<T: serde::Serialize>(value: &T) -> Result<String> {
@@ -515,6 +531,34 @@ fn decode_audit(row: &rusqlite::Row<'_>) -> Result<AuditEvent> {
     })
 }
 
+pub(crate) struct MetricEvent {
+    pub sequence: u64,
+    pub effects: Vec<Effect>,
+    pub messages: Vec<IpcEvent>,
+}
+
+pub(crate) struct DashboardEvent {
+    pub sequence: u64,
+    pub phase: String,
+    pub cycle: u64,
+    pub actor: String,
+    pub kind: String,
+    pub timeline: bool,
+    pub mcp: bool,
+    pub job: bool,
+    pub file: bool,
+    pub data: serde_json::Value,
+}
+
+const AUDIT_LIST_COLUMNS: &str = "sequence,checkpoint,timestamp_ms,phase,cycle,key,kind,actor,
+                CASE WHEN kind='tool' THEN json_patch(json_remove(data,'$.arguments'),coalesce(
+                    (SELECT json_remove(result.data,'$.full','$.output') FROM audit_events result
+                     WHERE result.run_id=?1 AND result.key IN (a.key||'-running',a.key||'-completed',
+                       a.key||'-failed',a.key||'-refused',a.key||'-unknown') ORDER BY result.sequence DESC LIMIT 1),'{}'))
+                WHEN kind='tool_result' THEN json_remove(data,'$.full','$.output')
+                WHEN json_type(data,'$.text')='object' THEN json_set(data,'$.text.text',substr(json_extract(data,'$.text.text'),1,32000))
+                ELSE data END";
+
 const EVENT_COLUMNS: &str =
     "sequence, run_id, phase, cycle, checkpoint, effects, ipc, workflow, timestamp_ms";
 
@@ -540,6 +584,116 @@ fn decode_event(row: &rusqlite::Row<'_>) -> Result<RunEvent> {
 }
 
 impl RunReader {
+    /// Compare values read from this connection to detect another connection's commits.
+    pub fn data_version(&self) -> Result<u64> {
+        self.0
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+    }
+
+    pub fn dashboard_deadline(&self, duration: Duration) -> Result<()> {
+        self.0
+            .busy_timeout(duration.min(Duration::from_millis(100)))?;
+        let deadline = std::time::Instant::now() + duration;
+        self.0
+            .progress_handler(2048, Some(move || std::time::Instant::now() >= deadline));
+        Ok(())
+    }
+
+    pub(crate) fn dashboard_index_events(
+        &self,
+        run: &str,
+        after: u64,
+        head: u64,
+        limit: u32,
+    ) -> Result<Vec<DashboardEvent>> {
+        if !self.has_audit()? {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.0.prepare_cached(
+            "SELECT sequence,phase,cycle,actor,kind,
+                kind<>'tool_result' AND NOT (kind='chat' AND coalesce(json_array_length(data,'$.calls'),0)>0
+                    AND trim(coalesce(json_extract(data,'$.text.text'),json_extract(data,'$.text'),''),char(9,10,11,12,13,32))=''),
+                CASE WHEN kind='tool' THEN coalesce(json_extract(data,'$.tool') IN ('mcp_list','tool_search','mcp_call'),0) ELSE 0 END,
+                CASE WHEN kind='tool' THEN key GLOB 'job-[0-9]*' ELSE 0 END,
+                CASE WHEN kind='tool' THEN json_extract(data,'$.path') IS NOT NULL ELSE 0 END,
+                CASE WHEN kind='ipc' THEN data ELSE '{}' END
+             FROM audit_events WHERE run_id=?1 AND sequence>?2 AND sequence<=?3 ORDER BY sequence LIMIT ?4"
+        )?;
+        statement
+            .query_map(params![run, after, head, limit], |row| {
+                Ok(DashboardEvent {
+                    sequence: row.get(0)?,
+                    phase: row.get(1)?,
+                    cycle: row.get(2)?,
+                    actor: row.get(3)?,
+                    kind: row.get(4)?,
+                    timeline: row.get(5)?,
+                    mcp: row.get(6)?,
+                    job: row.get(7)?,
+                    file: row.get(8)?,
+                    data: decode_column(row, 9)?,
+                })
+            })?
+            .collect()
+    }
+
+    pub(crate) fn dashboard_index_rows(
+        &self,
+        run: &str,
+        sequences: &[u64],
+    ) -> Result<Vec<AuditEvent>> {
+        let sql = format!(
+            "SELECT {AUDIT_LIST_COLUMNS}
+            FROM audit_events a WHERE a.run_id=?1 AND a.sequence IN (SELECT value FROM json_each(?2))
+            ORDER BY a.sequence DESC"
+        );
+        let selected = encode_json(&sequences)?;
+        self.0
+            .prepare_cached(&sql)?
+            .query_map(params![run, selected], decode_audit)?
+            .collect()
+    }
+
+    pub(crate) fn audit_marker(&self, run: &str, at: u64) -> Result<Option<String>> {
+        if !self.has_audit()? {
+            return Ok(None);
+        }
+        self.0.query_row(
+            "SELECT key||':'||checkpoint||':'||timestamp_ms FROM audit_events WHERE run_id=?1 AND sequence=?2",
+            params![run, at], |row| row.get(0),
+        ).optional()
+    }
+
+    pub fn checkpoint_digest(&self, run: &str, sequence: u64) -> Result<Option<String>> {
+        self.0
+            .query_row(
+                "SELECT checkpoint FROM events WHERE run_id=?1 AND sequence=?2",
+                params![run, sequence],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub(crate) fn metric_events(
+        &self,
+        run: &str,
+        after: u64,
+        through: u64,
+        limit: u32,
+    ) -> Result<Vec<MetricEvent>> {
+        let mut statement = self.0.prepare_cached(
+            "SELECT sequence,effects,ipc FROM events WHERE run_id=?1 AND sequence>?2 AND sequence<=?3 ORDER BY sequence LIMIT ?4",
+        )?;
+        statement
+            .query_map(params![run, after, through, limit], |row| {
+                Ok(MetricEvent {
+                    sequence: row.get(0)?,
+                    effects: decode_column(row, 1)?,
+                    messages: decode_column(row, 2)?,
+                })
+            })?
+            .collect()
+    }
     pub fn web_share_digest(&self, run: &str) -> Result<Option<Vec<u8>>> {
         let exists: bool = self.0.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='web_shares' AND type='table')",
@@ -613,15 +767,23 @@ impl RunReader {
         } else {
             "DESC"
         };
-        let sql = format!("SELECT sequence,checkpoint,timestamp_ms,phase,cycle,key,kind,actor,
-                CASE WHEN kind='tool' THEN json_patch(json_remove(data,'$.arguments'),coalesce(
-                    (SELECT json_remove(result.data,'$.full','$.output') FROM audit_events result
-                     WHERE result.run_id=?1 AND result.key IN (a.key||'-running',a.key||'-completed',
-                       a.key||'-failed',a.key||'-refused',a.key||'-unknown') ORDER BY result.sequence DESC LIMIT 1),'{{}}'))
-                WHEN kind='tool_result' THEN json_remove(data,'$.full','$.output')
-                WHEN json_type(data,'$.text')='object' THEN json_set(data,'$.text.text',substr(json_extract(data,'$.text.text'),1,32000))
-                ELSE data END
-            FROM audit_events a WHERE run_id=?1 AND (?2 IS NULL OR sequence<?2) AND (?3 IS NULL OR sequence>?3)
+        let fixed_kind = match filter.kind {
+            Some("job" | "mcp") => "AND kind='tool'",
+            Some("timeline") | None => "",
+            Some(_) => "AND kind=?5",
+        };
+        let before = if filter.before.is_some() {
+            "AND sequence<?2"
+        } else {
+            ""
+        };
+        let after = if filter.after.is_some() {
+            "AND sequence>?3"
+        } else {
+            ""
+        };
+        let sql = format!("SELECT {AUDIT_LIST_COLUMNS}
+            FROM audit_events a WHERE run_id=?1 {fixed_kind} {before} {after}
             AND (?4 IS NULL OR actor=?4 OR (kind='ipc' AND EXISTS(SELECT 1 FROM json_each(data,'$.to') WHERE value=?4)))
             AND (?5 IS NULL OR kind=?5 OR (?5='timeline' AND kind<>'tool_result'
                 AND NOT (kind='chat' AND coalesce(json_array_length(data,'$.calls'),0)>0
@@ -761,18 +923,30 @@ impl RunReader {
         if !self.has_audit()? {
             return Ok(None);
         }
-        self.0.query_row("SELECT sequence,checkpoint,timestamp_ms,phase,cycle,key,kind,actor,data
-            FROM audit_events WHERE run_id=?1 AND key IN (?2||'-running',?2||'-completed',?2||'-failed',
-                ?2||'-refused',?2||'-unknown') ORDER BY sequence DESC LIMIT 1",
-            params![run,key], decode_audit).optional()
+        // Resolve the small key set before ordering by sequence. Ordering the source rows can
+        // make SQLite use the run's sequence index and walk its entire history.
+        self.0
+            .query_row(
+                "WITH candidates AS MATERIALIZED (
+                SELECT sequence FROM audit_events WHERE run_id=?1 AND key IN
+                    (?2||'-running',?2||'-completed',?2||'-failed',?2||'-refused',?2||'-unknown')
+            )
+            SELECT sequence,checkpoint,timestamp_ms,phase,cycle,key,kind,actor,data
+            FROM audit_events WHERE sequence=(SELECT max(sequence) FROM candidates)",
+                params![run, key],
+                decode_audit,
+            )
+            .optional()
     }
 
     pub fn tool_stages(&self, run: &str, key: &str) -> Result<Vec<serde_json::Value>> {
         let mut statement = self.0.prepare(
-            "SELECT key,timestamp_ms,json_extract(data,'$.state')
-             FROM audit_events WHERE run_id=?1 AND key IN
-                 (?2,?2||'-running',?2||'-completed',?2||'-failed',?2||'-refused',?2||'-unknown')
-             ORDER BY sequence",
+            "WITH stages AS MATERIALIZED (
+                 SELECT sequence,key,timestamp_ms,json_extract(data,'$.state') AS state
+                 FROM audit_events WHERE run_id=?1 AND key IN
+                     (?2,?2||'-running',?2||'-completed',?2||'-failed',?2||'-refused',?2||'-unknown')
+             )
+             SELECT key,timestamp_ms,state FROM stages ORDER BY sequence",
         )?;
         statement
             .query_map(params![run, key], |row| {
@@ -804,6 +978,51 @@ impl RunReader {
         statement.query_map(params![run,after], |row| Ok(serde_json::json!({
             "sequence":row.get::<_,u64>(0)?,"key":row.get::<_,String>(1)?,"kind":row.get::<_,String>(2)?,"actor":row.get::<_,String>(3)?
         })))?.collect()
+    }
+
+    pub fn dashboard_overview(&self, run: &str) -> Result<Option<serde_json::Value>> {
+        let exists = self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='dashboard_overviews')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        self.0
+            .query_row(
+                "SELECT v.data FROM dashboard_overviews v JOIN runs r
+             ON v.run_id=r.run_id AND v.sequence=r.last_sequence WHERE v.run_id=?1",
+                [run],
+                |row| decode_column(row, 0),
+            )
+            .optional()
+    }
+
+    pub fn dashboard_latest_event(&self, run: &str) -> Result<Option<RunEvent>> {
+        self.0
+            .query_row(
+                "SELECT sequence,run_id,phase,cycle,checkpoint,'[]','[]',workflow,timestamp_ms
+             FROM events WHERE run_id=?1 ORDER BY sequence DESC LIMIT 1",
+                [run],
+                decode_event,
+            )
+            .optional()
+    }
+
+    pub fn dashboard_checkpoints(&self, run: &str, after: u64) -> Result<Vec<serde_json::Value>> {
+        let mut statement = self.0.prepare_cached(
+            "SELECT sequence,phase,cycle,timestamp_ms FROM events
+             WHERE run_id=?1 AND sequence>?2 ORDER BY sequence LIMIT 80",
+        )?;
+        statement
+            .query_map(params![run, after], |row| {
+                Ok(serde_json::json!({
+                    "sequence":row.get::<_,u64>(0)?, "phase":row.get::<_,String>(1)?,
+                    "cycle":row.get::<_,u64>(2)?, "timestamp_ms":row.get::<_,u64>(3)?
+                }))
+            })?
+            .collect()
     }
 
     pub fn snapshot(&self, run: &str, sequence: Option<u64>) -> Result<Option<Vec<u8>>> {
@@ -869,6 +1088,24 @@ impl RunReader {
         let connection = connect(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         check_version(&connection, false)?;
         Ok(Self(connection))
+    }
+
+    pub fn dashboard_runs(&self, before: Option<u64>) -> Result<Vec<RunSummary>> {
+        let mut statement = self.0.prepare_cached(
+            "SELECT run_id,phase,cycle,first_sequence,last_sequence FROM runs
+             WHERE last_sequence<?1 ORDER BY last_sequence DESC LIMIT 100",
+        )?;
+        statement
+            .query_map([before.unwrap_or(i64::MAX as u64)], |row| {
+                Ok(RunSummary {
+                    run_id: row.get(0)?,
+                    phase: row.get(1)?,
+                    cycle: row.get(2)?,
+                    first_sequence: row.get(3)?,
+                    last_sequence: row.get(4)?,
+                })
+            })?
+            .collect()
     }
 
     pub fn runs(&self) -> Result<Vec<RunSummary>> {
@@ -945,6 +1182,34 @@ impl RunReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_details_lookup_does_not_scan_unrelated_run_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runs.sqlite3");
+        let journal = Journal::open(&path).unwrap();
+        journal
+            .0
+            .execute_batch(
+                r#"INSERT INTO audit_events VALUES
+                    (1,'run',1,1,'Work',1,'tool-1','tool','worker','{"state":"intended"}'),
+                    (2,'run',1,2,'Work',1,'tool-1-completed','tool_result','worker','{"state":"completed"}');
+                WITH RECURSIVE later(i) AS (
+                    VALUES(3) UNION ALL SELECT i+1 FROM later WHERE i<10000
+                )
+                INSERT INTO audit_events SELECT
+                    i,'run',1,i,'Work',1,'other-'||i,'chat','worker','{}' FROM later;"#,
+            )
+            .unwrap();
+        let reader = RunReader::open(&path).unwrap();
+        reader.0.progress_handler(1000, Some(|| true));
+        let stages = reader.tool_stages("run", "tool-1").unwrap();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0]["state"], "intended");
+        assert_eq!(stages[1]["state"], "completed");
+        let outcome = reader.audit_outcome("run", "tool-1").unwrap().unwrap();
+        assert_eq!(outcome.key, "tool-1-completed");
+    }
 
     #[test]
     fn readers_see_committed_history_and_resuming_an_old_run_makes_it_current() {

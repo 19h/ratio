@@ -1,39 +1,46 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use ratio_protocol::{Delivery, EffectState, Evaluation, RunEvent, RunMetrics};
+use ratio_protocol::{Delivery, Effect, EffectState, Evaluation, IpcEvent, RunEvent, RunMetrics};
 use serde_json::{Value, json};
 
 use crate::RunReader;
 
 impl RunReader {
     pub fn metrics(&self, run_id: &str) -> Result<RunMetrics> {
-        self.run(run_id)?.context("unknown run")?;
-        let ledger = self.ledger(run_id)?;
-        let mut metrics = RunMetrics {
-            provider_attempts: ledger.requests,
-            metered_tokens: ledger.tokens,
-            token_breakdown: ledger.token_breakdown(0),
-            active_ms: ledger.elapsed_ms,
-            ..RunMetrics::default()
-        };
-        self.walk_events(run_id, |event| {
-            for effect in &event.effects {
-                match effect.state {
-                    EffectState::Intended => metrics.tool_intents += 1,
-                    EffectState::Recorded => metrics.tool_receipts += 1,
-                    EffectState::Unknown => metrics.unknown_tool_outcomes += 1,
-                }
-            }
-            for ipc in &event.ipc {
-                match ipc.delivery {
-                    Delivery::Queued => {}
-                    Delivery::Delivered => metrics.ipc_deliveries += ipc.to.len(),
-                    Delivery::Dropped => metrics.ipc_drops += ipc.to.len(),
-                }
-            }
-        })?;
+        let run = self.run(run_id)?.context("unknown run")?;
+        let mut metrics = RunMetrics::default();
+        let mut after = 0;
+        while self.advance_metrics(run_id, &mut after, run.last_sequence, &mut metrics, 64)? {}
+        self.refresh_metric_budget(run_id, &mut metrics)?;
         Ok(metrics)
+    }
+
+    pub fn advance_metrics(
+        &self,
+        run: &str,
+        after: &mut u64,
+        through: u64,
+        metrics: &mut RunMetrics,
+        limit: u32,
+    ) -> Result<bool> {
+        let limit = limit.clamp(1, 256);
+        let events = self.metric_events(run, *after, through, limit)?;
+        let more = events.len() == limit as usize;
+        for event in events {
+            count_metrics(metrics, &event.effects, &event.messages);
+            *after = event.sequence;
+        }
+        Ok(more)
+    }
+
+    pub fn refresh_metric_budget(&self, run: &str, metrics: &mut RunMetrics) -> Result<()> {
+        let ledger = self.ledger(run)?;
+        metrics.provider_attempts = ledger.requests;
+        metrics.metered_tokens = ledger.tokens;
+        metrics.token_breakdown = ledger.token_breakdown(0);
+        metrics.active_ms = ledger.elapsed_ms;
+        Ok(())
     }
 
     pub fn evaluate(&self, run_id: &str, rules: &Evaluation) -> Result<Value> {
@@ -150,6 +157,23 @@ impl RunReader {
                 after = event.sequence;
                 visit(&event);
             }
+        }
+    }
+}
+
+fn count_metrics(metrics: &mut RunMetrics, effects: &[Effect], messages: &[IpcEvent]) {
+    for effect in effects {
+        match effect.state {
+            EffectState::Intended => metrics.tool_intents += 1,
+            EffectState::Recorded => metrics.tool_receipts += 1,
+            EffectState::Unknown => metrics.unknown_tool_outcomes += 1,
+        }
+    }
+    for message in messages {
+        match message.delivery {
+            Delivery::Queued => {}
+            Delivery::Delivered => metrics.ipc_deliveries += message.to.len(),
+            Delivery::Dropped => metrics.ipc_drops += message.to.len(),
         }
     }
 }

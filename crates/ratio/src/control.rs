@@ -37,6 +37,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub use platform::Listener;
 
+pub async fn telemetry(workspace: &Path) -> Result<impl AsyncRead + Unpin> {
+    timeout(REQUEST_TIMEOUT, platform::connect(workspace, true)).await?
+}
+
+pub async fn read_telemetry(stream: &mut (impl AsyncRead + Unpin)) -> Result<ControlReply> {
+    let bytes = timeout(Duration::from_secs(3), read_frame(stream, RESPONSE_CAP)).await??;
+    Ok(from_slice(&bytes)?)
+}
+
 pub async fn launch(
     workspace: &Path,
     request_text: Option<&str>,
@@ -57,13 +66,17 @@ pub async fn launch_with_args(
     request_text: Option<&str>,
 ) -> Result<(Option<ControlReply>, PathBuf)> {
     let directory = workspace.join(".ratio");
-    std::fs::create_dir_all(&directory)?;
-    let (log, log_path) = tempfile::Builder::new()
-        .prefix("runner-")
-        .suffix(".log")
-        .tempfile_in(directory)?
-        .keep()?;
-    let error_log = log.try_clone()?;
+    let (log, error_log, log_path) = tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&directory)?;
+        let (log, log_path) = tempfile::Builder::new()
+            .prefix("runner-")
+            .suffix(".log")
+            .tempfile_in(directory)?
+            .keep()?;
+        let error_log = log.try_clone()?;
+        Ok::<_, anyhow::Error>((log, error_log, log_path))
+    })
+    .await??;
     let mut command = tokio::process::Command::new(std::env::current_exe()?);
     command
         .args(args)
@@ -132,7 +145,7 @@ pub async fn launch_with_args(
 
 pub async fn request_control(workspace: &Path, request: &ControlRequest) -> Result<ControlReply> {
     timeout(REQUEST_TIMEOUT, async {
-        let mut connection = platform::connect(workspace)
+        let mut connection = platform::connect(workspace, false)
             .await
             .context("connect to active Ratio run")?;
         send_frame(&mut connection, &serde_json::to_vec(request)?, REQUEST_CAP).await?;
@@ -141,6 +154,64 @@ pub async fn request_control(workspace: &Path, request: &ControlRequest) -> Resu
     })
     .await
     .context("Ratio control request timed out")?
+}
+
+pub async fn serve_telemetry(
+    mut listener: Listener,
+    run_id: &str,
+    dashboard_managed: bool,
+    generation: watch::Receiver<GenerationControl>,
+    live: &LiveGenerations,
+    budget: &Budget,
+) -> Result<()> {
+    let (snapshots, _) = watch::channel(None::<std::sync::Arc<Vec<u8>>>);
+    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_send = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            connection = listener.accept() => {
+                let mut socket = connection?;
+                let Ok(permit) = connections.clone().try_acquire_owned() else { continue };
+                let mut frames = snapshots.subscribe();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    loop {
+                        let frame = frames.borrow_and_update().clone();
+                        if let Some(frame) = frame {
+                            if !matches!(timeout(REQUEST_TIMEOUT, send_frame(&mut socket, &frame, RESPONSE_CAP)).await, Ok(Ok(()))) {
+                                break;
+                            }
+                        }
+                        if frames.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            _ = tick.tick() => {
+                if snapshots.receiver_count() == 0 {
+                    continue;
+                }
+                let mut status = reply(run_id, generation.borrow().paused, true, "run is active");
+                status.dashboard_managed = dashboard_managed;
+                status.generations = live.snapshot();
+                status.token_usage = Some(budget.live_token_usage());
+                let bytes = serde_json::to_vec(&status)?;
+                let heartbeat = last_send.elapsed() >= Duration::from_secs(1);
+                if snapshots.send_if_modified(|old| {
+                    if !heartbeat && old.as_ref().is_some_and(|old| **old == bytes) {
+                        return false;
+                    }
+                    *old = Some(std::sync::Arc::new(bytes));
+                    true
+                }) {
+                    last_send = tokio::time::Instant::now();
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

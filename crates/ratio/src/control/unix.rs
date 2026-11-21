@@ -20,7 +20,15 @@ pub struct Listener {
 
 impl Listener {
     pub fn bind(workspace: &Path) -> Result<Self> {
-        let path = endpoint(workspace, true)?;
+        Self::bind_channel(workspace, false)
+    }
+
+    pub fn bind_telemetry(workspace: &Path) -> Result<Self> {
+        Self::bind_channel(workspace, true)
+    }
+
+    fn bind_channel(workspace: &Path, telemetry: bool) -> Result<Self> {
+        let path = endpoint(workspace, true, telemetry)?;
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -42,7 +50,7 @@ impl Drop for Listener {
     }
 }
 
-fn endpoint(workspace: &Path, create: bool) -> Result<PathBuf> {
+fn endpoint(workspace: &Path, create: bool, telemetry: bool) -> Result<PathBuf> {
     // SAFETY: geteuid has no memory or lifetime preconditions.
     let uid = unsafe { libc::geteuid() };
     let directory = std::env::temp_dir().join(format!("ra-{uid}"));
@@ -60,11 +68,16 @@ fn endpoint(workspace: &Path, create: bool) -> Result<PathBuf> {
         metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o077 == 0,
         "Ratio control directory must be private to the current user"
     );
-    Ok(directory.join(workspace_key(workspace)))
+    let key = workspace_key(workspace);
+    Ok(directory.join(if telemetry {
+        format!("{key}-live")
+    } else {
+        key
+    }))
 }
 
-pub(super) async fn connect(workspace: &Path) -> Result<UnixStream> {
-    Ok(UnixStream::connect(endpoint(workspace, false)?).await?)
+pub(super) async fn connect(workspace: &Path, telemetry: bool) -> Result<UnixStream> {
+    Ok(UnixStream::connect(endpoint(workspace, false, telemetry)?).await?)
 }
 
 pub(super) fn detach(command: &mut Command) {

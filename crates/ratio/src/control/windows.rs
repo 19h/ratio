@@ -39,7 +39,15 @@ pub struct Listener {
 
 impl Listener {
     pub fn bind(workspace: &Path) -> Result<Self> {
-        let name = endpoint(workspace);
+        Self::bind_channel(workspace, false)
+    }
+
+    pub fn bind_telemetry(workspace: &Path) -> Result<Self> {
+        Self::bind_channel(workspace, true)
+    }
+
+    fn bind_channel(workspace: &Path, telemetry: bool) -> Result<Self> {
+        let name = endpoint(workspace, telemetry);
         let descriptor = SecurityDescriptor::for_current_user()?;
         let server = descriptor
             .open(&name, true)
@@ -58,12 +66,16 @@ impl Listener {
     }
 }
 
-fn endpoint(workspace: &Path) -> String {
-    format!(r"\\.\pipe\ratio-{}", workspace_key(workspace))
+fn endpoint(workspace: &Path, telemetry: bool) -> String {
+    format!(
+        r"\\.\pipe\ratio-{}{}",
+        workspace_key(workspace),
+        if telemetry { "-live" } else { "" }
+    )
 }
 
-pub(super) async fn connect(workspace: &Path) -> Result<NamedPipeClient> {
-    Ok(ClientOptions::new().open(endpoint(workspace))?)
+pub(super) async fn connect(workspace: &Path, telemetry: bool) -> Result<NamedPipeClient> {
+    Ok(ClientOptions::new().open(endpoint(workspace, telemetry))?)
 }
 
 pub(super) fn detach(command: &mut Command) {

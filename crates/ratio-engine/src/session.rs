@@ -773,6 +773,20 @@ impl Store {
         self.save_with_traffic(session, Vec::new())
     }
 
+    fn overview(session: &Session) -> serde_json::Value {
+        serde_json::json!({
+            "phase":session.phase,"stopped":session.stopped,
+            "goal":session.goal,"request":session.request,"verdict":session.verdict,
+            "parent_run_id":session.parent_run_id,"assessment":session.assessment,
+            "team_acceptance":session.team_acceptance,"workers":session.workers,
+            "reviewers":session.reviewers,"stakeholders":session.stakeholders,
+            "worker_plan":session.worker_plan,
+            "onboarding":session.onboarding.as_ref().map(|stage| serde_json::json!({
+                "plan":stage.plan,"mentor":stage.mentor,"stakeholder":stage.stakeholder,"briefed":stage.briefed
+            })),
+        })
+    }
+
     pub(crate) fn save_with_traffic(&self, session: &Session, ipc: Vec<IpcEvent>) -> Result<()> {
         let bytes = serde_json::to_vec(session)?;
         let mut audit = session.jobs.audit();
@@ -802,6 +816,7 @@ impl Store {
                     ipc,
                     workflow: session.workflow(),
                     audit,
+                    overview: Some(Self::overview(session)),
                 },
             )
             .context("commit Ratio run checkpoint")?;

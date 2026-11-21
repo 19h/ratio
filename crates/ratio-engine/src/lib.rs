@@ -16,5 +16,6 @@ pub mod session;
 pub mod setup;
 mod staging;
 pub mod tools;
+pub mod web_index;
 
 pub use journal::{Journal, RunReader};

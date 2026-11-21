@@ -290,6 +290,10 @@ Open the private URL printed by Ratio. The dashboard binds to `127.0.0.1` and ch
 
 Press `1` to `6` to switch views and `/` to search the run. In the message sequence, the arrow keys or `j` and `k` move the selection.
 
+The browser opens one connection for dashboard data and commands. Ratio sends the selected run's latest records for the standard views together. Search, older records, and expanded payloads use the same connection. During reconnect, the dashboard labels the cached view and refreshes it when the stream returns. HTTP assets and eligible stream messages use gzip.
+
+Ratio runs the dashboard and worker execution in separate processes. The dashboard reserves capacity for controls and live updates when historical queries or shared viewers are busy. Rebuildable web indexes live in the workspace's `.ratio/` directory alongside the authoritative journal. CPU, memory, disk, and network capacity are shared by native processes on the same host.
+
 ### Steering a run
 
 | Control | Effect |
@@ -416,11 +420,11 @@ With a provider profile and no configured worker roster, Ratio proposes workers,
 ### Architecture
 
 ```text
-  Browser <-- loopback HTTP / SSE --> ra --web ------ start / resume / fork ---+
+  Browser <-- HTTP / WebSocket ----> ra --web ------ start / resume / fork ---+
                                         |                                      |
   Attached TUI / control CLI -----------+                                      |
                                         |                                      |
-                                 private local control                         |
+                             private control and telemetry                     |
                                         |                                      |
                                         v                                      v
   Inline TUI / headless CLI ------> +--------------------------------------------+
