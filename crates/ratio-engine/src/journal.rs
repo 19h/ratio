@@ -553,8 +553,12 @@ pub(crate) struct DashboardEvent {
 const AUDIT_LIST_COLUMNS: &str = "sequence,checkpoint,timestamp_ms,phase,cycle,key,kind,actor,
                 CASE WHEN kind='tool' THEN json_patch(json_remove(data,'$.arguments'),coalesce(
                     (SELECT json_remove(result.data,'$.full','$.output') FROM audit_events result
-                     WHERE result.run_id=?1 AND result.key IN (a.key||'-running',a.key||'-completed',
-                       a.key||'-failed',a.key||'-refused',a.key||'-unknown') ORDER BY result.sequence DESC LIMIT 1),'{}'))
+                     WHERE result.sequence=(
+                         WITH candidates AS MATERIALIZED (
+                             SELECT sequence FROM audit_events WHERE run_id=?1 AND key IN
+                                (a.key||'-running',a.key||'-completed',a.key||'-failed',
+                                 a.key||'-refused',a.key||'-unknown')
+                         ) SELECT max(sequence) FROM candidates)),'{}'))
                 WHEN kind='tool_result' THEN json_remove(data,'$.full','$.output')
                 WHEN json_type(data,'$.text')='object' THEN json_set(data,'$.text.text',substr(json_extract(data,'$.text.text'),1,32000))
                 ELSE data END";
@@ -919,6 +923,16 @@ impl RunReader {
             .optional()
     }
 
+    pub fn audit_event_sequence(&self, run: &str, key: &str) -> Result<Option<u64>> {
+        self.0
+            .query_row(
+                "SELECT sequence FROM audit_events WHERE run_id=?1 AND key=?2",
+                params![run, key],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
     pub fn audit_outcome(&self, run: &str, key: &str) -> Result<Option<AuditEvent>> {
         if !self.has_audit()? {
             return Ok(None);
@@ -1209,6 +1223,17 @@ mod tests {
         assert_eq!(stages[1]["state"], "completed");
         let outcome = reader.audit_outcome("run", "tool-1").unwrap().unwrap();
         assert_eq!(outcome.key, "tool-1-completed");
+        let preview = reader
+            .audit(
+                "run",
+                AuditFilter {
+                    kind: Some("tool"),
+                    ..AuditFilter::default()
+                },
+                1,
+            )
+            .unwrap();
+        assert_eq!(preview[0].data["state"], "completed");
     }
 
     #[test]

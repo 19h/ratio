@@ -17,6 +17,9 @@ pub struct Cli {
     /// Serve the workspace's live and historical runs in a local browser.
     #[arg(long, conflicts_with_all = ["request", "goal", "goal_stdin", "attach", "resume", "fork", "detached", "control", "plan_only", "review_plan", "check_mcp", "check_provider", "list_runs", "events", "metrics", "otlp_trace", "evaluate"])]
     pub web: bool,
+    /// Train dashboard compression dictionaries from the given .ratio directories and exit.
+    #[arg(long, num_args = 1.., value_name = "DIRECTORY", conflicts_with_all = ["web", "request", "goal", "goal_stdin", "attach", "resume", "fork", "detached", "control", "list_runs", "events", "metrics", "evaluate"])]
+    pub train_web_dictionaries: Vec<PathBuf>,
     /// Loopback port for --web. Zero selects a free port.
     #[arg(long, requires = "web", default_value_t = 0)]
     pub web_port: u16,

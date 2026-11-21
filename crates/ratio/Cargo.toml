@@ -26,6 +26,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 url = "2"
+zstd = "=0.13.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

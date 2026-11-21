@@ -305,6 +305,48 @@ function onStreamMessage(message) {
   }
 }
 
+let decoderReady, decoderDisabled = false, cachedDictionary = null;
+
+function dashboardDecoder() {
+  if (decoderDisabled || !globalThis.Worker || !globalThis.WebAssembly || !globalThis.crypto?.subtle) {
+    return Promise.resolve(null);
+  }
+  decoderReady ??= new Promise(resolve => {
+    const worker = new Worker("/dashboard-decoder.js");
+    const requests = new Map();
+    let serial = 0;
+    const timeout = setTimeout(() => unavailable(), 2500);
+    function unavailable() {
+      clearTimeout(timeout);
+      decoderDisabled = true;
+      worker.terminate();
+      for (const { reject } of requests.values()) reject(new Error("Dashboard decoder stopped"));
+      requests.clear();
+      resolve(null);
+    }
+    worker.onerror = unavailable;
+    worker.onmessageerror = unavailable;
+    worker.onmessage = ({ data }) => {
+      if (data.ready === false) { unavailable(); return; }
+      if (data.ready === true) {
+        clearTimeout(timeout);
+        resolve((frame, decoded, id, dictionary) => new Promise((resolve, reject) => {
+          if (decoderDisabled) { reject(new Error("Dashboard decoder unavailable")); return; }
+          requests.set(++serial, { resolve, reject });
+          worker.postMessage({ serial, frame, decoded, id, dictionary }, [frame]);
+        }));
+        return;
+      }
+      const pending = requests.get(data.serial);
+      if (!pending) return;
+      requests.delete(data.serial);
+      if (data.error) pending.reject(new Error(data.error));
+      else pending.resolve(data.body);
+    };
+  }).catch(() => { decoderDisabled = true; return null; });
+  return decoderReady;
+}
+
 function connectDashboard() {
   clearTimeout(reconnectTimer);
   const url = new URL("/api/dashboard/socket", location.href);
@@ -315,33 +357,78 @@ function connectDashboard() {
   stream.binaryType = "arraybuffer";
   let decoding = Promise.resolve();
   let chunks = [], length = 0;
-  stream.addEventListener("open", () => {
+  let decoder, welcome, received = false, lastSequence = 0;
+  const decoderBoot = dashboardDecoder();
+  const start = () => {
+    if (socket !== stream) return;
+    if (initialRun !== selected && !readOnly) {
+      connected = true;
+      send({ type: "select", run: selected });
+    }
+    onStreamMessage(welcome);
+  };
+  const ready = async () => {
+    if (socket !== stream || stream.readyState !== WebSocket.OPEN) return;
+    stream.send(JSON.stringify({ type: "ready", sha256: welcome.dictionary?.sha256 ?? null }));
+    start();
+  };
+  stream.addEventListener("open", async () => {
+    decoder = await decoderBoot;
+    if (socket !== stream || stream.readyState !== WebSocket.OPEN) return;
     initialRun = selected ?? null;
-    stream.send(JSON.stringify({ type: "hello", version: 1, token: token ?? "",
-      run: initialRun, gzip: typeof DecompressionStream === "function" }));
+    stream.send(JSON.stringify({ type: "hello", version: decoder ? 2 : 1, token: token ?? "",
+      run: initialRun, gzip: typeof DecompressionStream === "function", dictionary: cachedDictionary }));
   });
   stream.addEventListener("message", event => {
     decoding = decoding.then(async () => {
       if (socket !== stream) return;
       if (typeof event.data === "string") {
         const message = JSON.parse(event.data);
-        if (message.type === "welcome" && initialRun !== selected && !readOnly) {
-          connected = true;
-          send({ type: "select", run: selected });
+        if (message.type === "welcome") {
+          welcome = message;
+          if (welcome.version !== 2) { start(); return; }
+          if (!decoder || !["zstd", "zstd-dict"].includes(welcome.codec) ||
+              (welcome.codec === "zstd-dict") !== Boolean(welcome.dictionary)) {
+            throw new Error("Invalid dashboard codec");
+          }
+          if (!welcome.dictionary || welcome.dictionary.sha256 === cachedDictionary) await ready();
+          return;
         }
         onStreamMessage(message);
         return;
       }
       const bytes = new Uint8Array(event.data);
+      if (bytes.length < 9) throw new Error("Invalid dashboard frame");
       const flags = bytes[0];
       const sequence = Number(new DataView(event.data).getBigUint64(1));
-      let body = bytes.subarray(9);
-      if (flags & 1) {
+      let body;
+      if (welcome?.version === 2) {
+        if (bytes.length < 14 || flags & ~6) throw new Error("Invalid Zstandard envelope");
+        const decoded = new DataView(event.data).getUint32(9);
+        if (flags & 4) {
+          const dictionary = welcome.dictionary;
+          if (flags !== 6 || sequence !== 0 || !dictionary || decoded !== dictionary.bytes ||
+              decoded > 64 * 1024 || connected || !/^[0-9a-f]{64}$/.test(dictionary.sha256)) {
+            throw new Error("Invalid dashboard dictionary envelope");
+          }
+          cachedDictionary = null;
+          await decoder(event.data, decoded, 0, dictionary);
+          cachedDictionary = dictionary.sha256;
+          await ready();
+          return;
+        }
+        if (!connected || sequence !== ++lastSequence) throw new Error("Unexpected dashboard sequence");
+        body = await decoder(event.data, decoded, welcome.dictionary?.id ?? 0);
+      } else if (flags & 1) {
+        body = bytes.subarray(9);
         const reader = new Blob([body]).stream().pipeThrough(new DecompressionStream("gzip"));
         body = new Uint8Array(await new Response(reader).arrayBuffer());
+      } else {
+        body = bytes.subarray(9);
       }
       if (socket !== stream) return;
       length += body.length;
+      received = true;
       if (length > 64 * 1024 * 1024) throw new Error("Dashboard message is too large");
       chunks.push(body);
       if (flags & 2) {
@@ -353,10 +440,14 @@ function connectDashboard() {
         onStreamMessage(JSON.parse(new TextDecoder().decode(joined)));
       }
       if (stream.readyState === WebSocket.OPEN) stream.send(JSON.stringify({ type: "ack", sequence }));
-    }).catch(() => stream.close());
+    }).catch(() => {
+      if (decoder && !received) decoderDisabled = true;
+      stream.close();
+    });
   });
   stream.addEventListener("close", () => {
     if (socket !== stream) return;
+    if (decoder && !welcome) decoderDisabled = true;
     connected = false;
     document.body.setAttribute("data-stream-stale", "");
     liveChangePending = true;

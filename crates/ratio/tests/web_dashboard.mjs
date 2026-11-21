@@ -202,12 +202,18 @@ tools = ["inspect"]
     });
     const streamTraffic = [];
     let compressedFrames = 0;
+    let operatorWelcome;
     page.on("websocket", websocket => {
       websocket.on("framesent", ({ payload }) => {
         if (typeof payload === "string") streamTraffic.push(JSON.parse(payload).type);
       });
       websocket.on("framereceived", ({ payload }) => {
-        if (Buffer.isBuffer(payload) && (payload[0] & 1)) compressedFrames++;
+        if (typeof payload === "string") {
+          const frame = JSON.parse(payload);
+          if (frame.type === "welcome") operatorWelcome = frame;
+        } else if (payload.subarray(13, 17).equals(Buffer.from([0x28, 0xb5, 0x2f, 0xfd]))) {
+          compressedFrames++;
+        }
       });
     });
     page.on("pageerror", error => exceptions.push(error.message));
@@ -313,8 +319,77 @@ tools = ["inspect"]
       { headers: { Authorization: "Bearer " + shareToken(shared) } })).status, 403);
     const visitor = await browser.newPage();
     visitor.setDefaultTimeout(10_000);
+    let visitorSocket;
+    const sharedWelcomes = [];
+    let dictionaryBootstraps = 0;
+    await visitor.routeWebSocket("**/api/dashboard/socket", socket => {
+      const upstream = socket.connectToServer();
+      upstream.onMessage(frame => {
+        if (typeof frame === "string") {
+          const message = JSON.parse(frame);
+          if (message.type === "welcome") {
+            visitorSocket = socket;
+            sharedWelcomes.push(message);
+          }
+        } else if (frame[0] === 6) {
+          dictionaryBootstraps++;
+        }
+        socket.send(frame);
+      });
+    });
     await visitor.goto(shared.href);
     await visitor.getByRole("heading", { name: "Run overview" }).waitFor();
+    assert.equal(operatorWelcome.version, 2);
+    assert.equal(sharedWelcomes[0].version, 2);
+    if (process.env.RATIO_EXPECT_DICTIONARIES === "1") {
+      assert.equal(operatorWelcome.codec, "zstd-dict");
+      assert.equal(sharedWelcomes[0].codec, "zstd-dict");
+    }
+    if (operatorWelcome.dictionary && sharedWelcomes[0].dictionary) {
+      assert.notEqual(operatorWelcome.dictionary.sha256, sharedWelcomes[0].dictionary.sha256);
+    }
+    const invalid = await visitor.evaluate(({ run, dictionary }) => new Promise((resolve, reject) => {
+      const socket = new WebSocket(location.origin.replace(/^http/, "ws") + "/api/dashboard/socket");
+      const messages = [];
+      socket.addEventListener("open", () => socket.send(JSON.stringify({
+        type: "hello", version: 2, token: "0".repeat(64), run, dictionary,
+      })));
+      socket.addEventListener("message", event => {
+        messages.push(typeof event.data === "string" ? JSON.parse(event.data) : "unexpected binary frame");
+      });
+      socket.addEventListener("close", () => resolve(messages), { once: true });
+      socket.addEventListener("error", reject);
+    }), { run, dictionary: operatorWelcome.dictionary?.sha256 });
+    assert.deepEqual(invalid, [{ type: "unauthorized" }]);
+    await visitorSocket.close({ code: 1012 });
+    await visitor.waitForFunction(() => document.body.hasAttribute("data-stream-stale"));
+    await visitor.waitForFunction(() => !document.body.hasAttribute("data-stream-stale"));
+    assert.equal(sharedWelcomes.length, 2);
+    assert.deepEqual(sharedWelcomes[0].dictionary, sharedWelcomes[1].dictionary);
+    assert.equal(dictionaryBootstraps, sharedWelcomes[0].dictionary ? 1 : 0);
+    if (sharedWelcomes[0].dictionary) {
+      const rotated = await visitor.evaluate(({ run, token }) => new Promise((resolve, reject) => {
+        const socket = new WebSocket(location.origin.replace(/^http/, "ws") + "/api/dashboard/socket");
+        let welcome;
+        socket.binaryType = "arraybuffer";
+        socket.addEventListener("open", () => socket.send(JSON.stringify({
+          type: "hello", version: 2, token, run, dictionary: "0".repeat(64),
+        })));
+        socket.addEventListener("message", event => {
+          if (typeof event.data === "string") {
+            welcome = JSON.parse(event.data);
+            return;
+          }
+          const header = new DataView(event.data);
+          resolve({ dictionary: welcome.dictionary, flags: header.getUint8(0), bytes: header.getUint32(9) });
+          socket.close();
+        });
+        socket.addEventListener("error", reject);
+      }), { run, token: shareToken(shared) });
+      assert.deepEqual(rotated, {
+        dictionary: sharedWelcomes[0].dictionary, flags: 6, bytes: sharedWelcomes[0].dictionary.bytes,
+      });
+    }
     assert.equal(new URL(visitor.url()).hash, "");
     await visitor.getByText("Read only", { exact: true }).waitFor();
     assert.equal(await visitor.locator("#new-run").isVisible(), false);
@@ -383,6 +458,7 @@ tools = ["inspect"]
     assert.equal(await page.locator(".seq-row:first-of-type.selected").count(), 1);
     assert.equal(await page.locator(".view-scroll").evaluate(element => element.scrollTop), 0);
     const sequencePage = await browser.newPage({ viewport: { width: 1500, height: 900 } });
+    await sequencePage.addInitScript(() => { window.Worker = undefined; });
     await sequencePage.routeWebSocket("**/api/dashboard/socket", socket => {
       const upstream = socket.connectToServer();
       let multipart = false;

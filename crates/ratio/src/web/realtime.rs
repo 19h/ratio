@@ -1,3 +1,4 @@
+use super::dictionary::{Descriptor, Dictionaries, Dictionary, Encoder};
 use super::*;
 use flate2::{Compression, write::GzEncoder};
 use futures_util::{SinkExt, StreamExt};
@@ -22,10 +23,10 @@ use tokio_tungstenite::{
 
 const TICK: Duration = Duration::from_millis(100);
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
-const CHUNK: usize = 128 * 1024;
+pub(super) const CHUNK: usize = 128 * 1024;
 // A 64 KiB run request can grow to 384 KiB when JSON escapes its contents.
 const CLIENT_MESSAGE_LIMIT: usize = 400 * 1024;
-const WARM: &[&str] = &[
+pub(super) const WARM: &[&str] = &[
     "history?collapse_tools=1",
     "history?kind=ipc",
     "history?kind=tool",
@@ -37,7 +38,7 @@ const WARM: &[&str] = &[
     "checkpoints",
 ];
 
-type Data = BTreeMap<String, Arc<Value>>;
+pub(super) type Data = BTreeMap<String, Arc<Value>>;
 type Feed = watch::Sender<Arc<Data>>;
 type Grant = watch::Receiver<Option<Option<Vec<u8>>>>;
 
@@ -61,11 +62,13 @@ pub(super) struct Hub {
     encoding: Arc<Semaphore>,
     guest_encoding: Arc<Semaphore>,
     encoded: Arc<StdMutex<EncodingCache>>,
+    dictionaries: Dictionaries,
+    plain: [Arc<Encoder>; 2],
 }
 
 impl Hub {
-    pub(super) fn new() -> Self {
-        Self {
+    pub(super) fn new(dictionaries: Dictionaries) -> Result<Self> {
+        Ok(Self {
             feeds: StdMutex::new(BTreeMap::new()),
             grants: StdMutex::new(BTreeMap::new()),
             grant_reads: Arc::new(Semaphore::new(2)),
@@ -79,7 +82,9 @@ impl Hub {
             encoding: Arc::new(Semaphore::new(2)),
             guest_encoding: Arc::new(Semaphore::new(2)),
             encoded: Arc::default(),
-        }
+            dictionaries,
+            plain: [Arc::new(Encoder::new(&[])?), Arc::new(Encoder::new(&[])?)],
+        })
     }
 
     fn subscribe(app: &Arc<Dashboard>, run: Option<String>) -> watch::Receiver<Arc<Data>> {
@@ -600,7 +605,13 @@ enum Client {
         version: u32,
         token: String,
         run: Option<String>,
+        #[serde(default)]
         gzip: bool,
+        #[serde(default)]
+        dictionary: Option<String>,
+    },
+    Ready {
+        sha256: Option<String>,
     },
     Select {
         run: Option<String>,
@@ -619,12 +630,27 @@ enum Client {
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum Server {
-    Welcome { version: u32 },
+pub(super) enum Server {
+    Welcome {
+        version: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        codec: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dictionary: Option<Descriptor>,
+    },
     Unauthorized,
-    Data { scope: Option<String>, values: Data },
-    Query { id: u64, values: Data },
-    Receipt { id: String, result: Value },
+    Data {
+        scope: Option<String>,
+        values: Data,
+    },
+    Query {
+        id: u64,
+        values: Data,
+    },
+    Receipt {
+        id: String,
+        result: Value,
+    },
 }
 
 struct Packet {
@@ -721,19 +747,23 @@ async fn session(
     surface: Surface,
     socket: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
 ) {
-    let (sink, mut source) = socket.split();
+    let (mut sink, mut source) = socket.split();
     let Ok(Some(Ok(Message::Text(first)))) = timeout(SEND_TIMEOUT, source.next()).await else {
         return;
     };
     let Ok(Client::Hello {
-        version: 1,
+        version,
         token,
         run,
         gzip,
+        dictionary: cached,
     }) = serde_json::from_str(&first)
     else {
         return;
     };
+    if !matches!(version, 1 | 2) {
+        return;
+    }
     let mut selected = run.filter(|run| valid_run(run));
     let share_hash = if surface == Surface::Share {
         Some(digest(&SHA256, token.as_bytes()).as_ref().to_vec())
@@ -750,6 +780,69 @@ async fn session(
         }
     } else {
         app.authorization.strip_prefix("Bearer ") == Some(token.as_str())
+    };
+    if !allowed {
+        send_priority(&mut sink, &Server::Unauthorized).await;
+        let _ = timeout(SEND_TIMEOUT, sink.close()).await;
+        return;
+    }
+    let (dictionary, plain) = match surface {
+        Surface::Operator => (&app.realtime.dictionaries.operator, &app.realtime.plain[0]),
+        Surface::Share => (&app.realtime.dictionaries.shared, &app.realtime.plain[1]),
+    };
+    let codec = if version == 1 {
+        if !send_priority(
+            &mut sink,
+            &Server::Welcome {
+                version,
+                codec: None,
+                dictionary: None,
+            },
+        )
+        .await
+        {
+            return;
+        }
+        Codec::Legacy(gzip)
+    } else {
+        let sha256 = dictionary
+            .as_ref()
+            .map(|dict| dict.descriptor.sha256.as_str());
+        let welcome = Server::Welcome {
+            version,
+            codec: Some(if dictionary.is_some() {
+                "zstd-dict"
+            } else {
+                "zstd"
+            }),
+            dictionary: dictionary.as_ref().map(|dict| dict.descriptor.clone()),
+        };
+        if !send_priority(&mut sink, &welcome).await {
+            return;
+        }
+        if let Some(dictionary) = dictionary.as_ref().filter(|_| cached.as_deref() != sha256) {
+            if !matches!(
+                timeout(
+                    SEND_TIMEOUT,
+                    sink.send(Message::Binary(dictionary.bootstrap.clone()))
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                return;
+            }
+        }
+        let Ok(Some(Ok(Message::Text(ready)))) = timeout(SEND_TIMEOUT, source.next()).await else {
+            return;
+        };
+        if !matches!(serde_json::from_str::<Client>(&ready), Ok(Client::Ready { sha256: actual }) if actual.as_deref() == sha256)
+        {
+            return;
+        }
+        Codec::Zstd {
+            dictionary: dictionary.clone(),
+            plain: plain.clone(),
+        }
     };
     let (data, rx) = mpsc::channel(24);
     let (priority, urgent) = mpsc::channel(8);
@@ -768,15 +861,8 @@ async fn session(
         app.realtime.encoded.clone(),
         credits.clone(),
         pending.clone(),
-        gzip,
+        codec,
     ));
-    if !allowed {
-        packet(&tx, Server::Unauthorized, false);
-        drop(tx);
-        let _ = writer.await;
-        return;
-    }
-    packet(&tx, Server::Welcome { version: 1 }, false);
     let mut workspace = (surface == Surface::Operator).then(|| Hub::subscribe(&app, None));
     let mut run_feed = selected.clone().map(|run| Hub::subscribe(&app, Some(run)));
     let mut live = app.realtime.live.subscribe();
@@ -954,7 +1040,7 @@ fn send_data(tx: &Outbound, scope: Option<String>, mut values: Data) -> bool {
     values.is_empty() || packet(tx, Server::Data { scope, values }, true)
 }
 
-fn split_query(spec: &str) -> (&str, Query) {
+pub(super) fn split_query(spec: &str) -> (&str, Query) {
     let (name, params) = spec.split_once('?').unwrap_or((spec, ""));
     (
         name,
@@ -1075,18 +1161,18 @@ struct EncodingCache {
 
 struct EncodingEntry {
     keys: Vec<Weak<Value>>,
-    use_gzip: bool,
+    codec: EncodingKey,
     chunks: Arc<[Encoded]>,
     bytes: usize,
 }
 
 impl EncodingCache {
-    fn get(&self, values: &Data, use_gzip: bool) -> Option<Arc<[Encoded]>> {
+    fn get(&self, values: &Data, codec: &EncodingKey) -> Option<Arc<[Encoded]>> {
         self.entries
             .iter()
             .rev()
             .find(|entry| {
-                entry.use_gzip == use_gzip
+                &entry.codec == codec
                     && entry.keys.len() == values.len()
                     && entry
                         .keys
@@ -1097,13 +1183,13 @@ impl EncodingCache {
             .map(|entry| entry.chunks.clone())
     }
 
-    fn insert(&mut self, values: &Data, use_gzip: bool, chunks: Arc<[Encoded]>) {
+    fn insert(&mut self, values: &Data, codec: EncodingKey, chunks: Arc<[Encoded]>) {
         const MAX_BYTES: usize = 4 * 1024 * 1024;
         let bytes = chunks
             .iter()
             .map(|chunk| chunk.content.len())
             .sum::<usize>();
-        if bytes > MAX_BYTES || self.get(values, use_gzip).is_some() {
+        if bytes > MAX_BYTES || self.get(values, &codec).is_some() {
             return;
         }
         while self.entries.len() >= 64 || self.bytes + bytes > MAX_BYTES {
@@ -1116,7 +1202,7 @@ impl EncodingCache {
         self.bytes += bytes;
         self.entries.push_back(EncodingEntry {
             keys: values.values().map(Arc::downgrade).collect(),
-            use_gzip,
+            codec,
             chunks,
             bytes,
         });
@@ -1127,6 +1213,44 @@ struct Encoded {
     content: Vec<u8>,
     compressed: bool,
     final_chunk: bool,
+    decoded: usize,
+}
+
+#[derive(Clone)]
+enum Codec {
+    Legacy(bool),
+    Zstd {
+        dictionary: Option<Arc<Dictionary>>,
+        plain: Arc<Encoder>,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum EncodingKey {
+    Legacy(bool),
+    Zstd(Option<String>),
+}
+
+impl Codec {
+    fn key(&self, compress: bool) -> EncodingKey {
+        match self {
+            Self::Legacy(gzip) => EncodingKey::Legacy(*gzip && compress),
+            Self::Zstd { dictionary, .. } => EncodingKey::Zstd(
+                dictionary
+                    .as_ref()
+                    .map(|dict| dict.descriptor.sha256.clone()),
+            ),
+        }
+    }
+}
+
+pub(super) fn zstd_frame(flags: u8, sequence: u64, decoded: usize, body: &[u8]) -> Bytes {
+    let mut frame = Vec::with_capacity(13 + body.len());
+    frame.push(flags);
+    frame.extend_from_slice(&sequence.to_be_bytes());
+    frame.extend_from_slice(&(decoded as u32).to_be_bytes());
+    frame.extend_from_slice(body);
+    frame.into()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1138,7 +1262,7 @@ async fn write_packets<S>(
     cache: Arc<StdMutex<EncodingCache>>,
     credits: Arc<Semaphore>,
     pending: Arc<StdMutex<VecDeque<u64>>>,
-    accepts_gzip: bool,
+    codec: Codec,
 ) where
     S: futures_util::Sink<Message> + Unpin,
 {
@@ -1159,12 +1283,12 @@ async fn write_packets<S>(
                 continue;
             }
         };
-        let use_gzip = packet.compress && accepts_gzip;
+        let key = codec.key(packet.compress);
         let cached = if let Server::Data { values, .. } = &packet.body {
             cache
                 .lock()
                 .expect("dashboard encoding cache")
-                .get(values, use_gzip)
+                .get(values, &key)
         } else {
             None
         };
@@ -1175,9 +1299,10 @@ async fn write_packets<S>(
                 return;
             };
             let shared = Arc::clone(&cache);
+            let encoder = codec.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                encode_body(packet.body, use_gzip, &shared)
+                encode_body(packet.body, key, &encoder, &shared)
             })
             .await;
             let Ok(Ok(chunks)) = result else { return };
@@ -1202,17 +1327,23 @@ async fn write_packets<S>(
             };
             sequence += 1;
             let flags = u8::from(chunk.compressed) | (u8::from(chunk.final_chunk) << 1);
-            let mut bytes = Vec::with_capacity(chunk.content.len() + 9);
-            bytes.push(flags);
-            bytes.extend_from_slice(&sequence.to_be_bytes());
-            bytes.extend_from_slice(&chunk.content);
+            let bytes = match codec {
+                Codec::Legacy(_) => {
+                    let mut bytes = Vec::with_capacity(chunk.content.len() + 9);
+                    bytes.push(flags);
+                    bytes.extend_from_slice(&sequence.to_be_bytes());
+                    bytes.extend_from_slice(&chunk.content);
+                    bytes.into()
+                }
+                Codec::Zstd { .. } => zstd_frame(flags, sequence, chunk.decoded, &chunk.content),
+            };
             pending
                 .lock()
                 .expect("dashboard frame acknowledgements")
                 .push_back(sequence);
             credit.forget();
             if !matches!(
-                timeout(SEND_TIMEOUT, sink.send(Message::Binary(bytes.into()))).await,
+                timeout(SEND_TIMEOUT, sink.send(Message::Binary(bytes))).await,
                 Ok(Ok(()))
             ) {
                 return;
@@ -1224,9 +1355,10 @@ async fn write_packets<S>(
 
 fn encode_body(
     body: Server,
-    use_gzip: bool,
+    key: EncodingKey,
+    codec: &Codec,
     cache: &StdMutex<EncodingCache>,
-) -> serde_json::Result<Arc<[Encoded]>> {
+) -> Result<Arc<[Encoded]>> {
     let reusable = match &body {
         Server::Data { values, .. } => Some(values),
         _ => None,
@@ -1235,34 +1367,54 @@ fn encode_body(
         if let Some(chunks) = cache
             .lock()
             .expect("dashboard encoding cache")
-            .get(values, use_gzip)
+            .get(values, &key)
         {
             return Ok(chunks);
         }
     }
     let bytes = serde_json::to_vec(&body)?;
-    let mut chunks = bytes.chunks(CHUNK).peekable();
-    let mut encoded = Vec::new();
-    while let Some(chunk) = chunks.next() {
-        let compressed = (use_gzip && chunk.len() >= 1024)
-            .then(|| gzip(chunk).ok())
-            .flatten()
-            .filter(|data| data.len() * 10 <= chunk.len() * 9);
-        let is_compressed = compressed.is_some();
-        encoded.push(Encoded {
-            content: compressed.unwrap_or_else(|| chunk.to_vec()),
-            compressed: is_compressed,
-            final_chunk: chunks.peek().is_none(),
-        });
+    let encode = |mut compressor: Option<&mut zstd::bulk::Compressor<'_>>| {
+        let mut chunks = bytes.chunks(CHUNK).peekable();
+        let mut encoded = Vec::new();
+        while let Some(chunk) = chunks.next() {
+            let (content, compressed) = if let Some(compressor) = &mut compressor {
+                (compressor.compress(chunk)?, false)
+            } else if let Some(gzip) = legacy_gzip(chunk, key == EncodingKey::Legacy(true)) {
+                (gzip, true)
+            } else {
+                (chunk.to_vec(), false)
+            };
+            encoded.push(Encoded {
+                content,
+                compressed,
+                final_chunk: chunks.peek().is_none(),
+                decoded: chunk.len(),
+            });
+        }
+        Ok::<_, std::io::Error>(encoded)
+    };
+    let encoded: Arc<[Encoded]> = match codec {
+        Codec::Legacy(_) => encode(None)?,
+        Codec::Zstd { dictionary, plain } => dictionary
+            .as_ref()
+            .map_or(plain.as_ref(), |dict| &dict.encoder)
+            .compress(|compressor| encode(Some(compressor)))?,
     }
-    let encoded: Arc<[Encoded]> = encoded.into();
+    .into();
     if let Some(values) = reusable {
         cache
             .lock()
             .expect("dashboard encoding cache")
-            .insert(values, use_gzip, encoded.clone());
+            .insert(values, key, encoded.clone());
     }
     Ok(encoded)
+}
+
+pub(super) fn legacy_gzip(chunk: &[u8], enabled: bool) -> Option<Vec<u8>> {
+    (enabled && chunk.len() >= 1024)
+        .then(|| gzip(chunk).ok())
+        .flatten()
+        .filter(|data| data.len() * 10 <= chunk.len() * 9)
 }
 
 async fn send_priority<S: futures_util::Sink<Message> + Unpin>(

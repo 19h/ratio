@@ -290,7 +290,9 @@ Open the private URL printed by Ratio. The dashboard binds to `127.0.0.1` and ch
 
 Press `1` to `6` to switch views and `/` to search the run. In the message sequence, the arrow keys or `j` and `k` move the selection.
 
-The browser opens one connection for dashboard data and commands. Ratio sends the selected run's latest records for the standard views together. Search, older records, and expanded payloads use the same connection. During reconnect, the dashboard labels the cached view and refreshes it when the stream returns. HTTP assets and eligible stream messages use gzip.
+The browser opens one connection for dashboard data and commands. Ratio sends the selected run's latest records for the standard views together. Search, older records, and expanded payloads use the same connection. During reconnect, the dashboard labels the cached view and refreshes it when the stream returns. HTTP assets use gzip. Current dashboard clients use Zstandard for binary socket frames and support trained dictionaries.
+
+Train the dictionaries locally with `ra --train-web-dictionaries PROJECT/.ratio OTHER_PROJECT/.ratio`. The trainer reads committed dashboard samples and installs successful dictionaries in `web-dictionaries` beside the user configuration. The operator dictionary contains fragments of the supplied run data. Give operator links only to people who can read all the supplied workspaces. Share links receive a separate dictionary trained on synthetic records. Dictionaries load at dashboard startup and remain in browser memory across reconnects.
 
 Ratio runs the dashboard and worker execution in separate processes. The dashboard reserves capacity for controls and live updates when historical queries or shared viewers are busy. Rebuildable web indexes live in the workspace's `.ratio/` directory alongside the authoritative journal. CPU, memory, disk, and network capacity are shared by native processes on the same host.
 

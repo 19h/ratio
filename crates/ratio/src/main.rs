@@ -46,6 +46,10 @@ fn main() -> ExitCode {
 }
 
 async fn run(mut cli: Cli) -> Result<u8> {
+    if !cli.train_web_dictionaries.is_empty() {
+        web::train_dictionaries(&cli.train_web_dictionaries)?;
+        return Ok(0);
+    }
     if cli.web {
         return web::serve(
             Config::history_workspace(&cli)?,

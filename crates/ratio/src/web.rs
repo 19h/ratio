@@ -40,8 +40,12 @@ use tokio::{
     sync::{Mutex, Semaphore, watch},
 };
 
+mod dictionary;
 mod legacy;
 mod realtime;
+mod training;
+
+pub use training::train_dictionaries;
 
 type Body = UnsyncBoxBody<Bytes, std::convert::Infallible>;
 type Reply = Response<Body>;
@@ -161,7 +165,8 @@ pub async fn serve(
     } else {
         (None, None)
     };
-    let assets = tokio::task::spawn_blocking(Assets::new).await?;
+    let (assets, dictionaries) =
+        tokio::task::spawn_blocking(|| (Assets::new(), dictionary::Dictionaries::load())).await?;
     let token = new_token()?;
     println!("http://{host}/#access={token}");
     let app = Arc::new(Dashboard {
@@ -179,7 +184,7 @@ pub async fn serve(
         http_reads: Arc::new(Semaphore::new(2)),
         guest_reads: Arc::new(Semaphore::new(2)),
         runner_pid: AtomicU32::new(0),
-        realtime: realtime::Hub::new(),
+        realtime: realtime::Hub::new(dictionaries)?,
     });
     realtime::observe(app.clone());
     let public = async {
@@ -471,6 +476,20 @@ impl Assets {
                 "/dashboard.js".into(),
                 Asset::new("text/javascript; charset=utf-8", JS),
             ),
+            (
+                "/dashboard-decoder.js".into(),
+                Asset::new(
+                    "text/javascript; charset=utf-8",
+                    include_str!("web/dashboard-decoder.js"),
+                ),
+            ),
+            (
+                "/dashboard-decoder.wasm".into(),
+                Asset::new(
+                    "application/wasm",
+                    include_bytes!("web/dashboard-decoder.wasm").as_slice(),
+                ),
+            ),
             ("/favicon.svg".into(), Asset::new("image/svg+xml", ICON)),
         ]);
         for (name, font) in FONTS {
@@ -493,7 +512,13 @@ impl Assets {
         sharing: bool,
     ) -> Reply {
         if let Some(asset) = self.static_files.get(path) {
-            asset.serve(request, true)
+            let mut reply = asset.serve(request, true);
+            if path == "/dashboard-decoder.js" {
+                reply.headers_mut().insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static(
+                    "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; object-src 'none'; base-uri 'none'"
+                ));
+            }
+            reply
         } else if path == "/" || path.starts_with("/run/") {
             let page = match surface {
                 Surface::Share => &self.shared,
