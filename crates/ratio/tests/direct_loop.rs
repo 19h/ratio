@@ -426,10 +426,13 @@ fn active_time_budget_still_interrupts_a_stalled_request() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let (finished, stopped) = std::sync::mpsc::channel();
+    // The provider never answers. A cap that is too short can expire during
+    // process start-up, and a cap that is too long lets the mock drop the socket
+    // first, so the margin here is deliberate.
     let server = thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
         read_mock_request(&mut socket);
-        stopped.recv_timeout(Duration::from_secs(5)).unwrap();
+        stopped.recv_timeout(Duration::from_secs(30)).unwrap();
     });
     let run = cli(
         temp.path(),
@@ -437,8 +440,16 @@ fn active_time_budget_still_interrupts_a_stalled_request() {
         &["--goal", "Inspect workspace", "--max-run-secs", "2"],
     );
     finished.send(()).unwrap();
-    assert_eq!(run.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&run.stdout).contains("Run budget exhausted: active time"));
+    let diagnostics = format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.status.code(), Some(3), "{diagnostics}");
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("Run budget exhausted: active time"),
+        "{diagnostics}"
+    );
     server.join().unwrap();
 }
 
@@ -3631,10 +3642,31 @@ fn tui_refines_and_approves_a_goal_then_displays_file_tools() {
     let run = process.finish(terminal);
     succeeded(&run);
     assert!(String::from_utf8_lossy(&run.stdout).contains("VERDICT: APPROVED"));
-    let display = String::from_utf8_lossy(&display);
-    for text in ["create_file", "edit_file", "read_file", "tagged", "error:"] {
-        assert!(display.contains(text), "missing terminal output: {text}");
+    let screen = screen_text(&display);
+    // The Activity pane keeps one live row per agent and updates it in place, so
+    // a tool that starts and finishes between renders never reaches the screen.
+    // The durable record proves execution; the screen proves what the frames show.
+    let reader = ra::session::Store::reader(temp.path()).unwrap();
+    let run = reader.runs().unwrap().remove(0);
+    let audit = reader.audit(&run.run_id, Default::default(), 500).unwrap();
+    let tools = audit
+        .iter()
+        .filter(|event| event.kind == "tool_result")
+        .map(|event| event.data["tool"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    for tool in ["create_file", "edit_file", "read_file"] {
+        assert!(
+            tools.contains(&tool.to_string()),
+            "missing tool record: {tool}"
+        );
     }
+    assert!(
+        audit.iter().any(|event| event.kind == "tool_result"
+            && event.data["state"] == "failed"
+            && event.data["tool"] == "edit_file"),
+        "missing rejected edit record"
+    );
+    assert!(screen.contains("tagged"), "missing terminal output: tagged");
     assert_eq!(
         std::fs::read_to_string(temp.path().join("status.txt")).unwrap(),
         "ready"
@@ -3741,6 +3773,46 @@ impl Drop for TerminalChild {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Concatenated PTY output as plain text. Ratatui writes only the cells that
+/// changed, so one label can reach the terminal as several runs separated by
+/// cursor and style sequences, and a line wrap splits it further. Stripping
+/// escapes and whitespace keeps a substring check on a drawn label stable
+/// across render speeds and widths.
+fn screen_text(display: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(display);
+    let mut text = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => match chars.next() {
+                Some('[') => {
+                    for part in chars.by_ref() {
+                        if ('@'..='~').contains(&part) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    for part in chars.by_ref() {
+                        if part == '\u{7}' {
+                            break;
+                        }
+                        if part == '\x1b' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            },
+            ch if ch.is_whitespace() => {}
+            ch => text.push(ch),
+        }
+    }
+    text
+}
+
 fn wait_for_screen(terminal: &mut std::fs::File, display: &mut Vec<u8>, wanted: &str) {
     use std::{io::Read, os::fd::AsRawFd};
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
