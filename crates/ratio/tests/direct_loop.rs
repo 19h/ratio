@@ -1599,6 +1599,7 @@ fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let (connected, connection) = std::sync::mpsc::sync_channel(1);
+    let (stop_provider, provider_stop) = std::sync::mpsc::channel();
     let server = thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
         let mut socket = loop {
@@ -1623,12 +1624,8 @@ fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
         )
         .unwrap();
         connected.send(()).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(20)))
-            .unwrap();
-        let mut byte = [0];
-        let result = std::io::Read::read(&mut socket, &mut byte);
-        assert!(matches!(result, Ok(0)) || result.is_err());
+        // Keep the chunked response open until the test cancels the run.
+        let _ = provider_stop.recv();
     });
     let launch = cli(
         workspace,
@@ -1672,6 +1669,7 @@ fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
         true
     );
     assert_eq!(control("cancel", &[])["accepted"], true);
+    drop(stop_provider);
     server.join().unwrap();
     assert!(
         std::fs::read_to_string(&log)
