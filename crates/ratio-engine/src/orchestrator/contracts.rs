@@ -6,7 +6,9 @@ use super::*;
 
 #[derive(Deserialize)]
 struct Assignment {
+    #[serde(deserialize_with = "crate::api::stringified")]
     task: ratio_protocol::Task,
+    #[serde(deserialize_with = "crate::api::stringified")]
     paths: Vec<WritePath>,
 }
 
@@ -164,5 +166,48 @@ impl Orchestrator<'_> {
         call.function.arguments =
             json!({"plan":text,"ownership":ownership,"tasks":assignments}).to_string();
         parse_plan(&call, workers, workspace, true).context("validate assembled recovery plan")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Assignment;
+    use std::path::Path;
+
+    /// A reasoning model serialised the nested task into a string of JSON and repeated
+    /// it on every repair round, so the assignment never decoded.
+    #[test]
+    fn an_assignment_accepts_a_task_the_model_encoded_as_text() {
+        let task = serde_json::json!({
+            "id": "worker_1",
+            "worker": "worker_1",
+            "description": "Lay out the shared constants",
+            "depends_on": [],
+            "acceptance": ["src/shared/constants.py exists", "no writes outside owned paths"],
+        });
+        let paths = serde_json::json!([{"path": "src/shared", "directory": true}]);
+        for arguments in [
+            serde_json::json!({"task": task, "paths": paths}).to_string(),
+            serde_json::json!({"task": task.to_string(), "paths": paths.to_string()}).to_string(),
+        ] {
+            let slot: Assignment = serde_json::from_str(&arguments).unwrap();
+            assert_eq!(slot.task.id, "worker_1");
+            assert_eq!(slot.task.acceptance.len(), 2);
+            assert_eq!(slot.paths[0].path, Path::new("src/shared"));
+            assert!(slot.paths[0].directory);
+        }
+    }
+
+    #[test]
+    fn an_encoded_task_that_is_not_json_names_the_expected_shape() {
+        let arguments = serde_json::json!({"task": "{\"id\":", "paths": []}).to_string();
+        let error = serde_json::from_str::<Assignment>(&arguments)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("write objects and arrays as JSON"),
+            "the repair prompt must name the shape: {error}"
+        );
     }
 }

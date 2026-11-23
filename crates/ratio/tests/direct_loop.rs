@@ -3312,6 +3312,11 @@ persona = "Own worker_3.txt."
                             .is_some_and(|content| content.contains(&conflicting_path))
                     }));
                 }
+                if !staged {
+                    // A reasoning model writes an array as text as often as as JSON, so
+                    // the plan arrives with the task graph serialised into a string.
+                    submission["tasks"] = json!(submission["tasks"].to_string());
+                }
             }
             (calls(&[tool("plan", "submit_plan", submission)]), false)
         } else if system.starts_with("Recover a multi-worker plan") {
@@ -3328,6 +3333,16 @@ persona = "Own worker_3.txt."
                 },
                 "paths":[{"path":format!("{id}.txt"),"directory":false}]
             });
+            // Worker 2 replies with the nested task and paths serialised into strings of
+            // JSON, which is what made real runs fail assignment recovery.
+            let assignment = if recovered == 2 {
+                json!({
+                    "task": assignment["task"].to_string(),
+                    "paths": assignment["paths"].to_string(),
+                })
+            } else {
+                assignment
+            };
             (
                 calls(&[tool("recovered", "submit_worker_assignment", assignment)]),
                 false,

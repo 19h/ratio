@@ -41,8 +41,39 @@ pub(crate) fn tool_arguments<T: DeserializeOwned>(arguments: &str) -> Result<T> 
         arguments.trim_start().starts_with('{'),
         "arguments must be a JSON object"
     );
-    serde_json::from_str(arguments).context("invalid tool arguments")
+    serde_json::from_str(arguments)
+        .map_err(|error| anyhow::anyhow!("{}; {ARGS_SHAPE_HINT}", clip(&error.to_string(), 400)))
+        .context("invalid tool arguments")
 }
+
+/// Models write object- and array-typed arguments as JSON, but a reasoning model
+/// sometimes serialises a nested value into a string of JSON first. The intent is
+/// unambiguous, so the text is parsed instead of the reply rejected.
+pub(crate) fn stringified<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Encoded<T> {
+        Direct(T),
+        Text(String),
+    }
+    match Encoded::<T>::deserialize(deserializer)? {
+        Encoded::Direct(value) => Ok(value),
+        Encoded::Text(text) => serde_json::from_str(&text).map_err(|error| {
+            serde::de::Error::custom(format!(
+                "{}; {ARGS_SHAPE_HINT}",
+                clip(&error.to_string(), 400)
+            ))
+        }),
+    }
+}
+
+/// Text appended to a tool-argument decode failure, which is fed back to the model
+/// as its repair instruction.
+const ARGS_SHAPE_HINT: &str = "write objects and arrays as JSON, not as a JSON-encoded string";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
