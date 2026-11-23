@@ -448,11 +448,29 @@ fn stalled_provider(check_only: bool) -> Output {
     let temp = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
     let (finished, stopped) = std::sync::mpsc::channel();
     let server = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stopped.recv_timeout(Duration::from_millis(10))
+                        != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    {
+                        return false;
+                    }
+                }
+                Err(error) => panic!("accept stalled provider connection: {error}"),
+            }
+        };
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         read_mock_request(&mut socket);
         stopped.recv_timeout(Duration::from_secs(30)).unwrap();
+        true
     });
     let mut options = vec!["--max-run-secs", "2"];
     if check_only {
@@ -461,8 +479,11 @@ fn stalled_provider(check_only: bool) -> Output {
         options.extend(["--goal", "Inspect workspace"]);
     }
     let run = cli(temp.path(), &endpoint, &options);
-    finished.send(()).unwrap();
-    server.join().unwrap();
+    let _ = finished.send(());
+    assert!(
+        server.join().unwrap(),
+        "CLI never reached the stalled provider: {run:?}"
+    );
     run
 }
 
@@ -5605,21 +5626,31 @@ fn accepted_campaign_survives_failed_workspace_preparation() {
         }
         4 => text("Inspected the fixture."),
         5 => {
-            assert!(
-                request["messages"]
-                    .to_string()
-                    .contains("Verification passed: true")
-            );
-            decision("approved", "Fixture verified.")
+            let messages = request["messages"].to_string();
+            if cfg!(windows) {
+                // The original command must still run through the verification
+                // gate. Windows has no workspace subprocess sandbox.
+                assert!(
+                    messages.contains("workspace sandbox unavailable"),
+                    "{messages}"
+                );
+                decision("rejected", "Verification unavailable on this platform.")
+            } else {
+                assert!(messages.contains("Verification passed: true"), "{messages}");
+                decision("approved", "Fixture verified.")
+            }
         }
         _ => panic!("unexpected request {index}"),
     });
-    succeeded(
-        &generated_campaign_command(workspace, &endpoint)
-            .args(["--config", profile.path().to_str().unwrap(), "--resume"])
-            .output()
-            .unwrap(),
-    );
+    let resumed = generated_campaign_command(workspace, &endpoint)
+        .args(["--config", profile.path().to_str().unwrap(), "--resume"])
+        .output()
+        .unwrap();
+    if cfg!(windows) {
+        assert_eq!(resumed.status.code(), Some(2), "{resumed:?}");
+    } else {
+        succeeded(&resumed);
+    }
     assert!(workspace.join(".ratio/staging").join(run.run_id()).is_dir());
     server.join().unwrap();
 }
