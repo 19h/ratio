@@ -188,6 +188,8 @@ ra -C /path/to/project --plan-only 'Add a --version flag to the CLI'
 
 Ratio's built-in Campaign Architect uses the request, the profile's tool policy, and root project manifests to propose a goal, roster, draft task graph, and acceptance gates. During coordination the team can revise dependencies and ownership. Ratio freezes the resulting plan before workers acknowledge it.
 
+Startup proposals can refer to workers by roster name or by position as `worker_1` through `worker_N`. Ratio resolves owners to position IDs before validating the task graph and ownership map.
+
 If `verification_commands` is omitted, the generated campaign may select declared npm checks, Cargo tests, or Go tests when their runners are available. An explicit list controls verification, including `[]` to disable discovery. If `stage_workspace` is omitted, the campaign may select staging when an executable check is selected and the workspace is the root of a Git worktree with a commit. The configured `max_parallel_agents` remains the concurrency ceiling.
 
 During **Propose team**, the Setup agent uses the configured reviewer model to submit the roster and acceptance criteria. Use **Open setup timeline** on the run overview to inspect the brief, submitted arguments, and validation results. The automatic check field accepts catalog IDs. Requirements for checks outside the catalog, including checks for files the run will create, go into the team's acceptance criteria.

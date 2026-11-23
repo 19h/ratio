@@ -2,7 +2,7 @@ mod campaign;
 
 pub use campaign::{Campaign, Check, Execution};
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet, btree_map::Entry};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -135,7 +135,7 @@ pub(crate) async fn refine_audited(
     }));
     let worker_prompt = if generate {
         format!(
-            "Include 1 to 64 workers with name and persona, project acceptance criteria, and a campaign object with draft tasks, ownership, rationale, and supported settings. Roster size and concurrent slot count are separate.\nWorkspace capabilities: {}",
+            "Include 1 to 64 workers with name and persona, project acceptance criteria, and a campaign object with draft tasks, ownership, rationale, and supported settings. Roster size and concurrent slot count are separate. Use worker_1 through worker_N in roster order or exact roster names for task owners and ownership keys. Include each worker's ownership once.\nWorkspace capabilities: {}",
             capabilities.as_ref().expect("generation capabilities")
         )
     } else {
@@ -293,6 +293,7 @@ pub(crate) async fn refine_audited(
                     );
                 }
                 if let Some(campaign) = &mut draft.campaign {
+                    canonicalize_owners(campaign, &draft.workers)?;
                     campaign.verification_checks.retain(|id| {
                         if facts.checks.iter().any(|check| &check.id == id) {
                             return true;
@@ -352,6 +353,47 @@ pub(crate) async fn refine_audited(
     }
 }
 
+fn canonicalize_owners(campaign: &mut Campaign, workers: &[Worker]) -> Result<()> {
+    let mut aliases = HashMap::new();
+    for index in 1..=workers.len() {
+        let id = format!("worker_{index}");
+        aliases.insert(id.clone(), id);
+    }
+    for (index, worker) in workers.iter().enumerate() {
+        let name = worker.name.to_lowercase();
+        let id = format!("worker_{}", index + 1);
+        ensure!(
+            aliases.get(&name).is_none_or(|owner| owner == &id),
+            "worker name {:?} conflicts with another worker's positional ID",
+            worker.name
+        );
+        aliases.insert(name, id);
+    }
+    let resolve = |owner: &str| {
+        aliases
+            .get(&owner.trim().to_lowercase())
+            .cloned()
+            .unwrap_or_else(|| owner.to_owned())
+    };
+    let mut ownership = BTreeMap::new();
+    for (owner, paths) in std::mem::take(&mut campaign.ownership) {
+        match ownership.entry(resolve(&owner)) {
+            Entry::Vacant(entry) => {
+                entry.insert(paths);
+            }
+            Entry::Occupied(entry) => anyhow::bail!(
+                "duplicate ownership entries for {} after resolving roster names",
+                entry.key()
+            ),
+        }
+    }
+    campaign.ownership = ownership;
+    for task in &mut campaign.tasks.0 {
+        task.worker = resolve(&task.worker);
+    }
+    Ok(())
+}
+
 fn team_schema(checks: &[Check]) -> Value {
     let ids: Vec<_> = checks.iter().map(|check| &check.id).collect();
     let verification = if ids.is_empty() {
@@ -373,11 +415,11 @@ fn team_schema(checks: &[Check]) -> Value {
         "acceptance":{"type":"array","minItems":1,"items":{"type":"string"}},
         "campaign":{"type":"object","additionalProperties":false,"properties":{
             "tasks":{"type":"array","maxItems":64,"items":{"type":"object","additionalProperties":false,
-                "properties":{"id":{"type":"string"},"worker":{"type":"string"},"description":{"type":"string"},
+                "properties":{"id":{"type":"string"},"worker":{"type":"string","description":"Position ID worker_1 through worker_N in roster order, or the exact roster name."},"description":{"type":"string"},
                     "depends_on":{"type":"array","items":{"type":"string"}},
                     "acceptance":{"type":"array","items":{"type":"string"}}},
                 "required":["id","worker","description","depends_on","acceptance"]}},
-            "ownership":{"type":"object","description":"Map each worker_N to an array of {path, directory} entries.",
+            "ownership":{"type":"object","description":"Map each worker's position ID or exact roster name to one array of {path, directory} entries.",
                 "additionalProperties":{"type":"array","items":{"type":"object","additionalProperties":false,
                     "properties":{"path":{"type":"string"},"directory":{"type":"boolean"}},"required":["path","directory"]}}},
             "rationale":{"type":"string"},

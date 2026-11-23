@@ -5220,6 +5220,53 @@ fn setup_reports_truncation_and_content_filter_separately() {
 }
 
 #[test]
+fn named_ownership_preserves_paths_and_rejects_duplicate_aliases() {
+    let root = tempfile::tempdir().unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        let mut proposal = json!({
+            "goal":"Build a fixture", "message":"Ready",
+            "workers":[{"name":"Builder","persona":"Build the fixture"}],
+            "reviewers":[], "stakeholders":[], "acceptance":["Record the result"],
+            "campaign":{
+                "tasks":[{"id":"build","worker":"Builder","description":"Build it",
+                    "depends_on":[],"acceptance":["Record the result"]}],
+                "ownership":{"Builder":[{"path":"src/lib.rs","directory":false}]},
+                "rationale":"One owner"
+            }
+        });
+        match index {
+            0 => {
+                proposal["campaign"]["ownership"]["worker_1"] = json!([]);
+                calls(&[tool("duplicate", "submit_team", proposal)])
+            }
+            1 => {
+                assert!(
+                    request["messages"]
+                        .to_string()
+                        .contains("duplicate ownership entries for worker_1")
+                );
+                let (status, mut response) = calls(&[tool("corrected", "submit_team", proposal)]);
+                response["test_terminal"] = json!(true);
+                (status, response)
+            }
+            _ => panic!("unexpected request {index}"),
+        }
+    });
+    let output = generated_campaign_command(root.path(), &endpoint)
+        .args(["--goal", "Build a fixture", "--plan-only"])
+        .output()
+        .unwrap();
+    succeeded(&output);
+    server.join().unwrap();
+    let proposal: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(proposal["campaign"]["tasks"][0]["worker"], "worker_1");
+    assert_eq!(
+        proposal["campaign"]["ownership"]["worker_1"][0]["path"],
+        "src/lib.rs"
+    );
+}
+
+#[test]
 fn setup_audits_proposal_repairs_and_preserves_manual_verification() {
     use ratio_engine::{audit::AuditFilter, session::Store};
 
