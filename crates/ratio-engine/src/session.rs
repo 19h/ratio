@@ -401,16 +401,23 @@ impl Session {
             }),
             ..Workflow::default()
         };
-        workflow.agents.extend([
-            AgentView {
-                id: "user".into(),
-                name: "You".into(),
-            },
-            AgentView {
-                id: "lead_reviewer".into(),
-                name: "Lead reviewer".into(),
-            },
-        ]);
+        workflow.agents.push(AgentView {
+            id: "user".into(),
+            name: "You".into(),
+        });
+        if self.phase == Phase::ProposeTeam || self.request.is_some() {
+            workflow.agents.push(AgentView {
+                id: crate::setup::ACTOR.into(),
+                name: crate::setup::LABEL.into(),
+            });
+        }
+        if self.phase == Phase::ProposeTeam {
+            return workflow;
+        }
+        workflow.agents.push(AgentView {
+            id: "lead_reviewer".into(),
+            name: "Lead reviewer".into(),
+        });
         workflow.agents.extend(
             self.workers
                 .as_deref()
@@ -422,7 +429,7 @@ impl Session {
                     name: worker.name.clone(),
                 }),
         );
-        if workflow.agents.len() == 2 {
+        if self.workers.as_deref().unwrap_or_default().is_empty() {
             workflow.agents.push(AgentView {
                 id: "worker_1".into(),
                 name: "Worker".into(),

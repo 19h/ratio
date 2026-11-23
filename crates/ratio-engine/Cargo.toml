@@ -17,13 +17,17 @@ ring = "0.17"
 rusqlite = { version = "0.32.1", features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+shell-words = "1"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
 toml = "0.8"
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }

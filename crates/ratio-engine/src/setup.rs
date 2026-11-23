@@ -15,6 +15,19 @@ use crate::{
     session::Session,
 };
 
+pub(crate) const ACTOR: &str = "setup_agent";
+pub(crate) const LABEL: &str = "Setup agent";
+
+pub(crate) enum Audit<'a> {
+    Brief(&'a str),
+    Attempt {
+        message: &'a Message,
+        state: &'static str,
+        result: &'a str,
+    },
+    Failure(&'a str),
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Draft {
     pub goal: String,
@@ -84,6 +97,16 @@ impl Draft {
 }
 
 pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Result<Draft> {
+    refine_audited(config, api, draft, user, |_| Ok(())).await
+}
+
+pub(crate) async fn refine_audited(
+    config: &Config,
+    api: &Api,
+    draft: &Draft,
+    user: &str,
+    mut audit: impl FnMut(Audit<'_>) -> Result<()>,
+) -> Result<Draft> {
     let generate = !config.fixed_team && config.workers.is_empty();
     let facts = if generate {
         let workspace = config.cwd.clone();
@@ -140,11 +163,17 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
     let mut length_retries = 0;
     let mut correction = None;
     let mut repairs = 0;
-    let schemas = if generate {
-        vec![team_schema()]
-    } else {
-        Vec::new()
-    };
+    let schemas = facts
+        .as_ref()
+        .map_or_else(Vec::new, |facts| vec![team_schema(&facts.checks)]);
+    let model = config.reviewer_spec();
+    let contract = if generate { "submit_team" } else { "JSON text" };
+    audit(Audit::Brief(&format!(
+        "Ratio Campaign Architect\nModel: {}\nResponse contract: {contract}\nWorkspace: {}\nRequest: {}\nTask: {user}\n{worker_prompt}",
+        model.model,
+        config.cwd.display(),
+        draft.goal,
+    )))?;
     loop {
         let prompt = Message::user(format!(
             "Current proposal (JSON):\n{}\n\nUser input:\n{user}{}",
@@ -166,8 +195,9 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
         );
         api.wait_for_generation().await?;
         let completion = match api
-            .complete_for(
-                "Setup agent",
+            .complete_as(
+                ACTOR,
+                LABEL,
                 config.reviewer_spec(),
                 &messages,
                 &schemas,
@@ -176,22 +206,38 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
             .await
         {
             Err(ApiError::Cancelled) => continue,
-            result => result?,
+            Ok(completion) => completion,
+            Err(error) => {
+                audit(Audit::Failure(&error.to_string()))?;
+                return Err(error.into());
+            }
         };
         match completion.finish_reason.as_deref() {
             Some("length") if length_retries < 2 => {
+                audit(Audit::Attempt {
+                    message: &completion.message,
+                    state: "failed",
+                    result: "Provider truncated the proposal. Retrying with a shorter prompt.",
+                })?;
                 length_retries += 1;
                 previous.message =
                     crate::context::clip(&previous.message, previous.message.len() / 3);
                 continue;
             }
             Some("length" | "content_filter") => {
-                anyhow::bail!("provider stopped before returning the full proposal");
+                let reason = "provider stopped before returning the full proposal";
+                audit(Audit::Attempt {
+                    message: &completion.message,
+                    state: "failed",
+                    result: reason,
+                })?;
+                anyhow::bail!("{reason}");
             }
             _ => {}
         }
-        match decode(completion, generate).and_then(|mut draft| {
-            if generate {
+        match decode(&completion.message, generate).and_then(|mut draft| {
+            let mut manual_checks = Vec::new();
+            if let Some(facts) = &facts {
                 let configured_names: HashSet<_> = config
                     .reviewers
                     .iter()
@@ -234,30 +280,75 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
                         "each worker needs a unique name and assignment"
                     );
                 }
-                draft.execution = Some(facts.as_ref().expect("generation facts").resolve(
-                    config,
-                    draft.campaign.as_ref(),
-                    &draft.workers,
-                )?);
+                if let Some(campaign) = &mut draft.campaign {
+                    campaign.verification_checks.retain(|id| {
+                        if facts.checks.iter().any(|check| &check.id == id) {
+                            return true;
+                        }
+                        if !id.trim().is_empty() && !manual_checks.contains(id) {
+                            manual_checks.push(id.clone());
+                        }
+                        false
+                    });
+                }
+                for check in &manual_checks {
+                    let criterion = format!("Manual verification requirement from setup: {check}");
+                    if !draft.acceptance.contains(check) && !draft.acceptance.contains(&criterion) {
+                        draft.acceptance.push(criterion);
+                    }
+                }
+                draft.execution =
+                    Some(facts.resolve(config, draft.campaign.as_ref(), &draft.workers)?);
             } else {
                 draft.campaign = None;
                 draft.workers.clone_from(&config.workers);
             }
-            Ok(draft)
+            Ok((draft, manual_checks))
         }) {
-            Ok(draft) => return Ok(draft),
-            Err(error) if repairs < 2 => {
+            Ok((draft, manual_checks)) => {
+                let result = if manual_checks.is_empty() {
+                    "Proposal accepted.".to_owned()
+                } else {
+                    format!(
+                        "Proposal accepted. Check selections outside the catalog were retained as manual acceptance requirements: {}",
+                        serde_json::to_string(&manual_checks)?
+                    )
+                };
+                audit(Audit::Attempt {
+                    message: &completion.message,
+                    state: "completed",
+                    result: &result,
+                })?;
+                return Ok(draft);
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                audit(Audit::Attempt {
+                    message: &completion.message,
+                    state: "refused",
+                    result: &reason,
+                })?;
+                if repairs == 2 {
+                    return Err(error);
+                }
                 repairs += 1;
                 correction = Some(Message::user(format!(
-                    "Correct the proposal and use the requested response contract. Validation error: {error:#}"
+                    "Correct the proposal and use the requested response contract. Validation error: {reason}"
                 )));
             }
-            Err(error) => return Err(error),
         }
     }
 }
 
-fn team_schema() -> Value {
+fn team_schema(checks: &[Check]) -> Value {
+    let ids: Vec<_> = checks.iter().map(|check| &check.id).collect();
+    let verification = if ids.is_empty() {
+        json!({"type":"array","maxItems":0,"items":{"type":"string"},
+            "description":"No automatic checks are available. Put manual requirements in acceptance."})
+    } else {
+        json!({"type":"array","uniqueItems":true,"items":{"type":"string","enum":ids},
+            "description":"Use exact check IDs. Put other verification requirements in acceptance."})
+    };
     let participant = json!({"type":"object","properties":{
         "name":{"type":"string"},"persona":{"type":"string"},"phases":{"type":"array","minItems":1,
         "items":{"type":"string","enum":["planning","review"]}}},"required":["name","persona","phases"]});
@@ -278,19 +369,19 @@ fn team_schema() -> Value {
                 "additionalProperties":{"type":"array","items":{"type":"object","additionalProperties":false,
                     "properties":{"path":{"type":"string"},"directory":{"type":"boolean"}},"required":["path","directory"]}}},
             "rationale":{"type":"string"},
-            "verification_checks":{"type":"array","items":{"type":"string"}},
+            "verification_checks":verification,
             "prefer_staging":{"type":"boolean"},
             "max_parallel_agents":{"type":"integer","minimum":1}
         },"required":["tasks","ownership","rationale"]}},
         "required":["goal","message","stakeholders","reviewers","workers","acceptance"]}}})
 }
 
-fn decode(completion: crate::api::Completion, typed: bool) -> Result<Draft> {
+fn decode(message: &Message, typed: bool) -> Result<Draft> {
     let Message::Assistant {
         content,
         tool_calls,
         ..
-    } = completion.message
+    } = message
     else {
         anyhow::bail!("setup model did not return proposal text");
     };

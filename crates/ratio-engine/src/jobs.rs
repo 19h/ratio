@@ -117,13 +117,13 @@ pub(crate) fn schemas(shell: bool, mcp: bool) -> Vec<Value> {
     let mut schemas = vec![
         schema(
             "list_specialists",
-            "Discover callable specialist roles and worker personas.",
+            "Discover specialist roles and read-only worker consultations.",
             json!({}),
             &[],
         ),
         schema(
             "delegate",
-            "Start a specialist in a fresh conversation. Pass a self-contained task and optional evidence references from your tool results. Returns a job ID.",
+            "Start a consultation. Worker personas advise only. The run assigns implementation in Work. Pass a self-contained task and optional evidence. Returns a job ID.",
             json!({
                 "role":{"type":"string"}, "task":{"type":"string"},
                 "evidence":{"type":"array","items":{"type":"string"},"description":"Exact tool name for the latest result, call ID, or inherited source ID."}
@@ -162,7 +162,7 @@ pub(crate) fn schemas(shell: bool, mcp: bool) -> Vec<Value> {
 pub(crate) fn compact_schema() -> Value {
     schema(
         "jobs",
-        "Job actions: list_specialists ({}), delegate (role, task, evidence), start_tool (tool, arguments), await_jobs (jobs), job_status (job).",
+        "list_specialists ({}), delegate for consultation (role, task, evidence), start_tool (tool, arguments), await_jobs (jobs), job_status (job).",
         json!({"op":{"type":"string"}, "args":{"type":"object"}}),
         &["op"],
     )
@@ -519,7 +519,7 @@ impl Jobs {
         }
         let writes = matches!(
             call.function.name.as_str(),
-            "shell" | "edit_file" | "create_file" | "mcp_call"
+            "shell" | "edit_file" | "replace_text" | "create_file" | "mcp_call"
         );
         Ok(writes
             && book.jobs.values().any(|job| {

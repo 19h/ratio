@@ -153,18 +153,26 @@ fn files(scope: &Scope) -> Result<Vec<PathBuf>> {
     } else {
         display(&scope.within)
     };
-    match crate::staging::git(
-        &scope.workspace,
-        &[
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--",
-            &spec,
-        ],
-    ) {
+    let listing = super::git(&scope.workspace).and_then(|command| {
+        let output = command
+            .into_std()
+            .args([
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                &spec,
+            ])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Git could not list workspace files"
+        );
+        Ok(output.stdout)
+    });
+    match listing {
         Ok(listing) => paths.extend(
             listing
                 .split(|byte| *byte == 0)
@@ -179,39 +187,41 @@ fn files(scope: &Scope) -> Result<Vec<PathBuf>> {
         .into_iter()
         .filter(|path| {
             !reserved(path)
-                // A symlink could lead outside the workspace.
-                && std::fs::symlink_metadata(scope.workspace.join(path))
-                    .is_ok_and(|entry| entry.is_file())
+                && super::FileTarget::new(&scope.workspace, &scope.workspace.join(path))
+                    .is_ok_and(|target| target.is_regular())
         })
         .collect())
 }
 
 fn walk(workspace: &Path, within: &Path, paths: &mut BTreeSet<PathBuf>) -> Result<()> {
+    if super::FileTarget::new(workspace, &workspace.join(within))
+        .is_ok_and(|target| target.is_regular())
+    {
+        paths.insert(within.to_owned());
+        return Ok(());
+    }
     let mut pending = vec![within.to_owned()];
     let mut visited = 0usize;
     while let Some(relative) = pending.pop() {
         let location = workspace.join(&relative);
-        if std::fs::symlink_metadata(&location).is_ok_and(|entry| entry.is_file()) {
-            paths.insert(relative);
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&location) else {
+        let Ok(entries) = super::native_paths::entries(workspace, &location) else {
             continue;
         };
-        for entry in entries.flatten() {
+        for (name, kind) in entries.flatten() {
             visited += 1;
             ensure!(
                 visited <= MAX_WALK_ENTRIES,
                 "workspace has more than {MAX_WALK_ENTRIES} entries. Narrow the search with path"
             );
-            let child = relative.join(entry.file_name());
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() && !reserved(&child) {
-                pending.push(child);
-            } else if kind.is_file() {
-                paths.insert(child);
+            let child = relative.join(name);
+            match kind {
+                super::native_paths::EntryKind::Directory if !reserved(&child) => {
+                    pending.push(child)
+                }
+                super::native_paths::EntryKind::File => {
+                    paths.insert(child);
+                }
+                _ => {}
             }
         }
     }
@@ -314,10 +324,16 @@ pub(super) fn search(scope: &Scope, args: &SearchFiles) -> Result<(String, Strin
         let Ok(location) = scope.workspace.join(&path).canonicalize() else {
             continue;
         };
-        if !location.starts_with(&scope.workspace) {
+        if !location
+            .strip_prefix(&scope.workspace)
+            .is_ok_and(|path| !reserved(path))
+        {
             continue;
         }
-        let text = match read_text_snapshot(&location, true) {
+        let text = match super::FileTarget::new(&scope.workspace, &location)
+            .and_then(|target| target.open())
+            .and_then(|file| read_text_snapshot(file, true))
+        {
             Ok(Some(text)) => text,
             _ => {
                 skipped += 1;
@@ -558,6 +574,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn git_workspaces_honor_ignore_rules() {
         let root = fixture();
         let git = |args: &[&str]| {

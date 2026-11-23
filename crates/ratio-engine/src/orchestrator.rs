@@ -252,20 +252,65 @@ impl<'a> Orchestrator<'a> {
             draft.goal.clone_from(&session.goal);
             self.reporter
                 .emit(Kind::Phase, Phase::ProposeTeam.label(), "");
-            let proposal = crate::setup::refine(
+            let proposal = crate::setup::refine_audited(
                 self.config,
                 &self.api,
                 &draft,
                 "Propose the team and acceptance criteria for this request.",
+                |event| {
+                    use crate::setup::{ACTOR, Audit};
+
+                    match event {
+                        Audit::Brief(text) => {
+                            session
+                                .dialogue
+                                .audit_note(ACTOR, "brief", &self.api.redact(text));
+                        }
+                        Audit::Attempt {
+                            message,
+                            state,
+                            result,
+                        } => {
+                            session
+                                .dialogue
+                                .audit_completion(ACTOR, message, |text| self.api.redact(text));
+                            let result = self.api.redact(result);
+                            if let Message::Assistant { tool_calls, .. } = message {
+                                for (index, call) in tool_calls.iter().enumerate() {
+                                    session.dialogue.audit_tool_at(
+                                        ACTOR,
+                                        index,
+                                        call,
+                                        state,
+                                        Some((&result, &result)),
+                                        None,
+                                    );
+                                }
+                            }
+                            if state != "completed" {
+                                session
+                                    .dialogue
+                                    .audit_note(ACTOR, "contract_error", &result);
+                            }
+                        }
+                        Audit::Failure(error) => {
+                            session
+                                .dialogue
+                                .audit_note(ACTOR, "error", &self.api.redact(error));
+                        }
+                    }
+                    self.store.save(&session)
+                },
             )
             .await?;
-            session.request = Some(session.goal.clone());
             let proposal_text = self.api.redact(&serde_json::to_string_pretty(&proposal)?);
             let worker_count = proposal.workers.len();
-            proposal.apply(&mut session);
             session
                 .dialogue
-                .audit_note("lead_reviewer", "proposal", &proposal_text);
+                .audit_note(crate::setup::ACTOR, "proposal", &proposal_text);
+            self.store.save(&session)?;
+            session.request = Some(session.goal.clone());
+            proposal.apply(&mut session);
             session.phase = Phase::Plan;
             self.store.save(&session)?;
             self.reporter.emit(
@@ -377,6 +422,14 @@ impl<'a> Orchestrator<'a> {
                 _ => {
                     let (model, access, role) = self.role(phase);
                     let mut system = self.system(&session.goal, &role, workspace);
+                    if phase == Phase::Plan
+                        && session
+                            .workers
+                            .as_ref()
+                            .is_some_and(|workers| !workers.is_empty())
+                    {
+                        system.push_str("\nFinish with the draft plan. Delegated worker personas can advise. Rostered workers implement in Work.");
+                    }
                     if final_review {
                         system.push_str("\nUse inspection tools to verify the goal. Approve only when the available evidence establishes completion. Submit the final decision using submit_verdict as the sole tool call.");
                     }
@@ -711,7 +764,7 @@ impl<'a> Orchestrator<'a> {
         let options = &self.config.orchestration;
         let role = match phase {
             Phase::Work => options.worker_system_prompt.clone().unwrap_or_else(|| {
-                "You are the worker. Execute the task with local tools, inspect project instructions, preserve existing work and verify what you change. Use create_file and edit_file for file changes. Report concrete results and remaining issues.".into()
+                "You are the worker. Execute the task with local tools, inspect project instructions, preserve existing work and verify what you change. Use native file tools for edits. Report concrete results and remaining issues.".into()
             }),
             _ => options.reviewer_system_prompt.clone().unwrap_or_else(|| {
                 "You are the reviewer. Inspect the workspace with the available tools. Develop precise plans and assess implementation against the goal and constraints. Verify claims against the workspace and identify any missing evidence.".into()
@@ -998,7 +1051,7 @@ impl<'a> Orchestrator<'a> {
             self.reporter.agent(peer.author, Kind::Tool, &title, "");
             let started = std::time::Instant::now();
             let same = |output: String| (output.clone(), output);
-            let (output, full) = match (call.function.name.as_str(), peer) {
+            let (mut output, mut full) = match (call.function.name.as_str(), peer) {
                 (
                     "send_message",
                     PeerTools {
@@ -1069,7 +1122,16 @@ impl<'a> Orchestrator<'a> {
                 },
                 _ => tools.execute_audited(&call).await,
             };
-            let state = jobs::tool_outcome(&output, &full).label();
+            let outcome = jobs::tool_outcome(&output, &full);
+            if outcome == crate::jobs::State::Refused
+                && let Some(hint) = peer.refusal_hint(access)
+            {
+                for receipt in [&mut output, &mut full] {
+                    receipt.push('\n');
+                    receipt.push_str(hint);
+                }
+            }
+            let state = outcome.label();
             dialogue.audit_tool(
                 peer.author,
                 &call,
@@ -1095,7 +1157,7 @@ impl<'a> Orchestrator<'a> {
             schemas.retain(|schema| {
                 !matches!(
                     schema["function"]["name"].as_str(),
-                    Some("search_files" | "find_files")
+                    Some("search_files" | "find_files" | "replace_text")
                 )
             });
         }
@@ -2277,7 +2339,7 @@ impl<'a> Orchestrator<'a> {
             } else {
                 let plan = approved.context("missing frozen plan")?;
                 if enabling_work {
-                    role.push_str("Phase: execute. The mutation gate is open. Implement only your own assignment and exclusive paths from the frozen plan, leave peer files alone, verify the result and report what you did. Use create_file or edit_file for file changes.");
+                    role.push_str("Phase: execute. The mutation gate is open. Implement only your own assignment and exclusive paths from the frozen plan, leave peer files alone, verify the result and report what you did. Use native file tools for edits.");
                 } else {
                     role.push_str("Phase: acknowledge. Native file tools are read-only. Check the entire frozen plan, including assignments and conflicts. Call ack_plan if you agree or object_to_plan with a reason. Send the decision tool alone and include the exact plan_id.");
                 }
@@ -2819,6 +2881,28 @@ impl<'a> PeerTools<'a> {
                 "read_file" | "list_directory" | "search_files" | "find_files" | "recall"
             ))
             && self.jobs.is_none_or(|jobs| jobs.permits(tool))
+    }
+
+    fn refusal_hint(&self, access: Access) -> Option<&'static str> {
+        if let Some(specialist) = self.jobs.and_then(|peer| peer.specialist()) {
+            return Some(jobs::specialist_mode(specialist));
+        }
+        if self.ack.is_some() {
+            return Some(
+                "You are acknowledging the frozen plan. Send ack_plan or object_to_plan as the sole tool call. Work starts after all workers acknowledge.",
+            );
+        }
+        if self.repairing {
+            return Some(
+                "This turn is for repairing the requested decision. Submit the corrected decision.",
+            );
+        }
+        if matches!(access, Access::Inspect) {
+            return Some(
+                "You are in inspection mode. Use the advertised read tools and report your findings. Native file edits require Work access.",
+            );
+        }
+        None
     }
 }
 

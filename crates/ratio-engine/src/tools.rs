@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
-    io::{Read, SeekFrom, Write},
+    io::{Read, SeekFrom},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -20,12 +20,17 @@ use tokio::{
 use crate::{api::ToolCall, context::clip, line_tags};
 
 pub mod mcp;
+mod native_paths;
 mod search;
+mod shell_guard;
 pub(crate) mod skills;
 #[cfg(windows)]
 mod windows_job;
+mod workspace_sandbox;
 
-#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
+use native_paths::FileTarget;
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Access {
     Inspect,
     Work,
@@ -46,9 +51,11 @@ impl Tools<'_> {
         matches!(self.access, Access::Work) || self.allow_inspection_shell
     }
 
-    pub(crate) fn validate_shell(call: &ToolCall) -> Result<()> {
+    pub(crate) fn validate_shell(call: &ToolCall, workspace: &Path, access: Access) -> Result<()> {
         let args: Shell = crate::api::tool_arguments(&call.function.arguments)?;
-        args.command.into_script()?;
+        let script = args.command.into_script()?;
+        shell_guard::check(&script, matches!(access, Access::Work))?;
+        shell_workdir(workspace, args.workdir.as_deref())?;
         Ok(())
     }
 
@@ -101,19 +108,35 @@ impl Tools<'_> {
                 }),
                 &["path", "content"],
             ));
-            schemas.push(schema("edit_file", "Atomically edit lines by tags from read_file. Use tag, tag..tag inclusive, +tag before, tag+ after; new text preserves explicit indentation, null deletes. One stale tag aborts all edits. Legacy old_text and new_text require a unique exact match.", json!({
-                "path": {"type":"string"},
-                "edits": {"type":"object","additionalProperties":{"type":["string","null"]}},
-                "line_hints": {"type":"object","description":"Optional previous 1-based line by tag for stale-tag diagnostics.","additionalProperties":{"type":"integer","minimum":1}},
-                "snapshot_id": {"type":"string","description":"Required for range edits. Copy from read_file."},
-                "old_text": {"type":"string"},
-                "new_text": {"type":"string"}
-            }), &["path"]));
+            schemas.push(schema(
+                "replace_text",
+                "Replace one unique exact match. Copy old_text verbatim. Empty new_text deletes it.",
+                json!({
+                    "path": {"type":"string"},
+                    "old_text": {"type":"string","minLength":1},
+                    "new_text": {"type":"string"}
+                }),
+                &["path", "old_text", "new_text"],
+            ));
+            schemas.push(schema(
+                "edit_file",
+                "Apply tagged edits atomically. Copy tags from read_file. Use TAG, +TAG (insert before), TAG+ (insert after), or START..END (inclusive range). Use null text to delete.",
+                json!({
+                    "path": {"type":"string"},
+                    "edits": {"type":"array","minItems":1,"items":{
+                        "type":"object","additionalProperties":false,
+                        "properties":{"target":{"type":"string"},"text":{"type":["string","null"]}},
+                        "required":["target","text"]
+                    }},
+                    "snapshot_id": {"type":"string","description":"Required for ranges. Copy from read_file."}
+                }),
+                &["path", "edits"],
+            ));
         }
         if self.allows_shell() {
             schemas.push(schema(
                 "shell",
-                "Shell in workdir. null uses workspace. Check status without sleeping.",
+                "Inspect, build or test. Null workdir uses workspace. Use native tools for edits.",
                 json!({
                     "command": {"type":"array","items":{"type":"string"}},
                     "workdir": {"type":["string","null"]}
@@ -203,7 +226,7 @@ impl Tools<'_> {
             "git_status" => {
                 let _: Empty = crate::api::tool_arguments(arguments)?;
                 let (_, output, full) = self
-                    .command_result(git().args([
+                    .command_result(git(self.workspace)?.args([
                         "status",
                         "--short",
                         "--untracked-files=normal",
@@ -218,7 +241,7 @@ impl Tools<'_> {
             }
             "git_diff" => {
                 let args: Diff = crate::api::tool_arguments(arguments)?;
-                let mut command = git();
+                let mut command = git(self.workspace)?;
                 command.args([
                     "diff",
                     "--no-ext-diff",
@@ -250,9 +273,10 @@ impl Tools<'_> {
             "create_file" if matches!(self.access, Access::Work) => {
                 let args: CreateFile = crate::api::tool_arguments(arguments)?;
                 let path = self.edit_path(&args.path).await?;
+                let workspace = self.workspace.to_owned();
                 let content_len = args.content.len();
                 let snapshot = tokio::task::spawn_blocking(move || {
-                    create_file(&path, &args.content)?;
+                    create_file(&workspace, &path, &args.content)?;
                     Ok::<_, anyhow::Error>(snapshot_id(&args.content))
                 })
                 .await??;
@@ -260,16 +284,30 @@ impl Tools<'_> {
                 *audit = Some(format!("{result}\nSnapshot ID: {snapshot}"));
                 Ok(result)
             }
-            "edit_file" if matches!(self.access, Access::Work) => {
-                let args: EditFile = crate::api::tool_arguments(arguments)?;
+            "edit_file" | "replace_text" if matches!(self.access, Access::Work) => {
+                let args = if call.function.name == "replace_text" {
+                    let args: ReplaceText = crate::api::tool_arguments(arguments)?;
+                    EditFile {
+                        path: args.path,
+                        edits: None,
+                        snapshot_id: None,
+                        line_hints: BTreeMap::new(),
+                        old_text: Some(args.old_text),
+                        new_text: Some(args.new_text),
+                    }
+                } else {
+                    crate::api::tool_arguments::<EditFile>(arguments)?
+                };
                 let path = self.edit_path(&args.path).await?;
+                let workspace = self.workspace.to_owned();
                 match (args.edits, args.old_text, args.new_text) {
                     (Some(edits), None, None) => {
+                        let edits = edits.into_map()?;
                         let changed_path = path.clone();
                         let count = edits.len();
                         let (updated, first, patch) = tokio::task::spawn_blocking(move || {
                             let mut patch = String::new();
-                            let (updated,first) = change_file(&changed_path, |original| {
+                            let (updated,first) = change_file(&workspace, &changed_path, |original| {
                                 if edits.keys().any(|tag| tag.contains("..")) || args.snapshot_id.is_some() {
                                     let current = snapshot_id(original);
                                     if args.snapshot_id.as_deref() != Some(&current) {
@@ -315,7 +353,10 @@ impl Tools<'_> {
                         );
                         let lengths = (old.len(), new.len());
                         let receipt = edit_receipt(&old, &new);
-                        tokio::task::spawn_blocking(move || edit_file(&path, &old, &new)).await??;
+                        tokio::task::spawn_blocking(move || {
+                            edit_file(&workspace, &path, &old, &new)
+                        })
+                        .await??;
                         *audit = Some(receipt);
                         Ok(format!(
                             "Edited {} ({} bytes replaced with {} bytes).",
@@ -324,16 +365,22 @@ impl Tools<'_> {
                             lengths.1
                         ))
                     }
-                    _ => anyhow::bail!("provide edits or both old_text and new_text"),
+                    _ => anyhow::bail!(
+                        "{}",
+                        r#"No complete edit was supplied. For edit_file, pass path and edits such as [{"target":"TAG","text":"replacement"}] (copy TAG from read_file). A snapshot_id alone cannot edit a file. For a unique exact match, call replace_text with path, old_text and new_text."#
+                    ),
                 }
             }
             "shell" if self.allows_shell() => {
                 let args: Shell = crate::api::tool_arguments(arguments)?;
                 let script = args.command.into_script()?;
-                let mut command = shell(&script);
-                if let Some(workdir) = args.workdir {
-                    command.current_dir(self.workspace.join(workdir));
+                let writable = matches!(self.access, Access::Work);
+                if let Err(error) = shell_guard::check(&script, writable) {
+                    return Ok(format!("REFUSED: {error}"));
                 }
+                let workdir = shell_workdir(self.workspace, args.workdir.as_deref())?;
+                let mut command = shell(self.workspace, &script, writable)?;
+                command.current_dir(workdir);
                 let (_, output, full) = self.command_result(&mut command).await?;
                 *audit = Some(full);
                 Ok(format!("Untrusted command output\n{output}"))
@@ -388,8 +435,12 @@ impl Tools<'_> {
 
     async fn read(&self, args: &ReadFile, audit: &mut Option<String>) -> Result<String> {
         let path = self.resolve(&args.path).await?;
-        let metadata = fs::metadata(&path).await?;
-        ensure!(metadata.is_file(), "expected a regular file");
+        let workspace = self.workspace.to_owned();
+        let path_to_open = path.clone();
+        let file =
+            tokio::task::spawn_blocking(move || FileTarget::new(&workspace, &path_to_open)?.open())
+                .await??;
+        let metadata = file.metadata()?;
         let limit = args
             .max_bytes
             .unwrap_or(self.output_bytes)
@@ -403,8 +454,9 @@ impl Tools<'_> {
             let start = args.start_line.unwrap_or(1);
             let end = args.end_line;
             let output_limit = self.output_bytes;
+            let tagged_file = file.try_clone()?;
             let tagged = tokio::task::spawn_blocking(move || {
-                let text = match read_text_snapshot(&tagged_path, auto) {
+                let text = match read_text_snapshot(tagged_file, auto) {
                     Ok(Some(text)) => text,
                     Ok(None) => return Ok(None),
                     Err(error) if error.is::<std::str::Utf8Error>() => {
@@ -451,7 +503,7 @@ impl Tools<'_> {
         let hex = line_mode || args.hex == Some(true);
         let default_length = if hex { HEX_PREVIEW_BYTES } else { remaining };
         let count = args.length.unwrap_or(default_length).min(remaining);
-        let mut file = fs::File::open(path).await?;
+        let mut file = fs::File::from_std(file);
         file.seek(SeekFrom::Start(offset)).await?;
         let hex_range = HexRange {
             offset,
@@ -511,39 +563,10 @@ impl Tools<'_> {
     }
 
     async fn list(&self, path: &Path) -> Result<(String, String)> {
-        const OMITTED: &str = "[... additional entries omitted ...]";
-        const AUDIT_DIRECTORY_BYTES: usize = 1024 * 1024;
-        let mut dir = fs::read_dir(self.resolve(path).await?).await?;
-        let mut lines = Vec::new();
-        let mut size = 0;
-        let mut visible_count = None;
-        let mut omitted = false;
-        while let Some(entry) = dir.next_entry().await? {
-            let name = entry.file_name();
-            let mut name = name.to_string_lossy().escape_debug().to_string();
-            if entry.file_type().await?.is_dir() {
-                name.push('/');
-            }
-            size += name.len() + 1;
-            if size > self.output_bytes.saturating_sub(64) && visible_count.is_none() {
-                visible_count = Some(lines.len());
-            }
-            if size > AUDIT_DIRECTORY_BYTES {
-                omitted = true;
-                break;
-            }
-            lines.push(name);
-        }
-        let mut visible = lines[..visible_count.unwrap_or(lines.len())].to_vec();
-        if visible_count.is_some() || omitted {
-            visible.push(OMITTED.into());
-        }
-        visible.sort_unstable();
-        if omitted {
-            lines.push(OMITTED.into());
-        }
-        lines.sort_unstable();
-        Ok((visible.join("\n"), lines.join("\n")))
+        let workspace = self.workspace.to_owned();
+        let path = self.resolve(path).await?;
+        let output_bytes = self.output_bytes;
+        tokio::task::spawn_blocking(move || list_directory(&workspace, &path, output_bytes)).await?
     }
 
     #[cfg(all(test, windows))]
@@ -552,7 +575,9 @@ impl Tools<'_> {
     }
 
     pub(crate) async fn verify(&self, script: &str) -> Result<(bool, String)> {
-        let (passed, output, _) = self.command_result(&mut shell(script)).await?;
+        let (passed, output, _) = self
+            .command_result(&mut shell(self.workspace, script, true)?)
+            .await?;
         Ok((passed, self.redact(output)))
     }
 
@@ -612,6 +637,41 @@ impl Tools<'_> {
             ),
         ))
     }
+}
+
+fn list_directory(workspace: &Path, path: &Path, output_bytes: usize) -> Result<(String, String)> {
+    const OMITTED: &str = "[... additional entries omitted ...]";
+    const AUDIT_DIRECTORY_BYTES: usize = 1024 * 1024;
+    let mut lines = Vec::new();
+    let mut size = 0;
+    let mut visible_count = None;
+    let mut omitted = false;
+    for entry in native_paths::entries(workspace, path)? {
+        let (name, kind) = entry?;
+        let mut name = name.to_string_lossy().escape_debug().to_string();
+        if matches!(kind, native_paths::EntryKind::Directory) {
+            name.push('/');
+        }
+        size += name.len() + 1;
+        if size > output_bytes.saturating_sub(64) && visible_count.is_none() {
+            visible_count = Some(lines.len());
+        }
+        if size > AUDIT_DIRECTORY_BYTES {
+            omitted = true;
+            break;
+        }
+        lines.push(name);
+    }
+    let mut visible = lines[..visible_count.unwrap_or(lines.len())].to_vec();
+    if visible_count.is_some() || omitted {
+        visible.push(OMITTED.into());
+    }
+    visible.sort_unstable();
+    if omitted {
+        lines.push(OMITTED.into());
+    }
+    lines.sort_unstable();
+    Ok((visible.join("\n"), lines.join("\n")))
 }
 
 const BYTE_READ_HINT: &str =
@@ -735,7 +795,7 @@ fn snapshot_id(text: &str) -> String {
         .collect()
 }
 
-fn create_file(path: &Path, content: &str) -> Result<()> {
+fn create_file(workspace: &Path, path: &Path, content: &str) -> Result<()> {
     let lock = write_lock(path)?;
     let _guard = lock
         .lock()
@@ -744,21 +804,12 @@ fn create_file(path: &Path, content: &str) -> Result<()> {
         content.len() <= MAX_EDIT_BYTES,
         "file would exceed {MAX_EDIT_BYTES} bytes"
     );
-    let builder = &mut tempfile::Builder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(std::fs::Permissions::from_mode(0o666));
-    }
-    let mut temp = builder.tempfile_in(path.parent().context("create file parent")?)?;
-    temp.write_all(content.as_bytes())?;
-    temp.persist_noclobber(path).context("create new file")?;
-    Ok(())
+    FileTarget::new(workspace, path)?.publish(content, None, || Ok(()))
 }
 
-fn edit_file(path: &Path, old: &str, new: &str) -> Result<()> {
+fn edit_file(workspace: &Path, path: &Path, old: &str, new: &str) -> Result<()> {
     ensure!(!old.is_empty(), "old_text must be nonempty");
-    change_file(path, |original| {
+    change_file(workspace, path, |original| {
         let start = original
             .find(old)
             .context("old_text does not match the file")?;
@@ -780,6 +831,7 @@ fn edit_file(path: &Path, old: &str, new: &str) -> Result<()> {
 }
 
 fn change_file(
+    workspace: &Path,
     path: &Path,
     plan: impl FnOnce(&str) -> Result<(String, usize)>,
 ) -> Result<(String, usize)> {
@@ -787,45 +839,42 @@ fn change_file(
     let _guard = lock
         .lock()
         .map_err(|_| anyhow::anyhow!("native write lock poisoned"))?;
-    let metadata = std::fs::symlink_metadata(path).context("inspect file")?;
-    ensure!(
-        !metadata.file_type().is_symlink(),
-        "writes through a symlink leaf are unavailable; edit the workspace target directly"
-    );
-    ensure!(metadata.is_file(), "expected a regular file");
-    let original = read_edit_file(path)?;
+    let target = FileTarget::new(workspace, path)?;
+    let file = target.open()?;
+    let metadata = file.metadata()?;
+    let original = read_edit_file(file)?;
     let (changed, first) = plan(&original)?;
     ensure!(
         changed.len() <= MAX_EDIT_BYTES,
         "edited file would exceed {MAX_EDIT_BYTES} bytes"
     );
-    let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("edit file parent")?)?;
-    temp.write_all(changed.as_bytes())?;
-    temp.as_file().set_permissions(metadata.permissions())?;
-    let current = std::fs::symlink_metadata(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
+    target.publish(&changed, Some(metadata.permissions()), || {
+        let current = target.open()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let current = current.metadata()?;
+            ensure!(
+                metadata.dev() == current.dev() && metadata.ino() == current.ino(),
+                "file identity changed during edit"
+            );
+        }
         ensure!(
-            metadata.dev() == current.dev() && metadata.ino() == current.ino(),
-            "file identity changed during edit"
+            read_edit_file(current)? == original,
+            "file changed during the edit. Read it again before retrying"
         );
-    }
-    ensure!(
-        current.is_file() && read_edit_file(path)? == original,
-        "file changed during the edit. Read it again before retrying"
-    );
-    temp.persist(path).context("replace edited file")?;
+        Ok(())
+    })?;
     Ok((changed, first))
 }
 
-fn read_edit_file(path: &Path) -> Result<String> {
-    read_text_snapshot(path, false)?.context("expected an editable UTF-8 file")
+fn read_edit_file(file: std::fs::File) -> Result<String> {
+    read_text_snapshot(file, false)?.context("expected an editable UTF-8 file")
 }
 
-fn read_text_snapshot(path: &Path, auto: bool) -> Result<Option<String>> {
+fn read_text_snapshot(file: std::fs::File, auto: bool) -> Result<Option<String>> {
     let mut bytes = Vec::new();
-    let mut file = std::fs::File::open(path)?.take(MAX_EDIT_BYTES as u64 + 1);
+    let mut file = file.take(MAX_EDIT_BYTES as u64 + 1);
     if auto {
         file.by_ref()
             .take(HEX_PREVIEW_BYTES)
@@ -860,8 +909,8 @@ fn read_text_snapshot(path: &Path, auto: bool) -> Result<Option<String>> {
     }
 }
 
-fn git() -> Command {
-    let mut command = Command::new("git");
+fn git(workspace: &Path) -> Result<Command> {
+    let mut command = workspace_sandbox::command(workspace, "git", false)?;
     command
         .args([
             "--no-pager",
@@ -870,24 +919,38 @@ fn git() -> Command {
             "-c",
             "core.untrackedCache=false",
         ])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
         .env("GIT_OPTIONAL_LOCKS", "0");
-    command
+    Ok(command)
 }
 
-#[cfg(unix)]
-fn shell(script: &str) -> Command {
-    let mut command = Command::new("/bin/sh");
+fn shell_workdir(workspace: &Path, workdir: Option<&Path>) -> Result<PathBuf> {
+    let root = workspace.canonicalize().context("resolve workspace")?;
+    let requested = workdir.map_or_else(|| root.clone(), |path| root.join(path));
+    (|| {
+        let resolved = requested.canonicalize()?;
+        ensure!(
+            resolved.starts_with(&root),
+            "working directory leaves the workspace"
+        );
+        ensure!(
+            !resolved.starts_with(root.join(".ratio")),
+            "working directory is reserved for Ratio checkpoints"
+        );
+        ensure!(resolved.is_dir(), "expected a working directory");
+        Ok(resolved)
+    })()
+    .with_context(|| format!("start command in {}", requested.display()))
+}
+
+fn shell(workspace: &Path, script: &str, writable: bool) -> Result<Command> {
+    let mut command = workspace_sandbox::command(workspace, "/bin/sh", writable)?;
     command.args(["-c", script]);
-    command
-}
-
-#[cfg(windows)]
-fn shell(script: &str) -> Command {
-    let mut command = Command::new("cmd.exe");
-    command
-        .args(["/D", "/S", "/C"])
-        .raw_arg(format!("\"{script}\""));
-    command
+    Ok(command)
 }
 
 #[cfg(unix)]
@@ -1015,7 +1078,7 @@ struct CreateFile {
 #[derive(Deserialize)]
 struct EditFile {
     path: PathBuf,
-    edits: Option<BTreeMap<String, Option<String>>>,
+    edits: Option<EditOperations>,
     snapshot_id: Option<String>,
     #[serde(default)]
     line_hints: BTreeMap<String, usize>,
@@ -1023,6 +1086,50 @@ struct EditFile {
     old_text: Option<String>,
     #[serde(alias = "new_string")]
     new_text: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplaceText {
+    path: PathBuf,
+    old_text: String,
+    new_text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EditOperations {
+    List(Vec<TaggedEdit>),
+    Legacy(BTreeMap<String, Option<String>>),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaggedEdit {
+    target: String,
+    // JSON null deletes, while an omitted field is invalid.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    text: Option<String>,
+}
+
+impl EditOperations {
+    fn into_map(self) -> Result<BTreeMap<String, Option<String>>> {
+        let edits = match self {
+            Self::Legacy(edits) => edits,
+            Self::List(operations) => {
+                let mut edits = BTreeMap::new();
+                for operation in operations {
+                    ensure!(
+                        edits.insert(operation.target, operation.text).is_none(),
+                        "Each edit target may appear only once"
+                    );
+                }
+                edits
+            }
+        };
+        ensure!(!edits.is_empty(), "Supply at least one tagged edit");
+        Ok(edits)
+    }
 }
 
 #[derive(Deserialize)]
@@ -1103,6 +1210,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     async fn shell_starts_in_the_requested_directory() {
         use crate::api::Function;
 
@@ -1125,11 +1233,7 @@ mod tests {
             output_bytes: 1024,
             key: None,
         };
-        let command = if cfg!(windows) {
-            "type probe.txt"
-        } else {
-            "cat probe.txt"
-        };
+        let command = "cat probe.txt";
         let call = |arguments: Value| ToolCall {
             id: "workdir-test".into(),
             kind: "function".into(),
@@ -1167,6 +1271,23 @@ mod tests {
         assert!(output.contains("nested-probe"), "{output}");
         let output = tools.execute(&call(json!({"command":[command]}))).await;
         assert!(output.contains("missing field `workdir`"), "{output}");
+    }
+
+    #[test]
+    fn shell_workdir_refuses_external_paths() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        for path in [Path::new(".."), parent.path()] {
+            let error = shell_workdir(&workspace, Some(path)).unwrap_err();
+            assert!(format!("{error:#}").contains("working directory leaves the workspace"));
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(parent.path(), workspace.join("link")).unwrap();
+            let error = shell_workdir(&workspace, Some(Path::new("link"))).unwrap_err();
+            assert!(format!("{error:#}").contains("working directory leaves the workspace"));
+        }
     }
 
     #[cfg(windows)]
@@ -1311,12 +1432,12 @@ mod tests {
         let workspace = root.path().canonicalize().unwrap();
         let path = workspace.join("fixture");
         let original = "first\nmiddle\nlast\n";
-        create_file(&path, original).unwrap();
+        create_file(&workspace, &path, original).unwrap();
         let anchors = line_tags::tags(
             &path.to_string_lossy(),
             &line_tags::lines(original).collect::<Vec<_>>(),
         );
-        edit_file(&path, "middle", "new interior").unwrap();
+        edit_file(&workspace, &path, "middle", "new interior").unwrap();
         let tools = Tools {
             workspace: &workspace,
             ownership: None,
@@ -1333,7 +1454,7 @@ mod tests {
         let result = tools.execute(&call).await;
         assert!(result.contains("current snapshot_id"), "{result}");
         assert_eq!(
-            read_edit_file(&path).unwrap(),
+            std::fs::read_to_string(&path).unwrap(),
             "first\nnew interior\nlast\n"
         );
     }
@@ -1341,53 +1462,57 @@ mod tests {
     #[test]
     fn edit_requires_one_exact_match_even_when_matches_overlap() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("text");
-        create_file(&path, "aaa\nunique\n").unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let path = workspace.join("text");
+        create_file(&workspace, &path, "aaa\nunique\n").unwrap();
         assert!(
-            edit_file(&path, "aa", "b")
+            edit_file(&workspace, &path, "aa", "b")
                 .unwrap_err()
                 .to_string()
                 .contains("more than once")
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "aaa\nunique\n");
-        edit_file(&path, "unique", "é").unwrap();
+        edit_file(&workspace, &path, "unique", "é").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "aaa\né\n");
     }
 
     #[test]
     fn native_edits_preserve_independent_changes_to_one_file() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("fixture");
-        create_file(&path, "first\nsecond\n").unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let path = workspace.join("fixture");
+        create_file(&workspace, &path, "first\nsecond\n").unwrap();
         let start = std::sync::Barrier::new(2);
         std::thread::scope(|threads| {
             for (old, new) in [("first", "one"), ("second", "two")] {
                 let path = &path;
+                let workspace = &workspace;
                 let start = &start;
                 threads.spawn(move || {
                     start.wait();
-                    edit_file(path, old, new).unwrap();
+                    edit_file(workspace, path, old, new).unwrap();
                 });
             }
         });
-        assert_eq!(read_edit_file(&path).unwrap(), "one\ntwo\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
     }
 
     #[cfg(unix)]
     #[test]
     fn native_edit_requires_addressing_a_symlink_target_directly() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("target");
-        let link = root.path().join("link");
-        create_file(&path, "original").unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let path = workspace.join("target");
+        let link = workspace.join("link");
+        create_file(&workspace, &path, "original").unwrap();
         std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert_eq!(read_edit_file(&link).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "original");
         assert!(
-            edit_file(&link, "original", "changed")
+            edit_file(&workspace, &link, "original", "changed")
                 .unwrap_err()
                 .to_string()
                 .contains("symlink leaf")
         );
-        assert_eq!(read_edit_file(&path).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
     }
 }

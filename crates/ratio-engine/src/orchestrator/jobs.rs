@@ -24,7 +24,7 @@ pub(super) struct JobPeer<'a> {
     pub shared_candidate: bool,
 }
 
-impl JobPeer<'_> {
+impl<'a> JobPeer<'a> {
     pub fn permits(&self, tool: &str) -> bool {
         self.profile().is_none_or(|profile| profile.allows(tool))
             && self
@@ -33,9 +33,30 @@ impl JobPeer<'_> {
     }
 
     pub fn profile(&self) -> Option<Profile> {
+        self.specialist().map(|specialist| specialist.profile)
+    }
+
+    pub fn specialist(&self) -> Option<&'a Specialist> {
         match &self.parent?.work {
-            Work::Specialist(specialist) => Some(specialist.profile),
+            Work::Specialist(specialist) => Some(specialist),
             Work::Tool(_) => None,
+        }
+    }
+}
+
+pub(super) fn specialist_mode(specialist: &Specialist) -> &'static str {
+    match specialist.profile {
+        Profile::Inspect if specialist.role.starts_with("worker_") => {
+            "You are in a read-only worker consultation. Delegating to another worker starts another consultation. Send findings or proposed edits to the requester. Rostered workers implement in Work."
+        }
+        Profile::Inspect => {
+            "You are in specialist inspection mode. Use the advertised tools and report findings to the requester."
+        }
+        Profile::Memory => {
+            "You are in memory mode. Use remember or recall for the requested evidence."
+        }
+        Profile::Operator => {
+            "You are in tool operator mode. Use the advertised MCP tools and report the result to the requester."
         }
     }
 }
@@ -287,7 +308,7 @@ impl Orchestrator<'_> {
                 let result = roles
                     .iter()
                     .map(|role| json!({"id":role.id,"name":role.name,"tools":role.profile,"description":if role.id.starts_with("worker_") {
-                        "Consult using the configured worker persona.".into()
+                        "Read-only consultation using this worker persona. Rostered implementation starts in Work after plan acknowledgement.".into()
                     } else {
                         clip(&role.instructions, 240)
                     }}))
@@ -407,7 +428,7 @@ impl Orchestrator<'_> {
                             || self.config.orchestration.allow_inspection_shell),
                     "shell is disabled for this agent or phase"
                 );
-                Tools::validate_shell(call)
+                Tools::validate_shell(call, &job.workspace, job.access)
             }
             "mcp_call" => {
                 ensure!(
@@ -445,10 +466,15 @@ impl Orchestrator<'_> {
         } else {
             Access::Inspect
         };
-        let system = self.system(scope.goal, &format!(
-            "{}\nYou are a temporary specialist. Work on the supplied task and reply with a compact result for the requesting agent. Cite concrete source references and report uncertainty.",
-            specialist.instructions
-        ), &job.workspace);
+        let system = self.system(
+            scope.goal,
+            &format!(
+                "{}\n{} Reply briefly with evidence and uncertainties.",
+                specialist.instructions,
+                specialist_mode(specialist),
+            ),
+            &job.workspace,
+        );
         self.step(
             &mut specialist.dialogue,
             self.config

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{Child, ChildStdin, ChildStdout},
     time::timeout,
 };
 
@@ -475,7 +475,7 @@ fn validated_request<'a>(
     Ok((input, server))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn run(
     sessions: &Connections,
     actor: &str,
@@ -550,8 +550,12 @@ async fn run_mode(
             .or_default()
             .clone();
         let mut connection = slot.lock().await;
-        if connection.is_none() {
-            *connection = Some(Client::open(server, workspace).await?);
+        if connection
+            .as_ref()
+            .is_none_or(|client| client.access != access)
+        {
+            *connection = None;
+            *connection = Some(Client::open(server, workspace, access).await?);
         }
         invoke(
             connection.as_mut().expect("client initialized"),
@@ -562,7 +566,7 @@ async fn run_mode(
         )
         .await
     } else {
-        let mut client = Client::open(server, workspace).await?;
+        let mut client = Client::open(server, workspace, access).await?;
         invoke(&mut client, server, access, operation, call_started).await
     }?;
     Ok((key, result))
@@ -779,7 +783,7 @@ pub async fn check(config: &Config, name: &str) -> Result<Value> {
     let listing = timeout(
         Duration::from_secs(config.orchestration.command_timeout_secs),
         async {
-            let mut client = Client::open(server, &config.cwd).await?;
+            let mut client = Client::open(server, &config.cwd, Access::Work).await?;
             discover(&mut client, server, Access::Work, None, schema_entry).await
         },
     )
@@ -803,6 +807,7 @@ pub async fn check(config: &Config, name: &str) -> Result<Value> {
 }
 
 struct Client {
+    access: Access,
     _child: Child,
     #[cfg(unix)]
     _group: super::ProcessGroup,
@@ -815,11 +820,14 @@ struct Client {
 }
 
 impl Client {
-    async fn open(server: &McpServer, workspace: &Path) -> Result<Self> {
-        let mut command = Command::new(&server.command);
+    async fn open(server: &McpServer, workspace: &Path, access: Access) -> Result<Self> {
+        let mut command = super::workspace_sandbox::command(
+            workspace,
+            &server.command,
+            matches!(access, Access::Work),
+        )?;
         command
             .args(&server.args)
-            .current_dir(workspace)
             .env_remove("OPENAI_API_KEY")
             .env_remove("RATIO_API_KEY")
             .stdin(Stdio::piped())
@@ -838,6 +846,7 @@ impl Client {
         let stdin = child.stdin.take().context("open MCP stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("open MCP stdout")?);
         let mut client = Self {
+            access,
             _child: child,
             #[cfg(unix)]
             _group: group,
@@ -1100,12 +1109,19 @@ mod tests {
                 arguments: json!({"server":"fixture","name":"query"}).to_string(),
             },
         };
-        for (actor, expected) in [("worker_1", 2), ("worker_1", 3), ("worker_2", 2)] {
+        for (actor, access, expected) in [
+            ("worker_1", Access::Inspect, 2),
+            ("worker_1", Access::Inspect, 3),
+            ("worker_2", Access::Inspect, 2),
+            ("worker_1", Access::Work, 2),
+            ("worker_1", Access::Work, 3),
+            ("worker_1", Access::Inspect, 2),
+        ] {
             let (_, Output::Response(result)) = run(
                 &sessions,
                 actor,
                 &servers,
-                Access::Inspect,
+                access,
                 &call,
                 directory.path(),
                 &Cell::new(false),

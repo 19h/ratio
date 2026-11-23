@@ -53,7 +53,7 @@ Ratio prints a private URL such as `http://127.0.0.1:52814/#access=...`. Open it
 
 Three things to know before the first run:
 
-- **Workers edit the project in place by default**, and their shell commands run with your permissions. Start on a clean Git branch, or enable [staged publication](#staged-publication) so nothing reaches your worktree before review.
+- **Workers edit the project in place by default.** Start on a clean Git branch, or enable [staged publication](#staged-publication) so nothing reaches your worktree before review.
 - **Runs have no limits by default.** Set token and time caps in [your first profile](#a-good-first-profile) before a long run.
 - **Ratio keeps its journal in `PROJECT/.ratio/`.** It contains transcripts and workspace data, so add `.ratio/` to the project's `.gitignore`.
 
@@ -189,6 +189,8 @@ ra -C /path/to/project --plan-only 'Add a --version flag to the CLI'
 Ratio's built-in Campaign Architect uses the request, the profile's tool policy, and root project manifests to propose a goal, roster, draft task graph, and acceptance gates. During coordination the team can revise dependencies and ownership. Ratio freezes the resulting plan before workers acknowledge it.
 
 If `verification_commands` is omitted, the generated campaign may select declared npm checks, Cargo tests, or Go tests when their runners are available. An explicit list controls verification, including `[]` to disable discovery. If `stage_workspace` is omitted, the campaign may select staging when an executable check is selected and the workspace is the root of a Git worktree with a commit. The configured `max_parallel_agents` remains the concurrency ceiling.
+
+During **Propose team**, the Setup agent uses the configured reviewer model to submit the roster and acceptance criteria. Use **Open setup timeline** on the run overview to inspect the brief, submitted arguments, and validation results. The automatic check field accepts catalog IDs. Requirements for checks outside the catalog, including checks for files the run will create, go into the team's acceptance criteria.
 
 ```sh
 ra -C PROJECT --config existing.toml --plan-only --plan-format toml 'Check the migration against the source records' > campaign.toml
@@ -499,7 +501,7 @@ A stakeholder addresses the reply to the requester. Ratio broadcasts it to all w
 
 ### On-demand work
 
-Agents can use `list_specialists` to find research, synthesis, adviser, memory, and tool operator roles, plus consultations using the configured workers' personas. `delegate` starts a separate conversation with a task and optional evidence references. Specialists can consult each other and return compact results. The tool operator uses configured MCP access within the caller's permissions.
+Agents can use `list_specialists` to find research, synthesis, adviser, memory, and tool operator roles, plus read-only consultations using the configured workers' personas. `delegate` starts a separate conversation with a task and optional evidence references. Worker consultations send findings or proposed edits to the requester. Rostered workers implement during the run's Work phase under the acknowledged plan. Refusals in restricted modes explain the current mode and the next action. The tool operator uses configured MCP access within the caller's permissions.
 
 `start_tool` runs an authorized shell or MCP call in the background. Both submission tools return a job ID. An agent can continue working, check `job_status`, or use `await_jobs` to release its agent slot until the jobs finish. Results enter the caller's context at a model request boundary. Tight context windows can use a single `jobs` tool with an operation and arguments. The **Jobs** tab under **Tools & files** links back to the calling turn and to each specialist conversation.
 
@@ -533,11 +535,12 @@ The reviewer and stakeholders can list directories, read workspace files, and in
 | `read_file` | Returns tagged UTF-8 lines or a byte range. Binary input automatically returns a hex and ASCII preview. |
 | `search_files` | Searches file lines by regex, or by literal text with `literal`. Narrow it with `path`, `glob`, and `ignore_case`, and add `context` lines. Rows carry the same line tags as `read_file`, so a match can be edited directly. |
 | `find_files` | Lists files matching a glob such as `*.rs` or `src/**/*.{ts,tsx}`. A pattern without a `/` matches the file name at any depth. |
-| `edit_file` | Applies one batch against a single snapshot. Use `tag` for a line, `tag..tag` for an inclusive range, `+tag` to insert before, or `tag+` to insert after. Range edits require the latest `snapshot_id`. |
+| `replace_text` | Replaces a unique exact substring using `path`, `old_text`, and `new_text`. Use empty `new_text` to delete it. |
+| `edit_file` | Applies tagged edits atomically. Pass `path` and an `edits` array of `{"target":"TAG","text":"replacement"}` objects. Use `TAG` for a line, `START..END` for a range, `+TAG` to insert before, or `TAG+` to insert after. Range edits require the latest `snapshot_id`. |
 | `create_file` | Creates a file only if its destination is absent. |
-| `shell` | Requires `workdir`, an absolute or workspace-relative directory or `null` to start at the active workspace root. Runs through `/bin/sh` on Unix or `cmd.exe` on Windows, with command timeouts, descendant process cleanup, and bounded output that keeps the start and the end of long streams. |
+| `shell` | Requires `workdir` to resolve inside the active workspace. Pass an absolute or workspace-relative directory, or `null` for the workspace root. Runs through `/bin/sh` with timeouts, descendant process cleanup, and bounded output. |
 
-Every role can search, including reviewers and stakeholders that have no shell. In a Git workspace the search tools skip ignored files, so build output and dependencies stay out of the results. Elsewhere they walk the directory tree. They never read `.git` or `.ratio`, and they skip binary files and files over 4 MiB. Results are sorted by path and capped. Pass the `after` value from a result to continue. A search stops after 10 seconds and returns what it found. Runs with a context window under 4,096 tokens are not offered the search tools, because every tool definition costs prompt space.
+Every role can search, including reviewers and stakeholders that have no shell. When sandboxed Git can inspect the workspace repository, search skips ignored files. Otherwise search walks the directory tree. It skips `.git`, `.ratio`, binary files, and files over 4 MiB. Results are sorted by path and capped. Pass the `after` value from a result to continue. A search stops after 10 seconds and returns what it found. Runs with a context window under 4,096 tokens omit the search tools and the separate `replace_text` tool to save prompt space. Tagged `edit_file` remains available to workers.
 
 Pass an array of complete shell commands, such as `{"workdir":"src","command":["git status --short","git diff --stat"]}`. Commands run in order in one shell and share its working directory, timeout, and output. Normal shell sequencing continues after a command returns a nonzero status. Ratio also accepts legacy script strings.
 
@@ -548,11 +551,13 @@ To make `shell` available during inspection, including before plan acknowledgeme
 allow_inspection_shell = true
 ```
 
-This defaults to `false`. With the option enabled, shell commands run with the operator's host permissions and can modify files. Native `create_file` and `edit_file` still require work access.
+This defaults to `false`. Ratio checks agent shell scripts before execution and refuses direct file output redirection, common file-writing utilities, and recognized inline script writes. Native file edits require work access.
+
+Ratio applies filesystem restrictions to shell commands, Git inspection, verification, and local stdio MCP processes and their descendants. Inspection runs with read-only workspace access. Work and verification processes can write within their active workspace, including a staged worker tree or verification copy. System runtime and toolchain paths have read-only access, and `/dev/null` remains available for output. Put build output and writable dependency caches inside the workspace. Subprocess tools fail closed on Windows and on Linux hosts without Landlock ABI 3 or newer. Native file tools remain available.
 
 Set `forbidden_tools = ["worker_2/shell"]` under `[constraints]` to disable the native shell tool for specific actor IDs throughout the run. The runner also refuses shell calls already queued in a saved conversation.
 
-Tagged reads and edits support files up to 4 MiB. Ratio uses Assist-style addressing with path-seeded 64-bit tags. Repeated lines carry occurrence information. A stale tag or overlap rejects the batch. Optional `line_hints` help locate nearby current lines when an anchor goes stale. Successful edits preserve file mode and return fresh tags. A unique substring replacement is also available via `old_text` and `new_text`.
+Tagged reads and edits support files up to 4 MiB. Ratio uses Assist-style addressing with path-seeded 64-bit tags. Repeated lines carry occurrence information. A stale tag or overlap rejects the batch. Optional `line_hints` help locate nearby current lines when an anchor goes stale. Successful edits preserve file mode and return fresh tags. Use `replace_text` for exact substring replacement.
 
 If a line read encounters binary data, `read_file` returns a hex preview from byte zero. To request a precise binary range, pass `{"path":"data/image.bin","hex":true,"offset":"0x100","length":64}`. `offset` starts at zero and `length` caps the number of source bytes. Both accept integers or `0x` strings. Hex reads default to 256 bytes. The header gives the actual half-open range and file size in hexadecimal. If the output cap shortened the range, use the displayed end as the next offset. Explicit byte ranges use byte positions only. Set `hex` to `false` to require UTF-8. `max_bytes` limits rendered output.
 
@@ -603,7 +608,7 @@ verification_commands = ["cargo test --locked --workspace"]
 
 Staging snapshots tracked edits and unignored untracked files. Worker deltas are merged in worker order within each completion wave. Verification runs in a separate copy and must pass against the candidate manifest for publication. Publication checks affected files against the baseline, leaves Git history and the index intact, and preserves unrelated local edits. Use regular files and UTF-8 paths, and ignore generated artifacts. File replacement is individually atomic where supported. An external process can still race the final check.
 
-Shell commands and local MCP subprocesses inherit the operator's host permissions. Staged ownership checks cover changes in the staged tree. Shell can act outside that tree or bypass native path ownership in a direct run. Keep the workspace, commands, and local Git configuration within your trust boundary.
+Subprocesses can read host files and use installed toolchains. Writable tools and verification commands are confined to the active workspace by the file-write sandbox. Linux Landlock leaves some metadata operations outside that boundary. Inspection tools run without workspace write access. Ratio gives Cargo a cache under `.ratio/cargo-cache` in the active workspace and clears inherited Rust compiler wrappers. Staged ownership checks still verify each worker's changes before merge. Native edits also enforce frozen ownership in direct runs. Network services and external MCP backends apply their own access policies.
 
 ## Context, limits, and automation
 

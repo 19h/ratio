@@ -170,7 +170,25 @@ impl Dialogue {
         let Some(group) = self.groups.back() else {
             return;
         };
-        let index = group.len().saturating_sub(1);
+        self.audit_tool_at(
+            actor,
+            group.len().saturating_sub(1),
+            call,
+            state,
+            result,
+            elapsed_ms,
+        );
+    }
+
+    pub(crate) fn audit_tool_at(
+        &self,
+        actor: &str,
+        index: usize,
+        call: &crate::api::ToolCall,
+        state: &str,
+        result: Option<(&str, &str)>,
+        elapsed_ms: Option<u64>,
+    ) {
         let key = self.audit_key(index);
         let job = result.and_then(|(output, _)| {
             matches!(

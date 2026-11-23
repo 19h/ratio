@@ -1745,6 +1745,7 @@ fn responses_transport_streams_tool_calls_and_round_trips_reasoning_items() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn staged_run_publishes_only_the_verified_candidate_and_preserves_the_index() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path();
@@ -1968,6 +1969,28 @@ fn diagnostics_script() -> &'static str {
     }
 }
 
+fn prepare_diagnostics(workspace: &Path) {
+    if cfg!(windows) {
+        std::fs::write(
+            workspace.join("diagnostics.txt"),
+            "workspace diagnostic status and context probe\n".repeat(200),
+        )
+        .unwrap();
+    }
+}
+
+fn diagnostic_call(id: &str) -> Value {
+    if cfg!(windows) {
+        tool(id, "read_file", json!({"path":"diagnostics.txt"}))
+    } else {
+        tool(
+            id,
+            "shell",
+            json!({"command":diagnostics_script(),"workdir":null}),
+        )
+    }
+}
+
 #[test]
 fn inspection_shell_opt_in_keeps_native_edits_gated() {
     let temp = tempfile::tempdir().unwrap();
@@ -2035,13 +2058,17 @@ persona = "Check fixture evidence."
                     .unwrap()["content"]
                     .as_str()
                     .unwrap();
-                let lines = output.lines().collect::<Vec<_>>();
-                assert!(
-                    lines
-                        .windows(3)
-                        .any(|lines| lines == ["stdout:", "inspection-probe", "inspection-done"]),
-                    "{output}"
-                );
+                if cfg!(windows) {
+                    assert!(output.contains("workspace sandbox unavailable"), "{output}");
+                } else {
+                    let lines = output.lines().collect::<Vec<_>>();
+                    assert!(
+                        lines.windows(3).any(
+                            |lines| lines == ["stdout:", "inspection-probe", "inspection-done"]
+                        ),
+                        "{output}"
+                    );
+                }
                 let history = request["messages"].to_string();
                 for tool in ["create_file", "edit_file"] {
                     assert!(history.contains(&format!("Tool error: tool {tool} is unavailable")));
@@ -2305,6 +2332,7 @@ instructions = "Use the work-only server during execution."
 #[test]
 fn direct_tool_loop_compacts_and_reviews() {
     let temp = tempfile::tempdir().unwrap();
+    prepare_diagnostics(temp.path());
     let mut work_calls = 0;
     let mut summaries = 0;
     let (endpoint, server) = mock(move |index, request| {
@@ -2328,13 +2356,10 @@ fn direct_tool_loop_compacts_and_reviews() {
                 return calls(&[
                     tool(
                         "create",
-                        "shell",
-                        json!({"command": if cfg!(windows) {
-                            format!("echo done>result.txt & {}", diagnostics_script())
-                        } else {
-                            format!("printf 'done\\n' > result.txt; {}", diagnostics_script())
-                        },"workdir":null}),
+                        "create_file",
+                        json!({"path":"result.txt","content":"done\n"}),
                     ),
+                    diagnostic_call("diagnostics"),
                     tool("read", "read_file", json!({"path":"result.txt"})),
                 ]);
             }
@@ -2348,11 +2373,7 @@ fn direct_tool_loop_compacts_and_reviews() {
                     );
                 }
                 work_calls += 1;
-                return calls(&[tool(
-                    &format!("work-{work_calls}"),
-                    "shell",
-                    json!({"command":diagnostics_script(),"workdir":null}),
-                )]);
+                return calls(&[diagnostic_call(&format!("work-{work_calls}"))]);
             }
             assert!(summaries > 0);
             assert!(messages.iter().any(|message| {
@@ -2436,8 +2457,8 @@ fn resume_does_not_replay_an_interrupted_tool() {
         0 => text("Append a line to result.txt once."),
         1 => calls(&[tool(
             "write",
-            "shell",
-            json!({"command":if cfg!(windows) {"echo once>>result.txt"} else {"printf 'once\\n' >> result.txt"},"workdir":null}),
+            "create_file",
+            json!({"path":"result.txt","content":"once\n"}),
         )]),
         _ => (
             400,
@@ -2532,6 +2553,7 @@ fn streamed_context_rejection_retries_with_compacted_history() {
 
 fn exercise_provider_context_limit(streamed: bool) {
     let temp = tempfile::tempdir().unwrap();
+    prepare_diagnostics(temp.path());
     let mut worker_requests = 0;
     let (endpoint, server) = mock(move |_, request| {
         let messages = request["messages"].as_array().unwrap();
@@ -2542,16 +2564,9 @@ fn exercise_provider_context_limit(streamed: bool) {
         }
         if system.contains("You are the worker") {
             worker_requests += 1;
-            let command = |id| {
-                tool(
-                    id,
-                    "shell",
-                    json!({"command":diagnostics_script(),"workdir":null}),
-                )
-            };
             return match worker_requests {
-                1 => calls(&[command("old")]),
-                2 => calls(&[command("recent")]),
+                1 => calls(&[diagnostic_call("old")]),
+                2 => calls(&[diagnostic_call("recent")]),
                 3 if streamed => stream_response(
                     &[
                         json!({"error":{"code":"context_length_exceeded","message":"Context window exceeded"}}),
@@ -2984,7 +2999,7 @@ persona = "Own worker_3.txt."
 "#,
             // Direct runs check these in the live workspace, which is only a
             // Git repository in the staged variant.
-            verification = if staged {
+            verification = if staged && !cfg!(windows) {
                 "verification_commands = [\"git diff --check\"]"
             } else {
                 ""
@@ -4009,6 +4024,116 @@ fn nested_specialist_jobs_release_the_only_slot_on_both_provider_apis() {
     }
 }
 
+#[test]
+fn worker_consultation_refusals_explain_the_mode_and_execution_handoff() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    seed_job_fixture(root, true);
+    let config = root.join("ratio.toml");
+    std::fs::write(
+        &config,
+        "[orchestration]\nmax_parallel_agents = 1\nallow_inspection_shell = true\n",
+    )
+    .unwrap();
+    let (endpoint, server) = mock(|_, request| {
+        let messages = request["messages"].as_array().unwrap();
+        let system = messages[0]["content"].as_str().unwrap();
+        let last = messages.last().unwrap();
+        let last_call = last["tool_call_id"].as_str();
+        let has_tool = |name| {
+            request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == name)
+        };
+        if system.starts_with("Consult using this worker persona") {
+            assert!(system.contains("read-only worker consultation"));
+            assert!(!has_tool("create_file") && !has_tool("shell") && !has_tool("start_tool"));
+            if last_call.is_none() {
+                return calls(&[
+                    tool(
+                        "consult-write",
+                        "create_file",
+                        json!({"path":"answer.txt","content":"from consultation"}),
+                    ),
+                    tool(
+                        "consult-shell",
+                        "shell",
+                        json!({"command":"echo mode-probe","workdir":null}),
+                    ),
+                    tool(
+                        "consult-background",
+                        "start_tool",
+                        json!({"tool":"shell","arguments":{"command":"echo mode-probe","workdir":null}}),
+                    ),
+                ]);
+            }
+            for id in ["consult-write", "consult-shell", "consult-background"] {
+                let result = messages
+                    .iter()
+                    .find(|message| message["tool_call_id"] == id)
+                    .unwrap()["content"]
+                    .as_str()
+                    .unwrap();
+                assert!(result.starts_with("REFUSED"), "{result}");
+                assert!(result.contains("read-only worker consultation"), "{result}");
+                assert!(
+                    result.contains("Rostered workers implement in Work"),
+                    "{result}"
+                );
+            }
+            return text("Proposed answer.txt to my requester.");
+        }
+        if has_tool("submit_verdict") {
+            return decision("approved", "The rostered worker wrote the answer.");
+        }
+        assert!(system.starts_with("You are parallel worker worker_1"));
+        assert!(has_tool("create_file"));
+        match last_call {
+            Some("catalog") => {
+                assert!(
+                    last["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Read-only consultation using this worker persona")
+                );
+                calls(&[tool(
+                    "consult",
+                    "delegate",
+                    json!({"role":"worker_1","task":"Propose the answer."}),
+                )])
+            }
+            Some("consult") => calls(&[tool("wait", "await_jobs", json!({"jobs":[1]}))]),
+            Some("wait") => {
+                assert!(messages.iter().any(|message| {
+                    message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("Proposed answer.txt"))
+                }));
+                calls(&[tool(
+                    "write",
+                    "create_file",
+                    json!({"path":"answer.txt","content":"from rostered worker"}),
+                )])
+            }
+            Some("write") => text("Wrote the answer."),
+            _ => calls(&[tool("catalog", "list_specialists", json!({}))]),
+        }
+    });
+    succeeded(&cli_window(
+        root,
+        &endpoint,
+        "8192",
+        &["--resume", "--config", config.to_str().unwrap()],
+    ));
+    assert_eq!(
+        std::fs::read_to_string(root.join("answer.txt")).unwrap(),
+        "from rostered worker"
+    );
+    server.join().unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn background_shell_allows_a_model_turn_and_defers_same_worker_mutation() {
@@ -4278,13 +4403,18 @@ fn interrupted_background_shell_is_reported_unknown_without_replay() {
 
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
+    std::fs::write(
+        root.join("verification.sh"),
+        "echo once >> dispatches\nsleep 30\n",
+    )
+    .unwrap();
     let run = seed_job_fixture(root, false);
     let (endpoint, server) = mock(|index, _| match index {
         0 => calls(&[tool(
             "start-once",
             "start_tool",
             json!({
-                "tool":"shell","arguments":{"command":["echo once >> dispatches","sleep 30"],"workdir":null}
+                "tool":"shell","arguments":{"command":["sh verification.sh"],"workdir":null}
             }),
         )]),
         1 => {
@@ -4365,8 +4495,8 @@ fn project_instructions_are_pinned_into_every_agent_prompt() {
             0 => text("Inspect the workspace."),
             1 => calls(&[tool(
                 "rewrite",
-                "shell",
-                json!({"workdir":null,"command":"echo Rewritten> AGENTS.md"}),
+                "replace_text",
+                json!({"path":"AGENTS.md","old_text":"Run make lint first.","new_text":"Rewritten"}),
             )]),
             2 => text("Instructions file rewritten."),
             3 => decision("approved", "Prompts kept the starting instructions."),
@@ -4603,10 +4733,10 @@ fn reasoning_effort_reaches_both_transports_with_role_overrides() {
 fn direct_runs_verify_the_workspace_and_a_failure_blocks_approval() {
     let profile = tempfile::tempdir().unwrap();
     let config = profile.path().join("ratio.toml");
-    // `git` behaves the same under sh and cmd.exe. The second command fails
-    // outside a repository.
+    // The second command fails outside a repository. On unsupported systems
+    // both verification commands fail before a shell can start.
     for (command, passes) in [
-        ("git --version", true),
+        ("git --version", !cfg!(windows)),
         ("git rev-parse --verify refs/heads/ratio-missing", false),
     ] {
         std::fs::write(
@@ -4631,6 +4761,9 @@ fn direct_runs_verify_the_workspace_and_a_failure_blocks_approval() {
                         "Verification 1: failed"
                     }));
                     assert!(!history.contains("Candidate SHA-256"));
+                    if cfg!(windows) {
+                        assert!(history.contains("workspace sandbox unavailable"));
+                    }
                     // The mock stops after a terminal verdict, and a failed
                     // check turns this approval into a repair request.
                     let (status, mut response) = decision("approved", "Checks reviewed.");
@@ -5055,6 +5188,99 @@ fn generated_campaign_defers_overlapping_draft_paths_to_worker_ipc() {
 }
 
 #[test]
+fn setup_audits_proposal_repairs_and_preserves_manual_verification() {
+    use ratio_engine::{audit::AuditFilter, session::Store};
+
+    const CHECK: &str =
+        "cargo build --release --workspace (must exit 0; captured output under docs/evidence/)";
+    let root = tempfile::tempdir().unwrap();
+    let (endpoint, server) = mock(|index, request| match index {
+        0 => {
+            let schema = &request["tools"][0]["function"];
+            assert_eq!(schema["name"], "submit_team");
+            assert_eq!(
+                schema["parameters"]["properties"]["campaign"]["properties"]["verification_checks"]
+                    ["maxItems"],
+                0
+            );
+            calls(&[tool("wrong", "inspect", json!({"path":"Cargo.toml"}))])
+        }
+        1 => {
+            assert!(
+                request["messages"]
+                    .to_string()
+                    .contains("expected submit_team")
+            );
+            calls(&[tool(
+                "team",
+                "submit_team",
+                json!({
+                    "goal":"Inspect the fixture", "message":"Prepared review",
+                    "workers":[{"name":"Inspector","persona":"Inspect the workspace"}],
+                    "reviewers":[], "stakeholders":[], "acceptance":["Record the result"],
+                    "campaign":{
+                        "tasks":[{"id":"inspect","worker":"worker_1","description":"Inspect",
+                            "depends_on":[],"acceptance":["Record the result"]}],
+                        "ownership":{"worker_1":[]},"rationale":"One read-only owner",
+                        "verification_checks":[CHECK]
+                    }
+                }),
+            )])
+        }
+        2 => {
+            assert!(request["messages"].to_string().contains(CHECK));
+            (
+                400,
+                json!({"error":{"message":"fixture ends after setup"},"test_terminal":true}),
+            )
+        }
+        _ => panic!("unexpected request {index}"),
+    });
+    let output = generated_campaign_command(root.path(), &endpoint)
+        .args(["--goal", "Inspect the fixture"])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("fixture ends after setup"));
+
+    let run = Store::open(root.path()).unwrap().load().unwrap();
+    assert_eq!(run.phase, ra::session::Phase::Plan);
+    let reader = Store::reader(root.path()).unwrap();
+    let setup = reader
+        .audit(run.run_id(), AuditFilter::default(), 50)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.actor == "setup_agent")
+        .collect::<Vec<_>>();
+    assert!(setup.iter().all(|event| event.phase == "ProposeTeam"));
+    let brief = setup.iter().find(|event| event.kind == "brief").unwrap();
+    assert!(
+        brief.data["text"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Ratio Campaign Architect")
+    );
+    for (name, state) in [("inspect", "refused"), ("submit_team", "completed")] {
+        let call = setup
+            .iter()
+            .find(|event| event.kind == "tool" && event.data["tool"] == name)
+            .unwrap();
+        let result = reader
+            .audit_outcome(run.run_id(), &call.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.data["state"], state);
+    }
+    let proposal = setup.iter().find(|event| event.kind == "proposal").unwrap();
+    let accepted: Value =
+        serde_json::from_str(proposal.data["text"]["text"].as_str().unwrap()).unwrap();
+    assert!(accepted["acceptance"].to_string().contains(CHECK));
+    assert_eq!(accepted["campaign"]["verification_checks"], json!([]));
+    assert_eq!(accepted["execution"]["verification_commands"], json!([]));
+}
+
+#[test]
 fn generated_campaign_freezes_discovered_verification_and_blocks_approval_on_failure() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -5069,6 +5295,11 @@ fn generated_campaign_freezes_discovered_verification_and_blocks_approval_on_fai
         match index {
             0 => {
                 assert!(messages.contains("cargo-test"));
+                assert_eq!(
+                    request["tools"][0]["function"]["parameters"]["properties"]["campaign"]["properties"]
+                        ["verification_checks"]["items"]["enum"],
+                    json!(["cargo-test"])
+                );
                 calls(&[tool(
                     "team",
                     "submit_team",
@@ -5301,9 +5532,7 @@ fn approved_run_continuation_restores_approval_and_runs_a_fresh_staged_cycle() {
             .unwrap(),
     );
     let profile = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(
-        profile.path(),
-        r#"
+    let configuration = r#"
 [orchestration]
 stage_workspace = true
 verification_commands = ["git diff --check"]
@@ -5315,9 +5544,16 @@ phases = ["review"]
 name = "Release owner"
 persona = "Check release requirements."
 phases = ["review"]
-"#,
-    )
-    .unwrap();
+"#;
+    let configuration = if cfg!(windows) {
+        configuration.replace(
+            "verification_commands = [\"git diff --check\"]",
+            "verification_commands = []",
+        )
+    } else {
+        configuration.to_owned()
+    };
+    std::fs::write(profile.path(), configuration).unwrap();
     let mut failed_discussion = false;
     let mut build_follow_up_findings = 0;
     let mut repaired_decision = false;
@@ -5545,5 +5781,128 @@ phases = ["review"]
         "Approved"
     );
     assert!(reader.metrics(&original.run_id).unwrap().provider_attempts > original_usage + 13);
+    server.join().unwrap();
+}
+
+#[test]
+fn shell_edit_refusals_lead_to_native_file_edits() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("note.txt"), "first\nsecond\n").unwrap();
+    let config = root.path().join("ratio.toml");
+    std::fs::write(&config, "[orchestration]\nallow_inspection_shell = true\n").unwrap();
+    let shell_call = |id| {
+        tool(
+            id,
+            "shell",
+            json!({
+                "command":["mkdir side-effect.txt", "echo replaced > note.txt"],
+                "workdir":null
+            }),
+        )
+    };
+    let (endpoint, server) = mock(move |index, request| {
+        let history = request["messages"].to_string();
+        match index {
+            0 => calls(&[shell_call("inspect-write")]),
+            1 => {
+                assert!(history.contains("REFUSED: Shell output redirection to a file is blocked"));
+                assert!(
+                    !request["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "replace_text")
+                );
+                text("Replace the first line and remove the second.")
+            }
+            2 => {
+                let schema = request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["function"]["name"] == "edit_file")
+                    .unwrap();
+                assert_eq!(
+                    schema["function"]["parameters"]["required"],
+                    json!(["path", "edits"])
+                );
+                calls(&[
+                    shell_call("worker-write"),
+                    tool(
+                        "background-write",
+                        "start_tool",
+                        json!({
+                            "tool":"shell","arguments":{"command":"echo value >> note.txt","workdir":null}
+                        }),
+                    ),
+                    tool(
+                        "missing-edit",
+                        "edit_file",
+                        json!({"path":"note.txt","snapshot_id":"unused"}),
+                    ),
+                ])
+            }
+            3 => {
+                assert!(history.contains("REFUSED: Shell output redirection to a file is blocked"));
+                assert!(
+                    history
+                        .matches("Shell output redirection to a file is blocked")
+                        .count()
+                        >= 2
+                );
+                assert!(history.contains("A snapshot_id alone cannot edit a file"));
+                calls(&[
+                    tool(
+                        "replace",
+                        "replace_text",
+                        json!({"path":"note.txt","old_text":"first","new_text":"changed"}),
+                    ),
+                    tool("read", "read_file", json!({"path":"note.txt"})),
+                ])
+            }
+            4 => {
+                let last = request["messages"].as_array().unwrap().last().unwrap()["content"]
+                    .as_str()
+                    .unwrap();
+                let tag = last
+                    .lines()
+                    .find(|line| line.ends_with("second"))
+                    .unwrap()
+                    .split_once('|')
+                    .unwrap()
+                    .0
+                    .split_whitespace()
+                    .last()
+                    .unwrap();
+                calls(&[tool(
+                    "remove",
+                    "edit_file",
+                    json!({"path":"note.txt","edits":[{"target":tag,"text":null}]}),
+                )])
+            }
+            5 => {
+                assert!(history.contains("1 tagged changes"), "{history}");
+                text("Native edits completed.")
+            }
+            6 => decision("approved", "Verified."),
+            _ => panic!("unexpected request {index}"),
+        }
+    });
+    succeeded(&cli_window(
+        root.path(),
+        &endpoint,
+        "8192",
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--goal",
+            "Edit the harmless note",
+        ],
+    ));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("note.txt")).unwrap(),
+        "changed\n"
+    );
+    assert!(!root.path().join("side-effect.txt").exists());
     server.join().unwrap();
 }

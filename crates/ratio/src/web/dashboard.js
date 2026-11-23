@@ -792,7 +792,8 @@ function overview() {
         data.request && data.request !== data.goal ? node("details", {}, node("summary", {}, "Original request"), pre(data.request)) : null),
       node("div", { class: "hero-field" }, caption("Phase"),
         node("strong", { class: "hero-title", "data-tone": endings.includes(phase) ? phase.toLowerCase() : "active" }, title(phase)),
-        node("span", { class: "hero-sub" }, `cycle ${data.run.cycle}`, flow.stopped ? pill(flow.stopped) : null)),
+        node("span", { class: "hero-sub" }, `cycle ${data.run.cycle}`, flow.stopped ? pill(flow.stopped) : null),
+        phase === "ProposeTeam" ? go("Open setup timeline", runUrl("history", { phase: "ProposeTeam" })) : null),
       phaseRail(phase, data.continuation)),
     continuationOverview(data),
     node("div", { class: "columns" },
@@ -807,7 +808,7 @@ function overview() {
             flow.verification.candidate ? code(flow.verification.candidate) : null] : "No receipt yet"],
           ["Verdict", data.verdict ? pill(data.verdict.verdict) : null],
           ["Assessment", data.assessment ? pre(data.assessment) : null],
-          ["Failure", data.latest_error ? [pre(data.latest_error.data.text), go("Open failure in timeline", entryUrl(data.latest_error.key))] : null],
+          ["Failure", data.latest_error ? [pre(asText(data.latest_error.data.text)), go("Open failure in timeline", entryUrl(data.latest_error.key))] : null],
         ])),
         section("Usage", data.metricsPending ? muted("Indexing checkpoint totals…") : null, facts(Object.entries(metrics).flatMap(([name, value]) => name === "token_breakdown"
           ? Object.entries(value).map(([flow, count]) => [title(flow) + " tokens", tokenCount(count)])
