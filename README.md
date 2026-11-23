@@ -288,7 +288,7 @@ ra -C PROJECT --web
 ra -C PROJECT --config ratio.toml --web --web-port 7350
 ```
 
-Open the private URL printed by Ratio. The dashboard binds to `127.0.0.1` and chooses a free port by default. Use `--web-port` for a stable address. Use **Start run** to enter a request, or select a run from workspace history.
+Open the private URL printed by Ratio. The dashboard binds to `127.0.0.1` and chooses a free port by default. Use `--web-port` for a stable address. Open **Start run** and enter a request, or click **Use TOML goal** to start with the profile's top-level `goal`. You can also select a run from workspace history.
 
 | View | Use it to |
 | --- | --- |

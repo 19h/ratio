@@ -415,7 +415,7 @@ dialog::backdrop { background: rgba(8, 7, 6, .8); }
 #action-hint { margin-bottom: 0.375rem; font-size: 0.75rem; }
 #action-text { width: 100%; resize: vertical; line-height: 1.5; }
 .action-error { color: var(--sig-err); font-size: 0.75rem; }
-#action-form > footer { border-bottom: 0; border-top: 0.0625rem solid var(--line-default); }
+#action-form > footer { border-bottom: 0; border-top: 0.0625rem solid var(--line-default); flex-wrap: wrap; }
 #action-form > footer button { padding: 0.1875rem 0.75rem; }
 
 @media (prefers-reduced-motion: reduce) { .dot.live, .connection[data-state="live"] i { animation: none; } }

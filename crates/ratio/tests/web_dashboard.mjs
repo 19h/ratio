@@ -162,7 +162,8 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
   });
   provider.listen(0,"127.0.0.1");
   await once(provider,"listening");
-  await writeFile(profile,`endpoint = "http://127.0.0.1:${provider.address().port}/v1"
+  await writeFile(profile,`goal = "Profile goal for the override test"
+endpoint = "http://127.0.0.1:${provider.address().port}/v1"
 model = "fixture-model"
 context_window = 8192
 output_tokens = 256
@@ -239,6 +240,7 @@ tools = ["inspect"]
     await page.getByLabel("Request",{exact:true}).fill("Inspect fixture MCP evidence");
     await page.locator("#submit-action").click();
     await page.getByRole("heading",{name:"Run overview"}).waitFor();
+  await page.getByText("Inspect fixture MCP evidence", { exact: true }).first().waitFor({ state: "attached" });
     await started;
     await page.locator('[data-preview-actor="worker_1"]').filter({hasText:"Inspect tool metadata and evidence."}).waitFor();
     assert.match(await page.locator("#connection").innerText(), /\b1 generating\b/i);
@@ -727,6 +729,8 @@ test("a broken profile is reported before a run starts", { timeout: 60_000 }, as
     assert.equal(escapedRequest, "set --context-window to the model's token limit");
     await page.locator("#new-run").click();
     assert.equal(await page.locator("#submit-action").isDisabled(), true);
+    const useGoal = page.getByRole("button", { name: "Use TOML goal", exact: true });
+    assert.equal(await useGoal.isDisabled(), true);
     await page.getByRole("button", { name: "Cancel", exact: true }).click();
     await writeFile(profile, settings + "context_window = 8192\n");
     await page.getByRole("button", { name: "Recheck", exact: true }).click();
@@ -734,6 +738,16 @@ test("a broken profile is reported before a run starts", { timeout: 60_000 }, as
     await page.getByText("None. A run continues until the reviewer approves or rejects it.", { exact: true }).waitFor();
     await page.locator("#new-run").click();
     assert.equal(await page.locator("#submit-action").isDisabled(), false);
+    await useGoal.click();
+    await page.getByText("Set a nonempty top-level goal in the TOML profile", { exact: true }).waitFor();
+    await writeFile(profile, settings + 'context_window = 8192\ngoal = "   "\n');
+    const blank = await fetch(address.origin + "/api/action", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, Origin: address.origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "blank-config-goal", action: "start_config" }),
+    });
+    assert.equal(blank.status, 409);
+    assert.equal((await blank.json()).error, "Set a nonempty top-level goal in the TOML profile");
   } finally {
     if (browser) await browser.close();
     const exited = once(child, "exit");
@@ -817,7 +831,7 @@ test("resume after restarting the dashboard preserves the run and refreshes tool
   provider.listen(0, "127.0.0.1");
   await once(provider, "listening");
 
-  const writeProfile = async () => {
+  const writeProfile = async (goal = "Inspect a fixture") => {
     const field = updated ? "new_subject" : "old_subject";
     const server = `
 const readline = require("node:readline");
@@ -833,7 +847,8 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
   process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:request.id,result})+"\\n");
 });
 `;
-    await writeFile(profile, `endpoint = "http://127.0.0.1:${provider.address().port}/v1"
+    await writeFile(profile, `goal = ${JSON.stringify(goal)}
+endpoint = "http://127.0.0.1:${provider.address().port}/v1"
 model = "${updated ? "updated-model" : "original-model"}"
 context_window = 8192
 output_tokens = 256
@@ -871,11 +886,21 @@ instructions = "${updated ? "Current" : "Initial"} fixture instructions."
     return json;
   };
   try {
-    await writeProfile();
+    await writeProfile("Earlier fixture goal");
     const first = await launch();
-    const launched = await api(first, "/api/action", { id: "start", action: "start", text: "Inspect a fixture" });
-    activeRun = launched.run_id;
-    assert.ok(activeRun);
+    browser = await chromium.launch();
+    const starter = await browser.newPage();
+    starter.setDefaultTimeout(10_000);
+    await starter.goto(first.href);
+    await starter.getByRole("heading", { name: "Runs", exact: true }).waitFor();
+    await starter.locator("#new-run").click();
+    assert.equal(await starter.getByLabel("Request", { exact: true }).inputValue(), "");
+    await writeProfile();
+    await starter.getByRole("button", { name: "Use TOML goal", exact: true }).click();
+    await starter.waitForURL(/\/run\/[\d-]+\/overview$/);
+    activeRun = new URL(starter.url()).pathname.split("/")[2];
+    await starter.getByText("Inspect a fixture", { exact: true }).first().waitFor();
+    await starter.close();
     await ready;
     const shared = await api(first, "/api/action", { id: "share", action: "create_share", run: activeRun });
     const shareUrl = new URL(shared.url);
@@ -893,7 +918,6 @@ instructions = "${updated ? "Current" : "Initial"} fixture instructions."
     const paused = await api(second, `/api/run/${activeRun}/live`);
     assert.equal(paused.paused, true);
     assert.equal(paused.pid, previous.pid);
-    browser = await chromium.launch();
     const visitor = await browser.newPage();
     let streamRequests = 0;
     await visitor.routeWebSocket("**/api/dashboard/socket", socket => {

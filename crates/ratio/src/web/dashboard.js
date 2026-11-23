@@ -1429,6 +1429,8 @@ function openAction(name, initial = "") {
   // A known-bad profile cannot start a run. Say why before the request is typed.
   const blocked = (name === "start" || name === "fork") && state.config?.ok === false;
   $("#submit-action").disabled = blocked;
+  $("#start-config").hidden = name !== "start";
+  $("#start-config").disabled = blocked;
   $(".action-error").textContent = blocked ? state.config.error : "";
   $(".action-error").hidden = !blocked;
   $("#action-dialog").showModal();
@@ -1532,17 +1534,26 @@ $("#global-search").addEventListener("submit", event => {
   navigate(runUrl("history", { q: new FormData(event.target).get("q") }));
 });
 $("#close-action").addEventListener("click", () => $("#action-dialog").close());
+$("#action-dialog").addEventListener("cancel", event => {
+  if ($("#close-action").disabled) event.preventDefault();
+});
 $("#action-form").addEventListener("submit", async event => {
   event.preventDefault();
-  const submit = $("#submit-action");
-  submit.disabled = true;
+  const controls = [$("#submit-action"), $("#start-config"), $("#close-action")];
+  for (const control of controls) control.disabled = true;
+  const fromConfig = event.submitter?.id === "start-config";
+  const { name, run, id } = actionState;
+  const errorLine = $(".action-error");
+  errorLine.hidden = true;
   try {
-    await sendAction(actionState.name, $("#action-text").value, actionState.run, actionState.id);
+    await sendAction(fromConfig ? "start_config" : name, fromConfig ? undefined : $("#action-text").value, run, id);
     $("#action-dialog").close();
   } catch (error) {
-    $(".action-error").textContent = error.message;
-    $(".action-error").hidden = false;
-  } finally { submit.disabled = false; }
+    errorLine.textContent = error.message;
+    errorLine.hidden = false;
+  } finally {
+    for (const control of controls) control.disabled = false;
+  }
 });
 document.addEventListener("keydown", event => {
   if ($("#action-dialog").open || $("#share-dialog").open || event.metaKey || event.ctrlKey || event.altKey

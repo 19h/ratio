@@ -46,7 +46,12 @@
         <textarea id="action-text" rows="7" spellcheck="false"></textarea>
         <p class="action-error" role="alert" hidden></p>
       </div>
-      <footer class="bar"><span class="spacer"></span><button type="button" id="close-action">Cancel</button><button type="submit" class="primary" id="submit-action">Submit</button></footer>
+      <footer class="bar">
+        <span class="spacer"></span>
+        <button type="button" id="close-action">Cancel</button>
+        <button type="submit" class="primary" id="submit-action">Submit</button>
+        <button type="submit" id="start-config" formnovalidate hidden>Use TOML goal</button>
+      </footer>
     </form>
   </dialog>
   <dialog id="share-dialog" aria-labelledby="share-title">

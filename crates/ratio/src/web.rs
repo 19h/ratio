@@ -1021,7 +1021,9 @@ impl Dashboard {
                 let lane = match action.action.as_str() {
                     "create_share" | "revoke_share" => &self.sharing,
                     "check_provider" => &self.provider,
-                    "start" | "resume" | "resume_saved" | "fork" => &self.lifecycle,
+                    "start" | "start_config" | "resume" | "resume_saved" | "fork" => {
+                        &self.lifecycle
+                    }
                     _ => &self.controls,
                 };
                 let permit = lane
@@ -1101,7 +1103,7 @@ impl Dashboard {
                     token.map(|token| format!("{}/run/{run}/overview#share={token}", site.origin));
                 json!({"active": create, "url": url})
             }
-            "start" | "resume" | "resume_saved" | "fork" => {
+            "start" | "start_config" | "resume" | "resume_saved" | "fork" => {
                 let resume = matches!(action.action.as_str(), "resume" | "resume_saved");
                 let active = control::request_control(
                     &self.workspace,
@@ -1129,7 +1131,7 @@ impl Dashboard {
                     let note = checked_note;
                     let mut args = app.launch_args.clone();
                     args.push("--dashboard-managed".into());
-                    if action_name != "start" {
+                    if resume || action_name == "fork" {
                         let run = run.as_deref().context("Choose a saved run")?;
                         let reader = Store::reader(&app.workspace)?;
                         let record = reader.run(run)?.context("Run not found")?;
@@ -1144,12 +1146,22 @@ impl Dashboard {
                             );
                             args.extend(["--resume".into(), "--run-id".into(), run.into()]);
                         }
-                    } else {
+                    } else if action_name == "start" {
                         ensure!(note.is_some(), "Enter a request to start a run");
                     }
                     if !resume {
                         // Report a broken profile here instead of in the runner log.
-                        app.effective_config()?;
+                        let config = app.effective_config()?;
+                        if action_name == "start_config" {
+                            ensure!(note.is_none(), "Use the profile goal or enter a request");
+                            ensure!(
+                                config
+                                    .goal
+                                    .as_deref()
+                                    .is_some_and(|goal| !goal.trim().is_empty()),
+                                "Set a nonempty top-level goal in the TOML profile"
+                            );
+                        }
                     }
                     if let Some(note) = note.as_deref() {
                         ensure!(note.len() <= 65_536 && !resume, "Invalid run request");
