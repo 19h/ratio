@@ -766,6 +766,14 @@ impl Config {
             goal.push_str("\n\nStartup acceptance criteria:\n");
             goal.push_str(&draft.acceptance.join("\n"));
         }
+        if let Some(warning) = draft
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.pending_ownership.as_deref())
+        {
+            goal.push_str("\n\n");
+            goal.push_str(warning);
+        }
         if let Some(campaign) = &draft.campaign {
             goal.push_str("\n\nDraft campaign for coordination:\n");
             goal.push_str(&serde_json::to_string_pretty(campaign)?);

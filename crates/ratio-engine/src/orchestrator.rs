@@ -369,7 +369,7 @@ impl<'a> Orchestrator<'a> {
                         system.push_str("\nUse inspection tools to verify the goal. Approve only when the available evidence establishes completion. Submit the final decision using submit_verdict as the sole tool call.");
                     }
                     if phase == Phase::FreezePlan {
-                        system.push_str("\nFreeze via submit_plan alone. Provide an assignment for each worker_N, including its write paths.");
+                        system.push_str("\nFreeze via submit_plan alone. Give each worker_N an assignment and exclusive write paths. For a shared file, designate one editor and have peers send their findings or proposed changes to that editor over IPC.");
                         if session.require_task_graph {
                             system.push_str("\nInclude one task per worker, explicit predecessor task IDs, and concrete acceptance criteria.");
                         }
@@ -2193,7 +2193,16 @@ impl<'a> Orchestrator<'a> {
                 role.push_str("Phase: coordinate. Native file tools are read-only. Identify your task, dependencies and exclusive write paths. Put conflicts and your proposed assignment in your final assessment for the lead reviewer.");
                 if peer_exchange {
                     let next = mailbox.id((index + 1) % workers.len());
-                    role.push_str(&format!("\nCall send_message to {next} before finishing, with your proposed task and exclusive write paths."));
+                    role.push_str(&format!("\nCall send_message to {next} before finishing, with your proposed task and exclusive write paths. Contact every worker whose proposed paths overlap yours. Agree on distinct files or subdirectories, or designate one editor per shared file and have peers send findings or proposed changes to that editor. Report the agreement and any unresolved overlaps to the lead reviewer."));
+                }
+                if let Some(warning) = session
+                    .campaign_execution
+                    .as_ref()
+                    .and_then(|execution| execution.pending_ownership.as_deref())
+                    .filter(|_| session.cycle == 1 && session.plan_attempt == 1)
+                {
+                    role.push('\n');
+                    role.push_str(warning);
                 }
                 session.dialogue.current_task()
             } else {
@@ -2207,6 +2216,9 @@ impl<'a> Orchestrator<'a> {
             };
             if ipc_enabled {
                 role.push_str(&format!("\nRoster:\n{roster}\n{}", ipc::BWP));
+                if enabling_work && workers.len() > 1 {
+                    role.push_str("\nSend changes proposed for a peer's files to their frozen owner over IPC.");
+                }
                 if !stakeholders.is_empty() {
                     role.push_str("\nAsk stakeholder_N to clarify requirements via send_message. All workers receive replies. Continue independent work. Flag plan changes for replanning.");
                 }
@@ -2529,7 +2541,7 @@ impl<'a> Orchestrator<'a> {
             Phase::Coordinate => (
                 Phase::FreezePlan,
                 format!(
-                    "Write the final execution plan based on the draft and coordination below. Give every worker_N an independent assignment and exclusive write paths, resolve conflicts and state shared validation. Workers execute concurrently as soon as the unanimous gate opens. The exact output will be frozen and must be acknowledged by every worker.\n{}\n\nWorker coordination:\n{excerpt}",
+                    "Write the final execution plan based on the draft and coordination below. Give every worker_N an assignment and exclusive write paths, resolve conflicts and state shared validation. Use task dependencies for handoffs that require a predecessor's output. Workers execute when the unanimous gate opens and their dependencies are complete. The exact output will be frozen and must be acknowledged by every worker.\n{}\n\nWorker coordination:\n{excerpt}",
                     session.dialogue.current_task()
                 ),
             ),
@@ -2905,12 +2917,14 @@ fn parse_campaign_plan(
     Ok(plan)
 }
 
+/// Check the draft's structure and paths. An overlap is an open coordination
+/// issue in a draft and a contract error in a plan submitted for freezing.
 pub(crate) fn validate_campaign_plan(
     graph: &TaskGraph,
     ownership: &std::collections::BTreeMap<String, Vec<WritePath>>,
     workers: &[Worker],
     workspace: &Path,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let call = serde_json::from_value(json!({
         "id": "draft",
         "type": "function",
@@ -2919,14 +2933,27 @@ pub(crate) fn validate_campaign_plan(
             "arguments": json!({"plan":"Draft campaign", "tasks":graph, "ownership":ownership}).to_string()
         }
     }))?;
-    parse_plan(&call, workers, workspace, true)?;
-    Ok(())
+    let submission = parse_plan_fields(&call, workers, workspace, true)?;
+    Ok(ownership_conflict(&submission.ownership))
 }
 
 fn parse_plan(
     call: &crate::api::ToolCall,
     workers: &[Worker],
-    workspace: &std::path::Path,
+    workspace: &Path,
+    require_graph: bool,
+) -> Result<FrozenSubmission> {
+    let submission = parse_plan_fields(call, workers, workspace, require_graph)?;
+    if let Some(conflict) = ownership_conflict(&submission.ownership) {
+        anyhow::bail!("{conflict}");
+    }
+    Ok(submission)
+}
+
+fn parse_plan_fields(
+    call: &crate::api::ToolCall,
+    workers: &[Worker],
+    workspace: &Path,
     require_graph: bool,
 ) -> Result<FrozenSubmission> {
     use serde::Deserialize;
@@ -3051,19 +3078,6 @@ fn parse_plan(
                     Err(error) => return Err(error.into()),
                 }
             }
-            for (other_index, other_paths) in ownership.iter().enumerate() {
-                if let Some(other) = other_paths
-                    .iter()
-                    .find(|other| other.includes(&entry.path) || entry.includes(&other.path))
-                {
-                    anyhow::bail!(
-                        "overlapping worker write paths: {id} claims {:?} and worker_{} claims {:?}. Assign distinct subdirectories or individual files",
-                        entry.path,
-                        other_index + 1,
-                        other.path
-                    );
-                }
-            }
         }
         paths.sort_by(|left, right| {
             left.path
@@ -3078,4 +3092,26 @@ fn parse_plan(
         graph: input.tasks,
         additional_checks: Vec::new(),
     })
+}
+
+fn ownership_conflict(ownership: &[Vec<WritePath>]) -> Option<String> {
+    for (index, paths) in ownership.iter().enumerate() {
+        for entry in paths {
+            for (other_index, other_paths) in ownership[..index].iter().enumerate() {
+                if let Some(other) = other_paths
+                    .iter()
+                    .find(|other| other.includes(&entry.path) || entry.includes(&other.path))
+                {
+                    return Some(format!(
+                        "overlapping worker write paths: worker_{} claims {:?} and worker_{} claims {:?}. Assign distinct subdirectories or individual files",
+                        index + 1,
+                        entry.path,
+                        other_index + 1,
+                        other.path
+                    ));
+                }
+            }
+        }
+    }
+    None
 }

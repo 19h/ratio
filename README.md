@@ -195,7 +195,7 @@ ra -C PROJECT --config existing.toml --plan-only --plan-format toml 'Check the m
 ra -C PROJECT --config campaign.toml --headless
 ```
 
-The export captures startup settings, so Ratio still coordinates and freezes the plan on launch. Supply provider credentials through the usual environment or CLI inputs. Profiles with custom provider headers or URL credentials can use the JSON preview.
+The export captures startup settings, so Ratio still coordinates and freezes the plan on launch. Overlapping draft write paths are flagged in the proposal and carried into the exported goal. During read-only coordination, workers use IPC to agree on distinct paths or nominate one editor for a shared file and send that editor their contributions. The lead reviewer must freeze exclusive write paths before workers can acknowledge the plan and start editing. Supply provider credentials through the usual environment or CLI inputs. Profiles with custom provider headers or URL credentials can use the JSON preview.
 
 ### When a run does not start
 
@@ -207,7 +207,7 @@ The start page and the **Start run** dialog report a profile that cannot be load
 | The start page or **Start run** shows `set --context-window to the model's token limit` | `context_window` is missing. | Add `context_window` to the profile and click **Recheck**. |
 | **Start run** shows `detached process exited during startup ... See .../.ratio/runner-....log` | The run stopped while starting. The log names the reason. | Open the log, fix the cause it names, and click **Start run** again. |
 | `ra: invalid config ...: unknown field` | A key is misspelled or sits in the wrong table, such as a limit outside `[orchestration]`. | Fix the key. The message lists the keys Ratio accepts at that level. |
-| The run stays in the Team phase, the log repeats `Provider retry`, and the run fails with `Connection refused` | The endpoint is unreachable. | Check the URL and port, and that the local server is running. |
+| The log repeats `Provider retry` with `Connection refused` | The endpoint is unreachable. | Check the URL and port, and that the local server is running. |
 | The provider answers 401 or 403 | The key is missing, wrong, or not visible to the dashboard. | Export `RATIO_API_KEY` in the same shell, then restart `ra --web`. |
 | The provider rejects `stream_options` | The gateway does not report usage on streams. | Set `stream_usage = false` under `[provider]`. |
 | The provider rejects `max_completion_tokens` | The gateway predates that field. | Set `legacy_max_tokens = true` at the top level of the profile. |
@@ -624,6 +624,8 @@ An agent that reaches `max_tool_rounds` is not stopped mid-task. Its tools close
 Ratio records usage for all runs. Provider attempts include retries and compaction. Token reservations use estimated input plus requested output and reconcile against usage when reported. Definite rate-limit and context rejections without usage release the token reservation. Ambiguous failures retain it. The active clock stops after an acknowledged pause reaches a request boundary and running tools settle.
 
 After a run stops at its token, provider-attempt, or active-runtime limit, update the cap and use **Resume saved** or `--resume --run-id RUN_ID`. Ratio restores the checkpoint before the stop and keeps the same run ID, history, and accumulated usage.
+
+Runs retry transient provider errors, including HTTP 429, indefinitely by default. Ratio backs off between attempts and honors longer provider `Retry-After` delays. Each retry counts toward the configured provider-attempt limit, and the active-runtime limit includes the wait.
 
 ### Metrics and evaluation
 

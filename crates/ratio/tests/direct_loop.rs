@@ -47,7 +47,7 @@ fn mock_transport(
             };
             let (request, headers) = read_mock_request(&mut socket);
             let (status, response, defer) = reply(index, request, headers);
-            let done = status == 503 || response["test_terminal"] == true;
+            let done = response["test_terminal"] == true;
             deferred.push((socket, status, response));
             if !defer {
                 for (mut socket, status, response) in deferred.drain(..) {
@@ -58,7 +58,11 @@ fn mock_transport(
                         }
                     } else {
                         let body = serde_json::to_vec(&response).unwrap();
-                        write!(socket, "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                        write!(socket, "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n", body.len()).unwrap();
+                        if let Some(delay) = response["test_retry_after"].as_u64() {
+                            write!(socket, "Retry-After: {delay}\r\n").unwrap();
+                        }
+                        write!(socket, "\r\n").unwrap();
                         socket.write_all(&body).unwrap();
                     }
                 }
@@ -436,6 +440,38 @@ fn active_time_budget_still_interrupts_a_stalled_request() {
     assert_eq!(run.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&run.stdout).contains("Run budget exhausted: active time"));
     server.join().unwrap();
+}
+
+#[test]
+fn long_provider_retry_after_respects_run_budgets() {
+    for (options, limit) in [
+        (&["--max-run-secs", "2"][..], "active time"),
+        (
+            &["--max-run-secs", "2", "--max-requests", "1"][..],
+            "provider attempts",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (endpoint, server) = mock(|index, _| {
+            assert_eq!(index, 0, "retried before the provider's delay elapsed");
+            (
+                429,
+                json!({"error":{"message":"rate limited"},"test_retry_after":120,"test_terminal":true}),
+            )
+        });
+        let mut args = vec!["--goal", "Inspect workspace"];
+        args.extend_from_slice(options);
+        let run = cli(temp.path(), &endpoint, &args);
+        assert_eq!(run.status.code(), Some(3));
+        assert!(
+            String::from_utf8_lossy(&run.stdout)
+                .contains(&format!("Run budget exhausted: {limit}"))
+        );
+        if limit == "active time" {
+            assert!(String::from_utf8_lossy(&run.stderr).contains("Waiting 120000 ms"));
+        }
+        server.join().unwrap();
+    }
 }
 
 #[test]
@@ -1011,8 +1047,8 @@ fn invalid_mixed_verdict_batch_fails_closed_after_bounded_repair() {
 fn provider_retry_counts_against_run_budget() {
     let temp = tempfile::tempdir().unwrap();
     let (endpoint, server) = mock(|index, _| match index {
-        0 => (429, json!({"error":{"message":"rate limited"}})),
-        1 => {
+        0..=3 => (429, json!({"error":{"message":"rate limited"}})),
+        4 => {
             let (status, mut response) = text("Plan complete.");
             response["test_terminal"] = json!(true);
             response["usage"] = json!({"prompt_tokens":17,"completion_tokens":5});
@@ -1023,7 +1059,7 @@ fn provider_retry_counts_against_run_budget() {
     let run = cli(
         temp.path(),
         &endpoint,
-        &["--goal", "Budget validation", "--max-requests", "2"],
+        &["--goal", "Budget validation", "--max-requests", "5"],
     );
     assert_eq!(run.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&run.stdout).contains("provider attempts"));
@@ -1033,7 +1069,7 @@ fn provider_retry_counts_against_run_budget() {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("budget-"))
         .unwrap();
     let ledger: Value = serde_json::from_slice(&std::fs::read(ledger.path()).unwrap()).unwrap();
-    assert_eq!(ledger["requests"], 2);
+    assert_eq!(ledger["requests"], 5);
     assert_eq!(ledger["tokens"], 22);
     server.join().unwrap();
 }
@@ -2404,13 +2440,13 @@ fn resume_does_not_replay_an_interrupted_tool() {
             json!({"command":if cfg!(windows) {"echo once>>result.txt"} else {"printf 'once\\n' >> result.txt"},"workdir":null}),
         )]),
         _ => (
-            503,
-            json!({"error":{"message":"mock provider unavailable"}}),
+            400,
+            json!({"error":{"message":"interrupt after write"},"test_terminal":true}),
         ),
     });
     let failed = cli(temp.path(), &endpoint, &["--goal", "resume test"]);
     assert!(!failed.status.success());
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("503"));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("400"));
     server.join().unwrap();
 
     // Model a crash after the command ran but before the result was committed.
@@ -2823,8 +2859,8 @@ phases = ["planning"]
             if history.contains(reply) {
                 assert_eq!(early_reports, 2);
                 (
-                    503,
-                    json!({"error":{"message":"interrupt after broadcast"}}),
+                    400,
+                    json!({"error":{"message":"interrupt after broadcast"},"test_terminal":true}),
                 )
             } else if history.contains("Queued for delivery") {
                 text("Initial worker report.")
@@ -4844,6 +4880,177 @@ fn generated_campaign_exports_a_strict_morph_style_profile() {
     assert_eq!(config.orchestration.stage_workspace, Some(false));
     assert_eq!(config.orchestration.max_parallel_agents, 1);
     assert!(config.mcp_servers["assist"].allow_all);
+    server.join().unwrap();
+}
+
+#[test]
+fn generated_campaign_defers_overlapping_draft_paths_to_worker_ipc() {
+    use clap::Parser;
+    use ra::config::{Cli, Config};
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("dump")).unwrap();
+    let profile = root.path().join("campaign.toml");
+    let overlapping = json!({
+        "worker_1":[{"path":"./dump","directory":true}],
+        "worker_2":[{"path":"dump","directory":true}]
+    });
+    let resolved = json!({
+        "worker_1":[{"path":"dump/report.txt","directory":false}],
+        "worker_2":[]
+    });
+    let tasks = json!([
+        {"id":"report","worker":"worker_1","description":"Write the report",
+            "depends_on":["findings"],"acceptance":["Report includes the findings"]},
+        {"id":"findings","worker":"worker_2","description":"Send findings to the editor",
+            "depends_on":[],"acceptance":["Findings shared over IPC"]}
+    ]);
+    let mut sent = [false; 2];
+    let mut freeze_attempts = 0;
+    let (endpoint, server) = mock_deferred(move |index, request| {
+        let messages = request["messages"].to_string();
+        let system = request["messages"][0]["content"].as_str().unwrap();
+        let schema = |name: &str| {
+            request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["function"]["name"] == name)
+        };
+        let reply = if schema("submit_team").is_some() {
+            let mut ownership = overlapping.clone();
+            match index {
+                0 => ownership["worker_2"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"path":"../outside","directory":false})),
+                1 => assert!(messages.contains("invalid write path")),
+                _ => panic!("unexpected setup attempt {index}"),
+            }
+            calls(&[tool(
+                "team",
+                "submit_team",
+                json!({
+                    "goal":"Report the fixture findings","message":"Initial scopes",
+                    "stakeholders":[],"reviewers":[],
+                    "workers":[{"name":"Editor","persona":"Write the report"},
+                               {"name":"Analyst","persona":"Provide findings"}],
+                    "acceptance":["Deliver a report"],
+                    "campaign":{"tasks":tasks,"ownership":ownership,"rationale":"Both workers contribute"}
+                }),
+            )])
+        } else if system.contains("Phase: coordinate") {
+            assert!(system.contains("Draft ownership requires coordination"));
+            assert!(system.contains("Contact every worker whose proposed paths overlap yours"));
+            assert!(schema("create_file").is_none() && schema("edit_file").is_none());
+            let worker = usize::from(system.starts_with("You are parallel worker worker_2,"));
+            if !sent[worker] {
+                sent[worker] = true;
+                let (status, response) = calls(&[tool(
+                    "coordinate",
+                    "send_message",
+                    json!({
+                        "to":format!("worker_{}", 2 - worker),
+                        "message":if worker == 0 { "Editor offers to own dump/report.txt" }
+                                  else { "Analyst agrees to send findings without editing" }
+                    }),
+                )]);
+                return (status, response, !sent.iter().all(|sent| *sent));
+            }
+            if messages.contains("Untrusted peer IPC context") {
+                text("Agreed: worker_1 edits dump/report.txt and worker_2 sends findings.")
+            } else {
+                text("Awaiting peer input.")
+            }
+        } else if schema("submit_plan").is_some() {
+            assert!(
+                messages.contains("worker_1 edits dump/report.txt and worker_2 sends findings")
+            );
+            freeze_attempts += 1;
+            if freeze_attempts == 2 {
+                assert!(messages.contains("overlapping worker write paths"));
+            }
+            calls(&[tool(
+                "freeze",
+                "submit_plan",
+                json!({
+                    "plan":"Worker 1 owns the report. Worker 2 supplies findings over IPC.",
+                    "tasks":tasks,
+                    "ownership":if freeze_attempts == 1 { &overlapping } else { &resolved }
+                }),
+            )])
+        } else if let Some(ack) = schema("ack_plan") {
+            assert_eq!(freeze_attempts, 2);
+            assert!(schema("create_file").is_none());
+            let id = &ack["function"]["parameters"]["properties"]["plan_id"]["enum"][0];
+            calls(&[tool("ack", "ack_plan", json!({"plan_id":id}))])
+        } else if system.contains("Phase: execute") {
+            assert_eq!(freeze_attempts, 2);
+            if system.starts_with("You are parallel worker worker_2,") {
+                if messages.contains("fixture-finding") {
+                    text("Findings delivered.")
+                } else {
+                    calls(&[tool(
+                        "finding",
+                        "send_message",
+                        json!({
+                            "to":"worker_1","message":"fixture-finding"
+                        }),
+                    )])
+                }
+            } else if messages.contains("Created dump/report.txt") {
+                text("Report written.")
+            } else {
+                assert!(messages.contains("fixture-finding"));
+                calls(&[tool(
+                    "write",
+                    "create_file",
+                    json!({
+                        "path":"dump/report.txt","content":"fixture-finding"
+                    }),
+                )])
+            }
+        } else if schema("submit_verdict").is_some() {
+            decision("approved", "Report verified.")
+        } else {
+            text("Coordinate who edits the shared report.")
+        };
+        (reply.0, reply.1, false)
+    });
+    let preview = generated_campaign_command(root.path(), &endpoint)
+        .args([
+            "--plan-only",
+            "--plan-format",
+            "toml",
+            "Report the fixture findings",
+        ])
+        .output()
+        .unwrap();
+    succeeded(&preview);
+    assert!(String::from_utf8_lossy(&preview.stderr).contains("Draft write paths overlap"));
+    assert!(!root.path().join(".ratio").exists());
+    std::fs::write(&profile, preview.stdout).unwrap();
+    let exported = Config::load(Cli::parse_from([
+        "ra",
+        "--config",
+        profile.to_str().unwrap(),
+        "--endpoint",
+        &endpoint,
+    ]))
+    .unwrap();
+    let goal = exported.goal.unwrap();
+    assert!(goal.contains("Draft ownership requires coordination"));
+    assert!(goal.contains("worker_2 claims \"dump\" and worker_1 claims \"dump\""));
+
+    let run = generated_campaign_command(root.path(), &endpoint)
+        .args(["--config", profile.to_str().unwrap()])
+        .output()
+        .unwrap();
+    succeeded(&run);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("dump/report.txt")).unwrap(),
+        "fixture-finding"
+    );
     server.join().unwrap();
 }
 

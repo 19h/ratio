@@ -209,6 +209,15 @@ async fn run(mut cli: Cli) -> Result<u8> {
         let api = ra::api::Api::new(&config, Reporter::Terminal, budget)?;
         let proposal =
             ra::setup::refine(&config, &api, &draft, "Propose the team for this request.").await?;
+        if proposal
+            .execution
+            .as_ref()
+            .is_some_and(|execution| execution.pending_ownership.is_some())
+        {
+            eprintln!(
+                "Draft write paths overlap. The proposal carries them forward for read-only coordination."
+            );
+        }
         match plan_format.unwrap_or(PlanFormat::Json) {
             PlanFormat::Json => println!("{}", serde_json::to_string_pretty(&proposal)?),
             PlanFormat::Toml => print!("{}", config.export_campaign(&proposal)?),

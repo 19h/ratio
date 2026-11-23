@@ -44,6 +44,8 @@ pub struct Execution {
     pub selected_checks: Vec<Check>,
     pub available_checks: Vec<Check>,
     pub verification_from_profile: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_ownership: Option<String>,
 }
 
 impl Execution {
@@ -93,18 +95,24 @@ impl WorkspaceFacts {
             selected_checks: Vec::new(),
             available_checks: self.checks.clone(),
             verification_from_profile: limits.verification_commands.is_some(),
+            pending_ownership: None,
         };
         if let Some(campaign) = campaign {
             ensure!(
                 !campaign.rationale.trim().is_empty(),
                 "campaign requires a rationale"
             );
-            crate::orchestrator::validate_campaign_plan(
+            let conflict = crate::orchestrator::validate_campaign_plan(
                 &campaign.tasks,
                 &campaign.ownership,
                 workers,
                 &config.cwd,
             )?;
+            execution.pending_ownership = conflict.map(|conflict| {
+                format!(
+                    "Draft ownership requires coordination. Detected {conflict}. Resolve all overlaps through read-only worker IPC before freezing the plan."
+                )
+            });
             if let Some(width) = campaign.max_parallel_agents {
                 ensure!(
                     (1..=limits.max_parallel_agents).contains(&width),

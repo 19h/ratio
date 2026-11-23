@@ -242,12 +242,13 @@ impl Api {
         for spec in specs {
             let started = std::time::Instant::now();
             let result = self
-                .complete_for(
-                    "Provider check",
+                .complete_with_retries(
+                    ("Provider check", "Provider check"),
                     spec,
                     &[&system, &request],
                     &tools,
                     config.output_tokens.min(256),
+                    Some(2),
                 )
                 .await;
             let (tool_call, error) = match &result {
@@ -304,9 +305,22 @@ impl Api {
         tools: &[Value],
         output_tokens: usize,
     ) -> Result<Completion, ApiError> {
+        self.complete_with_retries((actor, label), model, messages, tools, output_tokens, None)
+            .await
+    }
+
+    async fn complete_with_retries(
+        &self,
+        (actor, label): (&str, &str),
+        model: ModelSpec<'_>,
+        messages: &[&Message],
+        tools: &[Value],
+        output_tokens: usize,
+        retry_limit: Option<u32>,
+    ) -> Result<Completion, ApiError> {
         let prompt = estimate(messages, tools);
         let mut last_http = None;
-        let mut attempt = 0;
+        let mut attempt = 0u32;
         let mut control = self.reporter.generation_control();
         loop {
             let state = control
@@ -327,6 +341,7 @@ impl Api {
                     None => pending::<()>().await,
                 }
             };
+            tokio::pin!(cancelled);
             let completion =
                 self.complete_once(model, messages, tools, output_tokens, &tokens, &mut preview);
             let result = async {
@@ -340,7 +355,7 @@ impl Api {
             };
             let result = tokio::select! {
                 biased;
-                () = cancelled => return Err(ApiError::Cancelled),
+                () = &mut cancelled => return Err(ApiError::Cancelled),
                 result = result => result,
             };
             drop(preview);
@@ -349,7 +364,7 @@ impl Api {
                 Ok(completion) => return Ok(completion),
                 Err(error) => error,
             };
-            let backoff = Duration::from_millis(if attempt == 0 { 250 } else { 1000 });
+            let backoff = Duration::from_millis((250u64 << attempt.min(7)).min(30_000));
             let wait = match &error {
                 ApiError::Status {
                     status: 408 | 429 | 500 | 502 | 503 | 504,
@@ -368,19 +383,15 @@ impl Api {
                 }
                 _ => return Err(error),
             };
-            if attempt == 2
-                || wait > Duration::from_secs(30)
-                || self
-                    .budget
-                    .remaining()
-                    .is_some_and(|remaining| wait >= remaining)
-            {
+            if retry_limit.is_some_and(|limit| attempt >= limit || wait > Duration::from_secs(30)) {
                 return Err(if matches!(error, ApiError::Status { .. }) {
                     error
                 } else {
                     last_http.unwrap_or(error)
                 });
             }
+            self.budget
+                .ensure_available(prompt.saturating_add(output_tokens) as u64)?;
             self.reporter.emit(
                 Kind::Info,
                 "Provider retry",
@@ -389,8 +400,15 @@ impl Api {
             if matches!(error, ApiError::Status { .. }) {
                 last_http = Some(error);
             }
-            tokio::time::sleep(wait).await;
-            attempt += 1;
+            tokio::select! {
+                biased;
+                () = &mut cancelled => return Err(ApiError::Cancelled),
+                () = self.budget.until_exhausted() => {
+                    return Err(anyhow::anyhow!("run budget exhausted: active time").into());
+                }
+                () = tokio::time::sleep(wait) => {}
+            }
+            attempt = attempt.saturating_add(1);
         }
     }
 
@@ -579,13 +597,10 @@ impl Api {
         tokens: &TokenProgress<'_>,
     ) -> Result<Completion, ApiError> {
         let status = response.status();
-        let retry_after = response.headers().get(header::RETRY_AFTER).map(|value| {
-            value
-                .to_str()
-                .ok()
-                .and_then(retry_delay)
-                .unwrap_or(Duration::MAX)
-        });
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok().and_then(retry_delay));
         let limit_bytes = if status.is_success() {
             MAX_RESPONSE_BYTES
         } else {

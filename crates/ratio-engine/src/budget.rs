@@ -194,7 +194,7 @@ impl Budget {
         state.save()
     }
 
-    pub fn reserve(&self, tokens: u64) -> Result<()> {
+    pub(crate) fn ensure_available(&self, tokens: u64) -> Result<()> {
         let mut state = self.state.borrow_mut();
         let limit = if self
             .elapsed_ms
@@ -218,6 +218,12 @@ impl Budget {
             state.exhausted = Some(limit);
             anyhow::bail!("run budget exhausted: {limit}");
         }
+        Ok(())
+    }
+
+    pub fn reserve(&self, tokens: u64) -> Result<()> {
+        self.ensure_available(tokens)?;
+        let mut state = self.state.borrow_mut();
         state.ledger.requests = state.ledger.requests.saturating_add(1);
         state.ledger.tokens = state.ledger.tokens.saturating_add(tokens);
         state.save()

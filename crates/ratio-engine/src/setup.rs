@@ -54,6 +54,14 @@ impl Draft {
 
     pub(crate) fn apply(self, session: &mut Session) {
         session.goal = self.goal;
+        if let Some(warning) = self
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.pending_ownership.as_deref())
+        {
+            session.dialogue.task.push_str("\n\n");
+            session.dialogue.task.push_str(warning);
+        }
         if let Some(campaign) = &self.campaign {
             session.dialogue.task.push_str(&format!(
                 "\nDraft campaign for coordination:\n{}",
