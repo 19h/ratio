@@ -3302,7 +3302,12 @@ persona = "Own worker_3.txt."
                 if !staged && freeze_attempts == 2 {
                     assert!(all_messages.contains("worker_3 claims"));
                     assert!(all_messages.contains("worker_1 claims"));
-                    assert!(all_messages.contains("tools/generate.py"));
+                    let conflicting_path = format!("{:?}", Path::new("tools").join("generate.py"));
+                    assert!(messages.iter().any(|message| {
+                        message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains(&conflicting_path))
+                    }));
                 }
             }
             (calls(&[tool("plan", "submit_plan", submission)]), false)
