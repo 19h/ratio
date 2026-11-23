@@ -276,7 +276,9 @@ impl Ui {
                                 _ => {}
                             },
                             result = &mut request => break Some(result),
-                            Some(event) = self.events.recv() => self.view.push_event(event),
+                            Some(event) = self.events.recv() => {
+                                self.view.push_event(event);
+                            }
                         }
                     }
                 };
@@ -406,11 +408,11 @@ impl Ui {
                     }
                 }
                 Some(event) = self.events.recv() => {
-                    redraw = true;
-                    self.view.push_event(event);
-                    for _ in 0..127 {
-                        let Ok(event) = self.events.try_recv() else { break };
-                        self.view.push_event(event);
+                    if self.view.push_event_batch(event, &mut self.events) {
+                        self.draw(None, Mode::Running)?;
+                        redraw = false;
+                    } else {
+                        redraw = true;
                     }
                 },
                 _ = workflow_tick.tick() => {
@@ -433,7 +435,9 @@ impl Ui {
             }
         };
         while let Ok(event) = self.events.try_recv() {
-            self.view.push_event(event);
+            if self.view.push_event_batch(event, &mut self.events) {
+                self.draw(None, Mode::Running)?;
+            }
         }
         if let Some(event) = reader.latest_event(&run_id)? {
             self.view.set_workflow(event.workflow);
@@ -609,10 +613,25 @@ impl View {
         }
     }
 
-    fn push_event(&mut self, event: Event) {
+    /// A tool start gets a frame before a queued result can overwrite its live row.
+    fn push_event_batch(&mut self, first: Event, events: &mut UnboundedReceiver<Event>) -> bool {
+        if self.push_event(first) {
+            return true;
+        }
+        for _ in 0..127 {
+            let Ok(event) = events.try_recv() else { break };
+            if self.push_event(event) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Records one event, returning whether it started a tool call.
+    fn push_event(&mut self, event: Event) -> bool {
         if let Some(generation) = event.generation {
             self.agents.generation(generation);
-            return;
+            return false;
         }
         if let Some(network) = event.network {
             if let NetworkEvent::Roster(roster) = &network {
@@ -621,22 +640,24 @@ impl View {
                 }
             }
             self.network.ingest(network);
-            return;
+            return false;
         }
         if matches!(event.kind, Kind::Phase) {
             self.status.clone_from(&event.title);
         }
         if let Some(actor) = event.actor {
-            self.agents
+            let started = self
+                .agents
                 .observe(&actor, event.kind, &event.title, &event.body);
             self.push(
                 event.kind,
                 &format!("{actor} / {}", event.title),
                 &event.body,
             );
-        } else {
-            self.push(event.kind, &event.title, &event.body);
+            return started;
         }
+        self.push(event.kind, &event.title, &event.body);
+        false
     }
 
     fn push(&mut self, kind: Kind, title: &str, body: &str) {
@@ -1231,5 +1252,42 @@ impl Editor {
         }
         self.text.insert_str(self.cursor, &text[..length]);
         self.cursor += length;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn queued_tool_result_cannot_overwrite_the_start_before_its_frame() {
+        let event = |kind, title: &str, body: &str| Event {
+            kind,
+            actor: Some("worker_1".into()),
+            title: title.into(),
+            body: body.into(),
+            network: None,
+            generation: None,
+        };
+        let (sender, mut events) = unbounded_channel();
+        let title = "create_file · status.txt";
+        sender.send(event(Kind::Tool, title, "")).unwrap();
+        sender
+            .send(event(Kind::Output, title, "Wrote status.txt"))
+            .unwrap();
+        let first = events.try_recv().unwrap();
+        let mut view = View::default();
+        assert!(view.push_event_batch(first, &mut events));
+        assert_eq!(events.len(), 1);
+        let mut terminal = Terminal::new(TestBackend::new(80, 17)).unwrap();
+        terminal
+            .draw(|frame| {
+                view.agents.render(frame, frame.area());
+            })
+            .unwrap();
+        assert!(terminal.backend().to_string().contains("Tool running"));
+        let result = events.try_recv().unwrap();
+        assert!(!view.push_event_batch(result, &mut events));
     }
 }

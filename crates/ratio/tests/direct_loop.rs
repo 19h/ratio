@@ -3670,9 +3670,21 @@ fn tui_refines_and_approves_a_goal_then_displays_file_tools() {
     let run = process.finish(terminal);
     succeeded(&run);
     assert!(String::from_utf8_lossy(&run.stdout).contains("VERDICT: APPROVED"));
-    let display = String::from_utf8_lossy(&display);
-    for text in ["create_file", "edit_file", "read_file", "tagged", "error:"] {
-        assert!(display.contains(text), "missing terminal output: {text}");
+    let reader = ra::session::Store::reader(temp.path()).unwrap();
+    let id = reader.runs().unwrap().remove(0).run_id;
+    let audit = reader.audit(&id, Default::default(), 500).unwrap();
+    for (tool, state) in [
+        ("create_file", "completed"),
+        ("edit_file", "failed"),
+        ("read_file", "completed"),
+        ("edit_file", "completed"),
+    ] {
+        assert!(
+            audit.iter().any(|event| event.kind == "tool_result"
+                && event.data["tool"] == tool
+                && event.data["state"] == state),
+            "missing {state} tool result for {tool}"
+        );
     }
     assert_eq!(
         std::fs::read_to_string(temp.path().join("status.txt")).unwrap(),
