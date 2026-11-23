@@ -1625,7 +1625,7 @@ fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
         .unwrap();
         connected.send(()).unwrap();
         // Keep the chunked response open until the test cancels the run.
-        let _ = provider_stop.recv();
+        let _ = provider_stop.recv_timeout(Duration::from_secs(30));
     });
     let launch = cli(
         workspace,

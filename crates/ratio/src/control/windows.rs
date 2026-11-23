@@ -16,7 +16,9 @@ use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use windows_sys::Win32::{
-    Foundation::{HANDLE, LocalFree},
+    Foundation::{
+        HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
+    },
     Security::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -24,8 +26,11 @@ use windows_sys::Win32::{
         },
         GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
-    System::Threading::{
-        CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, GetCurrentProcess, OpenProcessToken,
+    System::{
+        Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+        Threading::{
+            CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, GetCurrentProcess, OpenProcessToken,
+        },
     },
 };
 
@@ -78,8 +83,22 @@ pub(super) async fn connect(workspace: &Path, telemetry: bool) -> Result<NamedPi
     Ok(ClientOptions::new().open(endpoint(workspace, telemetry))?)
 }
 
-pub(super) fn detach(command: &mut Command) {
+pub(super) fn detach(command: &mut Command) -> Result<()> {
+    // CreateProcess inherits inheritable handles even when the child supplies
+    // its own stdio. Keeping the launcher's original pipes open would prevent
+    // callers from reading EOF until the detached runner exits.
+    for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: stream is a valid selector. The returned handle remains owned by the process.
+        let handle = unsafe { GetStdHandle(stream) };
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+            // SAFETY: handle is borrowed. Only its inheritance flag is modified.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                return Err(io::Error::last_os_error()).context("clear launcher stdio inheritance");
+            }
+        }
+    }
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    Ok(())
 }
 
 struct SecurityDescriptor(*mut c_void);

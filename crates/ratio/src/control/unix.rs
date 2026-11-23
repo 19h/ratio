@@ -80,7 +80,7 @@ pub(super) async fn connect(workspace: &Path, telemetry: bool) -> Result<UnixStr
     Ok(UnixStream::connect(endpoint(workspace, false, telemetry)?).await?)
 }
 
-pub(super) fn detach(command: &mut Command) {
+pub(super) fn detach(command: &mut Command) -> Result<()> {
     // SAFETY: the child callback calls only async-signal-safe functions.
     unsafe {
         command.pre_exec(|| {
@@ -90,4 +90,5 @@ pub(super) fn detach(command: &mut Command) {
             Ok(())
         });
     }
+    Ok(())
 }

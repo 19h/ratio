@@ -88,7 +88,7 @@ pub async fn launch_with_args(
         })
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(error_log));
-    platform::detach(command.as_std_mut());
+    platform::detach(command.as_std_mut())?;
     let mut child = command.spawn().context("start detached Ratio run")?;
     if let Some(request_text) = request_text {
         child
