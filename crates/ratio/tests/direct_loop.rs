@@ -1599,7 +1599,7 @@ fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let (connected, connection) = std::sync::mpsc::sync_channel(1);
-    let (stop_provider, provider_stop) = std::sync::mpsc::channel();
+    let (stop_provider, provider_stop) = std::sync::mpsc::channel::<()>();
     let server = thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
         let mut socket = loop {
