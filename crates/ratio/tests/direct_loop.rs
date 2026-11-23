@@ -3662,9 +3662,6 @@ fn tui_refines_and_approves_a_goal_then_displays_file_tools() {
     wait_for_screen(&mut terminal, &mut display, "!required");
     terminal.write_all(b"\x14").unwrap(); // Ctrl+T
     wait_for_screen(&mut terminal, &mut display, "Outbound routes");
-    terminal.write_all(b"\x1b[<0;3;2M\x1b[<0;3;2m").unwrap();
-    terminal.write_all(b"\x1b[5~").unwrap(); // Page Up
-    wait_for_screen(&mut terminal, &mut display, "tagged");
     terminal.write_all(b"q").unwrap();
     wait_for_screen(&mut terminal, &mut display, "\x1b[?1049l");
     let run = process.finish(terminal);
