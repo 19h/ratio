@@ -135,6 +135,12 @@ pub struct Cli {
     pub managed_run: bool,
     #[arg(long, hide = true, requires = "managed_run")]
     pub dashboard_managed: bool,
+    #[arg(long, hide = true, requires_all = ["managed_run", "goal_stdin", "continue_checkpoint", "continue_action"], conflicts_with_all = ["fork", "resume"])]
+    pub continue_run: Option<String>,
+    #[arg(long, hide = true, requires = "continue_run")]
+    pub continue_checkpoint: Option<u64>,
+    #[arg(long, hide = true, requires = "continue_run")]
+    pub continue_action: Option<String>,
     /// Control the active foreground headless or detached run.
     #[arg(long, value_enum, conflicts_with_all = ["events", "list_runs", "resume", "goal"])]
     pub control: Option<ControlOperation>,

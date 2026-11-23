@@ -29,6 +29,16 @@ pub(crate) struct Ledger {
     token_breakdown: TokenBreakdown,
     #[serde(default)]
     breakdown_attempts: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allowance: Option<Allowance>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Allowance {
+    cycle: usize,
+    requests: u64,
+    tokens: u64,
+    elapsed_ms: u64,
 }
 
 impl Ledger {
@@ -178,6 +188,7 @@ impl Budget {
         resume: bool,
         journal: Rc<RefCell<Journal>>,
         run_id: &str,
+        continuation_cycle: Option<usize>,
     ) -> Result<()> {
         let mut state = self.state.borrow_mut();
         if resume {
@@ -189,6 +200,20 @@ impl Budget {
             };
             state.since = Some(Instant::now());
         }
+        if let Some(cycle) = continuation_cycle
+            && state
+                .ledger
+                .allowance
+                .as_ref()
+                .is_none_or(|allowance| allowance.cycle != cycle)
+        {
+            state.ledger.allowance = Some(Allowance {
+                cycle,
+                requests: state.ledger.requests,
+                tokens: state.ledger.tokens,
+                elapsed_ms: state.ledger.elapsed_ms,
+            });
+        }
         state.journal = Some((journal, run_id.into()));
         state.path = Some(path);
         state.save()
@@ -196,19 +221,28 @@ impl Budget {
 
     pub(crate) fn ensure_available(&self, tokens: u64) -> Result<()> {
         let mut state = self.state.borrow_mut();
+        let base = state.ledger.allowance.as_ref();
+        let used_requests = state
+            .ledger
+            .requests
+            .saturating_sub(base.map_or(0, |base| base.requests));
+        let used_tokens = state
+            .ledger
+            .tokens
+            .saturating_sub(base.map_or(0, |base| base.tokens));
         let limit = if self
             .elapsed_ms
-            .is_some_and(|limit| state.elapsed() >= limit)
+            .is_some_and(|limit| state.allowance_elapsed() >= limit)
         {
             Some("active time")
         } else if self
             .requests
-            .is_some_and(|limit| state.ledger.requests >= limit.get())
+            .is_some_and(|limit| used_requests >= limit.get())
         {
             Some("provider attempts")
         } else if self
             .tokens
-            .is_some_and(|limit| tokens > limit.get().saturating_sub(state.ledger.tokens))
+            .is_some_and(|limit| tokens > limit.get().saturating_sub(used_tokens))
         {
             Some("metered tokens")
         } else {
@@ -284,8 +318,9 @@ impl Budget {
     }
 
     pub fn remaining(&self) -> Option<Duration> {
-        self.elapsed_ms
-            .map(|limit| Duration::from_millis(limit.saturating_sub(self.state.borrow().elapsed())))
+        self.elapsed_ms.map(|limit| {
+            Duration::from_millis(limit.saturating_sub(self.state.borrow().allowance_elapsed()))
+        })
     }
 
     pub(crate) fn pause(&self) -> Result<Pause<'_>> {
@@ -424,6 +459,15 @@ impl State {
             .tokens
             .saturating_sub(reserved)
             .saturating_add(actual);
+    }
+
+    fn allowance_elapsed(&self) -> u64 {
+        self.elapsed().saturating_sub(
+            self.ledger
+                .allowance
+                .as_ref()
+                .map_or(0, |base| base.elapsed_ms),
+        )
     }
 
     fn elapsed(&self) -> u64 {

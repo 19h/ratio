@@ -923,6 +923,23 @@ impl RunReader {
             .optional()
     }
 
+    pub fn continuation_receipt(
+        &self,
+        run: &str,
+        id: &str,
+        expected: u64,
+        prompt: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(event) = self.audit_event(run, &format!("continuation-request-{id}"))? else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            event.data["expected"] == expected && event.data["text"] == prompt,
+            "Continuation action ID was already used for a different request"
+        );
+        Ok(true)
+    }
+
     pub fn audit_event_sequence(&self, run: &str, key: &str) -> Result<Option<u64>> {
         self.0
             .query_row(

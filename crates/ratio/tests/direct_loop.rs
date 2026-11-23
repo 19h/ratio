@@ -5280,3 +5280,270 @@ fn accepted_campaign_survives_failed_workspace_preparation() {
     assert!(workspace.join(".ratio/staging").join(run.run_id()).is_dir());
     server.join().unwrap();
 }
+
+#[test]
+fn approved_run_continuation_restores_approval_and_runs_a_fresh_staged_cycle() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    succeeded(
+        &Command::new("git")
+            .current_dir(root)
+            .args(["init", "--quiet"])
+            .output()
+            .unwrap(),
+    );
+    std::fs::write(root.join("result.txt"), "original\n").unwrap();
+    succeeded(
+        &Command::new("git")
+            .current_dir(root)
+            .args(["add", "result.txt"])
+            .output()
+            .unwrap(),
+    );
+    let profile = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        profile.path(),
+        r#"
+[orchestration]
+stage_workspace = true
+verification_commands = ["git diff --check"]
+[[stakeholders]]
+name = "Build owner"
+persona = "Check build requirements."
+phases = ["review"]
+[[stakeholders]]
+name = "Release owner"
+persona = "Check release requirements."
+phases = ["review"]
+"#,
+    )
+    .unwrap();
+    let mut failed_discussion = false;
+    let mut build_follow_up_findings = 0;
+    let mut repaired_decision = false;
+    let mut accepted_decisions = 0;
+    let mut failed_worker = false;
+    let (endpoint, server) = mock(move |_, request| {
+        let system = request["messages"][0]["content"].as_str().unwrap();
+        let task = request["messages"][1]["content"].as_str().unwrap();
+        let advertised = |name| {
+            request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == name)
+        };
+        if advertised("submit_continuation") {
+            assert!(task.contains("Build discussion"));
+            assert!(task.contains("Release discussion"));
+            let proceed = task.contains("Update the staged result");
+            if proceed && !repaired_decision {
+                repaired_decision = true;
+                return text("This response omits the typed decision.");
+            }
+            if proceed {
+                assert!(task.contains("Correct the previous response"));
+                accepted_decisions += 1;
+                assert_eq!(
+                    accepted_decisions, 1,
+                    "Committed continuation decision was replayed"
+                );
+            }
+            return calls(&[tool(
+                "intake",
+                "submit_continuation",
+                json!({
+                    "decision": if proceed { "continue" } else { "decline" },
+                    "reason":"Both stakeholder requirements considered.",
+                    "plan": proceed.then_some("Update result.txt and verify its exact contents."),
+                }),
+            )]);
+        }
+        if system.contains("You are stakeholder") {
+            if task.contains("Operator follow-up:") {
+                assert!(
+                    !advertised("shell") && !advertised("edit_file") && !advertised("mcp_call")
+                );
+                let name = if system.contains("Build owner") {
+                    "Build"
+                } else {
+                    "Release"
+                };
+                if task.contains("Initial findings") {
+                    assert!(task.contains("Build finding") && task.contains("Release finding"));
+                    if name == "Release"
+                        && task.contains("Update the staged result")
+                        && !failed_discussion
+                    {
+                        failed_discussion = true;
+                        return (
+                            400,
+                            json!({"error":{"message":"Temporary stakeholder failure"}}),
+                        );
+                    }
+                    return text(&format!("{name} discussion"));
+                }
+                if name == "Build" && task.contains("Update the staged result") {
+                    build_follow_up_findings += 1;
+                    assert_eq!(
+                        build_follow_up_findings, 1,
+                        "Completed first round was replayed"
+                    );
+                }
+                return text(&format!("{name} finding"));
+            }
+            return text("Final review evidence.");
+        }
+        if advertised("submit_verdict") {
+            let (status, mut response) = decision("approved", "Verified staged result.");
+            response["test_terminal"] = json!(system.contains("Update the staged result"));
+            return (status, response);
+        }
+        if system.contains("You are the worker") && system.contains("Update the staged result") {
+            if !failed_worker {
+                failed_worker = true;
+                return (
+                    400,
+                    json!({"error":{"message":"Temporary staged worker failure"}}),
+                );
+            }
+            if request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["role"] == "tool")
+            {
+                return text("Updated staged result.");
+            }
+            assert!(task.contains("Accepted continuation plan"));
+            return calls(&[tool(
+                "edit",
+                "edit_file",
+                json!({
+                    "path":"result.txt","old_text":"operator baseline","new_text":"continued"
+                }),
+            )]);
+        }
+        text("Inspect and verify the result.")
+    });
+    let config = profile.path().to_str().unwrap();
+    succeeded(&cli_window(
+        root,
+        &endpoint,
+        "8192",
+        &["--config", config, "--goal", "Verify original"],
+    ));
+    let reader = ra::session::Store::reader(root).unwrap();
+    let original = reader.runs().unwrap().remove(0);
+    let original_usage = reader.metrics(&original.run_id).unwrap().provider_attempts;
+    let launch = |seq: u64, id: &str, prompt: &str| {
+        let mut child = cli_command(
+            root,
+            &endpoint,
+            "8192",
+            &[
+                "--config",
+                config,
+                "--max-requests",
+                "14",
+                "--managed-run",
+                "--continue-run",
+                &original.run_id,
+                "--continue-checkpoint",
+                &seq.to_string(),
+                "--continue-action",
+                id,
+                "--goal-stdin",
+            ],
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(prompt.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let declined = "Request a change outside the approved scope";
+    succeeded(&launch(original.last_sequence, "declined", declined));
+    let after_decline = reader.run(&original.run_id).unwrap().unwrap();
+    assert_eq!(after_decline.phase, "Approved");
+    assert_eq!(after_decline.cycle, original.cycle);
+    assert_eq!(
+        std::fs::read_to_string(root.join("result.txt")).unwrap(),
+        "original\n"
+    );
+    succeeded(&launch(original.last_sequence, "declined", declined));
+    assert!(
+        !launch(original.last_sequence, "stale", declined)
+            .status
+            .success()
+    );
+    assert_eq!(
+        reader.run(&original.run_id).unwrap().unwrap(),
+        after_decline
+    );
+    std::fs::write(root.join("result.txt"), "operator baseline\n").unwrap();
+    let failed = launch(
+        after_decline.last_sequence,
+        "accepted",
+        "Update the staged result",
+    );
+    assert!(!failed.status.success());
+    assert_eq!(
+        reader.run(&original.run_id).unwrap().unwrap().phase,
+        "ContinuationDiscuss"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("result.txt")).unwrap(),
+        "operator baseline\n"
+    );
+    let resume = || {
+        cli_window(
+            root,
+            &endpoint,
+            "8192",
+            &[
+                "--config",
+                config,
+                "--max-requests",
+                "14",
+                "--resume",
+                "--run-id",
+                &original.run_id,
+            ],
+        )
+    };
+    let failed_work = resume();
+    assert!(!failed_work.status.success());
+    assert_eq!(reader.run(&original.run_id).unwrap().unwrap().phase, "Work");
+    assert_eq!(
+        std::fs::read_to_string(root.join("result.txt")).unwrap(),
+        "operator baseline\n"
+    );
+    succeeded(&resume());
+    let finished = reader.runs().unwrap();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].run_id, original.run_id);
+    assert_eq!(finished[0].phase, "Approved");
+    assert_eq!(finished[0].cycle, original.cycle + 2);
+    assert_eq!(
+        std::fs::read_to_string(root.join("result.txt")).unwrap(),
+        "continued\n"
+    );
+    assert_eq!(
+        reader
+            .event_at(&original.run_id, original.last_sequence)
+            .unwrap()
+            .unwrap()
+            .phase,
+        "Approved"
+    );
+    assert!(reader.metrics(&original.run_id).unwrap().provider_attempts > original_usage + 13);
+    server.join().unwrap();
+}

@@ -179,6 +179,16 @@ async fn run(mut cli: Cli) -> Result<u8> {
     let explicit_goal = cli.goal.clone();
     let run_id = cli.run_id.clone();
     let fork = cli.fork.clone();
+    let continuation = cli.continue_run.take().map(|run| {
+        (
+            run,
+            cli.continue_checkpoint.expect("required checkpoint"),
+            cli.continue_action.take().expect("required action"),
+        )
+    });
+    if continuation.is_some() {
+        cli.goal = None;
+    }
     let managed = cli.managed_run;
     let dashboard_managed = cli.dashboard_managed;
     let plan_only = cli.plan_only;
@@ -225,7 +235,19 @@ async fn run(mut cli: Cli) -> Result<u8> {
         return Ok(0);
     }
     let store = Store::open(&config.cwd)?;
-    let resumed = if config.resume {
+    let resumed = if let Some((run, checkpoint, id)) = &continuation {
+        match store.begin_continuation(
+            run,
+            *checkpoint,
+            id,
+            explicit_goal
+                .as_deref()
+                .context("Missing continuation prompt")?,
+        )? {
+            Some(session) => Some(session),
+            None => return Ok(0),
+        }
+    } else if config.resume {
         let session = store.load_run(run_id.as_deref())?;
         if let Some(goal) = &explicit_goal {
             ensure!(
@@ -275,7 +297,7 @@ async fn run(mut cli: Cli) -> Result<u8> {
         .map(|session| session.run_id().to_owned())
         .unwrap_or_default();
     if !interactive {
-        if !config.resume {
+        if !config.resume && continuation.is_none() {
             store.archive_old_checkpoint()?;
         }
         store.save(session.as_ref().expect("managed run has a session"))?;

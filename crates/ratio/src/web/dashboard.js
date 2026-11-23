@@ -568,6 +568,8 @@ function renderLive() {
     button("Resume saved", () => openAction("resume_saved"), {
       disabled: endings.includes(state.summary.run.phase) && !state.summary.resume_phase,
     }),
+    ...(state.summary.run.phase === "Approved"
+      ? [button("Continue run", () => openAction("continue"))] : []),
     button("Fork", () => openAction("fork")),
   ] : [];
   const phase = state.summary?.run?.phase ?? "";
@@ -717,12 +719,15 @@ function agentRow(agent, task, describe = true) {
     pre(active?.text || "", { class: "preview", hidden: !active, "data-preview-actor": agent.id }));
 }
 
-function phaseRail(phase) {
-  const order = stages.flatMap(([, steps]) => steps);
+function phaseRail(phase, continuation) {
+  const visibleStages = continuation
+    ? [["Continuation", ["ContinuationReview", "ContinuationDiscuss", "ContinuationDecision"]], ...stages.slice(1)]
+    : stages;
+  const order = visibleStages.flatMap(([, steps]) => steps);
   const done = endings.includes(phase);
   const at = order.indexOf(phase === "OnboardWorker" ? "Work" : phase);
   return node("ol", { class: "rail", "aria-label": "Run phases", "data-end": done ? phase.toLowerCase() : undefined },
-    stages.map(([name, steps]) => {
+    visibleStages.map(([name, steps]) => {
       const current = !done && steps.includes(order[at]);
       return node("li", { class: `g${steps.length}${current ? " on" : ""}`, "aria-current": current ? "step" : undefined },
         node("div", { class: "steps" }, steps.map(step => {
@@ -751,6 +756,27 @@ function executionPlan(tasks, flow, data) {
       ]))) : null);
 }
 
+function continuationOverview(data) {
+  const continuation = data.continuation;
+  if (!continuation) return null;
+  const count = data.stakeholders?.length ?? 0;
+  const decision = continuation.decision;
+  return section("Continuation", facts([
+    ["Follow-up", pre(continuation.prompt)],
+    ["Prior approval", readOnly ? code(continuation.approved_checkpoint) :
+      go("Checkpoint #" + continuation.approved_checkpoint, runUrl("archive", { sequence: continuation.approved_checkpoint }))],
+    ["Stakeholder review", `${continuation.reviewed} / ${count}`],
+    ["Stakeholder discussion", `${continuation.discussed} / ${count}`],
+    ["Decision", decision ? pill(decision.decision) : "Pending"],
+    ["Rationale", decision ? pre(decision.reason) : null],
+    ["Continuation plan", decision?.plan ? pre(decision.plan) : null],
+    ["Timeline", [
+      go("Open follow-up request", entryUrl("continuation-request-" + continuation.id)),
+      decision ? go("Open decision", entryUrl("continuation-decision-" + continuation.id)) : null,
+    ]],
+  ]));
+}
+
 function overview() {
   const data = state.summary;
   const flow = data.event?.workflow ?? {};
@@ -767,7 +793,8 @@ function overview() {
       node("div", { class: "hero-field" }, caption("Phase"),
         node("strong", { class: "hero-title", "data-tone": endings.includes(phase) ? phase.toLowerCase() : "active" }, title(phase)),
         node("span", { class: "hero-sub" }, `cycle ${data.run.cycle}`, flow.stopped ? pill(flow.stopped) : null)),
-      phaseRail(phase)),
+      phaseRail(phase, data.continuation)),
+    continuationOverview(data),
     node("div", { class: "columns" },
       section({ label: "Agents", meta: agents.length || null, flush: true }, agents.length
         ? agents.map(agent => agentRow(agent, tasks.find(task => task.task.worker === agent.id), false))
@@ -785,7 +812,7 @@ function overview() {
         section("Usage", data.metricsPending ? muted("Indexing checkpoint totals…") : null, facts(Object.entries(metrics).flatMap(([name, value]) => name === "token_breakdown"
           ? Object.entries(value).map(([flow, count]) => [title(flow) + " tokens", tokenCount(count)])
           : [[title(name), number.format(value)]])) ?? muted("Nothing metered yet.")))),
-    executionPlan(tasks, flow, data),
+    data.continuation && !data.continuation.decision ? null : executionPlan(tasks, flow, data),
   ]);
 }
 
@@ -814,9 +841,9 @@ function filters(route, { actor = true, kind = false } = {}) {
   };
   form.append(node("input", { type: "search", name: "q", value: query.q ?? "", placeholder: "Search entries", "aria-label": "Search entries", spellcheck: "false" }),
     ...(actor ? [select("actor", "All agents", (state.summary?.event?.workflow?.agents ?? []).map(agent => [agent.id, agent.name]))] : []),
-    ...(kind ? [select("kind", "All event types", ["chat", "tool", "tool_result", "job", "job_delivery", "ipc", "phase", "brief", "proposal", "guidance", "triage", "triage_delivery", "compaction", "verification", "contract_error", "error", "control"].map(type => [type, title(type)]))] : []),
+    ...(kind ? [select("kind", "All event types", ["chat", "tool", "tool_result", "job", "job_delivery", "ipc", "phase", "brief", "proposal", "guidance", "triage", "triage_delivery", "compaction", "verification", "contract_error", "error", "control", "continuation_request", "continuation_decision"].map(type => [type, title(type)]))] : []),
     node("input", { type: "number", min: "1", name: "cycle", value: query.cycle ?? "", placeholder: "Cycle", "aria-label": "Cycle" }),
-    select("phase", "All phases", ["ProposeTeam", "Plan", "PlanConsult", "PlanSynthesize", "Coordinate", "FreezePlan", "Acknowledge", "Work", "OnboardWorker", "Review", "ReviewConsult", "ReviewSynthesize", "Publish"].map(phase => [phase, title(phase)])),
+    select("phase", "All phases", ["ProposeTeam", "ContinuationReview", "ContinuationDiscuss", "ContinuationDecision", "Plan", "PlanConsult", "PlanSynthesize", "Coordinate", "FreezePlan", "Acknowledge", "Work", "OnboardWorker", "Review", "ReviewConsult", "ReviewSynthesize", "Publish"].map(phase => [phase, title(phase)])),
     node("button", { type: "submit" }, "Apply"));
   return form;
 }
@@ -1402,6 +1429,7 @@ function refreshLivePage() {
 let actionState;
 const descriptions = {
   start: ["Start a run", "Describe the outcome and constraints. Ratio will propose a roster and start the run.", "Request", true],
+  continue: ["Continue run", "Stakeholders review and discuss your request. If the lead reviewer accepts it, work starts automatically in this run.", "Follow-up prompt", true],
   fork: ["Fork this run", "Start a new run with this roster. Leave the request empty to keep the original goal.", "Replacement request", false],
   resume_saved: ["Resume saved run", "Continue from the latest committed checkpoint with the current runner configuration.", "", false],
   add_worker: ["Request a worker", "Describe the role and scope. Writes remain gated until unanimous acknowledgement.", "Assignment and proposed scope", true],
@@ -1413,7 +1441,8 @@ const descriptions = {
 function openAction(name, initial = "") {
   if (readOnly) return;
   const [label, hint, field, required] = descriptions[name];
-  actionState = { name, run: state.route.run, id: crypto.randomUUID() };
+  actionState = { name, run: state.route.run, id: crypto.randomUUID(),
+    checkpoint: name === "continue" ? state.summary?.run.last_sequence : undefined };
   $("#action-title").textContent = label;
   $("#action-hint").textContent = name === "resume_saved" && state.summary?.resume_phase
     ? `Continue from ${title(state.summary.resume_phase)} in the same run with the current limits and accumulated usage.`
@@ -1427,7 +1456,7 @@ function openAction(name, initial = "") {
   input.maxLength = name === "start" || name === "fork" ? 65536 : 4096;
   $("#submit-action").textContent = label;
   // A known-bad profile cannot start a run. Say why before the request is typed.
-  const blocked = (name === "start" || name === "fork") && state.config?.ok === false;
+  const blocked = (name === "start" || name === "fork" || name === "continue") && state.config?.ok === false;
   $("#submit-action").disabled = blocked;
   $("#start-config").hidden = name !== "start";
   $("#start-config").disabled = blocked;
@@ -1437,8 +1466,8 @@ function openAction(name, initial = "") {
   (field ? input : $("#submit-action")).focus();
 }
 
-function postAction(action, text, run = state.route.run, id = crypto.randomUUID()) {
-  const message = { type: "action", action: { action, text, run, id } };
+function postAction(action, text, run = state.route.run, id = crypto.randomUUID(), checkpoint) {
+  const message = { type: "action", action: { action, text, run, id, checkpoint } };
   return new Promise((resolve, reject) => {
     if (!send(message)) {
       reject(new Error("Dashboard stream is reconnecting"));
@@ -1448,9 +1477,9 @@ function postAction(action, text, run = state.route.run, id = crypto.randomUUID(
   });
 }
 
-async function sendAction(action, text, run = state.route.run, id = crypto.randomUUID()) {
+async function sendAction(action, text, run = state.route.run, id = crypto.randomUUID(), checkpoint) {
   if (readOnly) return;
-  const receipt = await postAction(action, text, run, id);
+  const receipt = await postAction(action, text, run, id, checkpoint);
   notify(receipt.detail);
   if (receipt.run_id && receipt.run_id !== state.route.run) navigate(runUrl("overview", {}, receipt.run_id));
   else load(false);
@@ -1542,11 +1571,11 @@ $("#action-form").addEventListener("submit", async event => {
   const controls = [$("#submit-action"), $("#start-config"), $("#close-action")];
   for (const control of controls) control.disabled = true;
   const fromConfig = event.submitter?.id === "start-config";
-  const { name, run, id } = actionState;
+  const { name, run, id, checkpoint } = actionState;
   const errorLine = $(".action-error");
   errorLine.hidden = true;
   try {
-    await sendAction(fromConfig ? "start_config" : name, fromConfig ? undefined : $("#action-text").value, run, id);
+    await sendAction(fromConfig ? "start_config" : name, fromConfig ? undefined : $("#action-text").value, run, id, checkpoint);
     $("#action-dialog").close();
   } catch (error) {
     errorLine.textContent = error.message;

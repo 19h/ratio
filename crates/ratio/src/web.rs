@@ -96,7 +96,7 @@ type ActionResult = std::result::Result<Value, String>;
 
 #[derive(Default)]
 struct ActionBook {
-    pending: BTreeMap<String, watch::Receiver<Option<ActionResult>>>,
+    pending: BTreeMap<String, (Action, watch::Receiver<Option<ActionResult>>)>,
     completed: VecDeque<(String, ActionResult)>,
 }
 
@@ -700,6 +700,7 @@ fn overview(
         "run":reader.run(run)?, "event":event, "head":reader.audit_head(run)?,
         "goal":session["goal"], "request":session["request"], "verdict":session["verdict"],
         "parent_run":session["parent_run_id"],
+        "continuation":session["continuation"],
         "resume_phase":resume_phase,
         "latest_error":latest_error,
         "assessment":session["assessment"], "acceptance":session["team_acceptance"],
@@ -942,13 +943,14 @@ fn stream(
     reply
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Action {
     id: String,
     action: String,
     run: Option<String>,
     text: Option<String>,
+    checkpoint: Option<u64>,
 }
 
 impl Dashboard {
@@ -1012,16 +1014,23 @@ impl Dashboard {
         );
         let mut result = {
             let mut book = self.actions.lock().await;
-            if let Some((_, receipt)) = book.completed.iter().find(|(id, _)| id == &action.id) {
+            if action.action != "continue"
+                && let Some((_, receipt)) = book.completed.iter().find(|(id, _)| id == &action.id)
+            {
                 return receipt.clone().map_err(anyhow::Error::msg);
             }
-            if let Some(pending) = book.pending.get(&action.id) {
+            if let Some((submitted, pending)) = book.pending.get(&action.id) {
+                ensure!(
+                    (action.action != "continue" && submitted.action != "continue")
+                        || submitted == &action,
+                    "Continuation action ID was already used for a different request"
+                );
                 pending.clone()
             } else {
                 let lane = match action.action.as_str() {
                     "create_share" | "revoke_share" => &self.sharing,
                     "check_provider" => &self.provider,
-                    "start" | "start_config" | "resume" | "resume_saved" | "fork" => {
+                    "start" | "start_config" | "resume" | "resume_saved" | "fork" | "continue" => {
                         &self.lifecycle
                     }
                     _ => &self.controls,
@@ -1031,18 +1040,20 @@ impl Dashboard {
                     .try_acquire_owned()
                     .context("A related dashboard action is already running")?;
                 let (finish, result) = watch::channel(None);
-                book.pending.insert(action.id.clone(), result.clone());
+                book.pending
+                    .insert(action.id.clone(), (action.clone(), result.clone()));
                 let app = self.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let id = action.id.clone();
+                    let continuation = action.action == "continue";
                     let receipt = app
                         .execute_action(action)
                         .await
                         .map_err(|error| format!("{error:#}"));
                     let mut book = app.actions.lock().await;
                     book.pending.remove(&id);
-                    if receipt.is_ok() {
+                    if receipt.is_ok() && !continuation {
                         book.completed.push_back((id, receipt.clone()));
                         if book.completed.len() > 256 {
                             book.completed.pop_front();
@@ -1102,6 +1113,46 @@ impl Dashboard {
                 let url =
                     token.map(|token| format!("{}/run/{run}/overview#share={token}", site.origin));
                 json!({"active": create, "url": url})
+            }
+            "continue" => {
+                let run = run.context("Choose an approved run")?;
+                let expected = action.checkpoint.context("Missing approved checkpoint")?;
+                let note = note
+                    .filter(|note| note.len() <= 4096)
+                    .context("Enter a follow-up prompt up to 4096 UTF-8 bytes")?;
+                let app = self.clone();
+                let checked_run = run.to_owned();
+                let checked_note = note.to_owned();
+                let id = action.id.clone();
+                let replay = tokio::task::spawn_blocking(move || {
+                    let reader = Store::reader(&app.workspace)?;
+                    if reader.continuation_receipt(&checked_run, &id, expected, &checked_note)? {
+                        return Ok::<_, anyhow::Error>(true);
+                    }
+                    let record = reader.run(&checked_run)?.context("Run not found")?;
+                    ensure!(
+                        record.phase == "Approved" && record.last_sequence == expected,
+                        "The approved checkpoint changed. Refresh and submit the follow-up again."
+                    );
+                    app.effective_config()?;
+                    Ok(false)
+                })
+                .await??;
+                if !replay {
+                    let mut args = self.launch_args.clone();
+                    args.extend([
+                        "--dashboard-managed".into(),
+                        "--continue-run".into(),
+                        run.into(),
+                        "--continue-checkpoint".into(),
+                        expected.to_string().into(),
+                        "--continue-action".into(),
+                        action.id.into(),
+                        "--goal-stdin".into(),
+                    ]);
+                    self.launch(args, Some(note), None, false).await?;
+                }
+                json!({"accepted": true, "run_id": run, "detail":"Follow-up submitted for stakeholder review"})
             }
             "start" | "start_config" | "resume" | "resume_saved" | "fork" => {
                 let resume = matches!(action.action.as_str(), "resume" | "resume_saved");

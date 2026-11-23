@@ -317,11 +317,14 @@ Ratio runs the dashboard and worker execution in separate processes. The dashboa
 | **Add worker** | Request an additional worker during the work phase. See [Adding a worker mid-run](#adding-a-worker-mid-run). |
 | **Submit information** in the Triage view | Give the team new information. The lead reviewer routes it to the right agents. |
 | **Resume saved** | Continue a stopped run from its latest checkpoint with the current configuration |
+| **Continue run** | Submit a follow-up on an approved run for stakeholder review and a lead decision |
 | **Fork** | Start a new run with the same roster, optionally with a new request |
 
 Use **Guide** when you know what the team should do differently. The text reaches the active agents with their next model request, up to 4,096 bytes. Use **Submit information** when you have facts and want the lead reviewer to decide who needs them.
 
 Automatic triage uses the lead reviewer to classify and route information within the existing run permissions. You can name agents in the note. A queued note is waiting for routing at a runner checkpoint. Delivery saves it for the recipient and places it after the tool history in the next model request. The inbox shows the routing decision and delivery receipts, and allows you to retry routing an undelivered note. Pending items are marked deferred if the run finishes before delivery. **Add worker** requests a separate, read-only onboarding phase followed by unanimous acknowledgement of the amended plan. The worker request links to its onboarding IPC.
+
+Use **Continue run** on an approved run to submit a follow-up. Each recorded stakeholder reviews the prompt and responds to the panel’s findings. The lead reviewer records the decision and rationale. If accepted, Ratio starts a new execution cycle with the continuation plan and the same run ID. If declined, the earlier approval still applies and you can submit a revised prompt. Each follow-up has fresh limits. Usage and prior approvals remain in the run history, which includes any active share link.
 
 ### Closing, resuming, and changing configuration
 

@@ -380,6 +380,7 @@ impl Orchestrator<'_> {
         ipc: bool,
     ) -> PanelOptions<'a> {
         PanelOptions {
+            passive_inspection: false,
             access: Access::Inspect,
             width: self.parallel_limit.get(),
             ipc,

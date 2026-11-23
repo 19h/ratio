@@ -458,6 +458,7 @@ impl Orchestrator<'_> {
             &system,
             &format!("{} / {}", actor, specialist.name),
             PeerTools {
+                passive_inspection: false,
                 route: None,
                 ack: None,
                 memory,

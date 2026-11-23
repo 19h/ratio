@@ -54,6 +54,9 @@ pub struct Verdict {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Phase {
     ProposeTeam,
+    ContinuationReview,
+    ContinuationDiscuss,
+    ContinuationDecision,
     OnboardWorker,
     Plan,
     PlanConsult,
@@ -74,6 +77,9 @@ pub enum Phase {
 impl Phase {
     pub fn label(self) -> &'static str {
         match self {
+            Self::ContinuationReview => "Continuation review",
+            Self::ContinuationDiscuss => "Continuation discussion",
+            Self::ContinuationDecision => "Continuation decision",
             Self::ProposeTeam => "Propose team",
             Self::OnboardWorker => "Onboard worker",
             Self::Plan => "Reviewer plan",
@@ -98,6 +104,50 @@ impl Phase {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct Continuation {
+    pub id: String,
+    pub approved_checkpoint: u64,
+    pub cycle: usize,
+    pub prompt: String,
+    pub initial_reports: Vec<(String, String)>,
+    pub discussion: Vec<(String, String)>,
+    pub decision: Option<ContinuationDecision>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContinuationDecision {
+    pub decision: ContinuationChoice,
+    pub reason: String,
+    pub plan: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContinuationChoice {
+    Continue,
+    Decline,
+}
+
+impl Continuation {
+    fn overview(&self, phase: Phase, panel: Option<&PanelProgress>) -> serde_json::Value {
+        let completed = panel.map_or(0, |panel| {
+            panel
+                .agents
+                .iter()
+                .filter(|agent| agent.assessment.is_some())
+                .count()
+        });
+        serde_json::json!({
+            "id": self.id, "approved_checkpoint": self.approved_checkpoint,
+            "cycle": self.cycle, "prompt": self.prompt, "decision": self.decision,
+            "reviewed": if phase == Phase::ContinuationReview { completed } else { self.initial_reports.len() },
+            "discussed": if phase == Phase::ContinuationDiscuss { completed } else { self.discussion.len() }
+        })
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 pub struct Session {
     version: u32,
@@ -116,6 +166,8 @@ pub struct Session {
     pub(crate) worker_addition_status: Option<String>,
     #[serde(default)]
     pub(crate) onboarding: Option<WorkerOnboarding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) continuation: Option<Continuation>,
     pub phase: Phase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) phase_result: Option<String>,
@@ -542,6 +594,7 @@ impl Session {
         );
         Self {
             version: FORMAT,
+            continuation: None,
             goal,
             phase: Phase::Plan,
             phase_result: None,
@@ -777,6 +830,80 @@ impl Store {
         Self::decode(file)
     }
 
+    pub fn begin_continuation(
+        &self,
+        run: &str,
+        expected: u64,
+        id: &str,
+        prompt: &str,
+    ) -> Result<Option<Session>> {
+        let prompt = prompt.trim();
+        ensure!(
+            (1..=4096).contains(&prompt.len()),
+            "Enter a follow-up prompt up to 4096 UTF-8 bytes"
+        );
+        ensure!(
+            (1..=80).contains(&id.len())
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+            "Invalid continuation action ID"
+        );
+        let reader = RunReader::open(&self.directory.join("runs.sqlite3"))?;
+        if reader.continuation_receipt(run, id, expected, prompt)? {
+            return Ok(None);
+        }
+        let record = reader.run(run)?.context("Run not found")?;
+        ensure!(
+            record.phase == "Approved" && record.last_sequence == expected,
+            "The approved checkpoint changed. Refresh and submit the follow-up again."
+        );
+        let mut session = self.load_run(Some(run))?;
+        let prior = session.continuation.as_ref();
+        let approved_checkpoint = prior
+            .filter(|item| {
+                item.decision
+                    .as_ref()
+                    .is_some_and(|decision| decision.decision == ContinuationChoice::Decline)
+            })
+            .map_or(expected, |item| item.approved_checkpoint);
+        session.cycle = session
+            .cycle
+            .max(prior.map_or(0, |item| item.cycle))
+            .checked_add(1)
+            .context("Run cycle overflow")?;
+        session.phase = Phase::ContinuationReview;
+        session.stopped = None;
+        session.panel = None;
+        session.phase_result = None;
+        session.dialogue = Dialogue::start("Review the follow-up request.".into());
+        session.continuation = Some(Continuation {
+            id: id.into(),
+            approved_checkpoint,
+            cycle: session.cycle,
+            prompt: prompt.into(),
+            initial_reports: Vec::new(),
+            discussion: Vec::new(),
+            decision: None,
+        });
+        session.dialogue.audit.push(crate::audit::Observation {
+            key: format!("continuation-request-{id}"),
+            kind: "continuation_request",
+            actor: "user".into(),
+            data: serde_json::json!({"text":prompt,"expected":expected}),
+        });
+        self.save(&session)?;
+        Ok(Some(session))
+    }
+
+    pub(crate) fn load_checkpoint(&self, run: &str, sequence: u64) -> Result<Session> {
+        let reader = RunReader::open(&self.directory.join("runs.sqlite3"))?;
+        let bytes = reader
+            .snapshot(run, Some(sequence))?
+            .context("Continuation approval checkpoint is missing")?;
+        Self::decode(bytes.as_slice())
+    }
+
     pub(crate) fn recover_budget_checkpoint(&self, run: &str) -> Result<Option<Session>> {
         let reader = RunReader::open(&self.directory.join("runs.sqlite3"))?;
         let Some((sequence, _)) = reader.budget_resume_checkpoint(run)? else {
@@ -806,6 +933,7 @@ impl Store {
     fn overview(session: &Session) -> serde_json::Value {
         serde_json::json!({
             "phase":session.phase,"stopped":session.stopped,
+            "continuation":session.continuation.as_ref().map(|item| item.overview(session.phase, session.panel.as_ref())),
             "goal":session.goal,"request":session.request,"verdict":session.verdict,
             "parent_run_id":session.parent_run_id,"assessment":session.assessment,
             "team_acceptance":session.team_acceptance,"workers":session.workers,

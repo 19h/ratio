@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 
+mod continuation;
 mod contracts;
 mod jobs;
 mod onboarding;
@@ -82,7 +83,7 @@ impl<'a> Orchestrator<'a> {
             self.store.save(&session)?;
             return Ok(session);
         }
-        if !self.config.resume {
+        if !self.config.resume && session.continuation.is_none() {
             self.store.archive_old_checkpoint()?;
         }
         session.stopped = None;
@@ -105,6 +106,7 @@ impl<'a> Orchestrator<'a> {
             session.budget_started,
             self.store.journal.clone(),
             session.run_id(),
+            session.continuation.as_ref().map(|item| item.cycle),
         )?;
         session.budget_started = true;
         if restored_budget_checkpoint {
@@ -165,7 +167,7 @@ impl<'a> Orchestrator<'a> {
 
     async fn prepare_workspace(&self, session: &mut Session) -> Result<Option<Staging>> {
         let prepared = session.workspace_prepared.unwrap_or(session.budget_started);
-        if !prepared {
+        if !prepared && session.continuation.is_none() {
             let limits = &self.config.orchestration;
             let (staged, commands) = session.campaign_execution.as_ref().map_or_else(
                 || {
@@ -186,7 +188,10 @@ impl<'a> Orchestrator<'a> {
         }
         let staging = if session.staging_commands.is_some() {
             let workspace = self.config.cwd.clone();
-            let run_id = session.run_id().to_owned();
+            let run_id = session.continuation.as_ref().map_or_else(
+                || session.run_id().to_owned(),
+                |item| format!("{}-continuation-{}", session.run_id(), item.cycle),
+            );
             Some(
                 tokio::task::spawn_blocking(move || Staging::open(&workspace, &run_id, prepared))
                     .await??,
@@ -278,6 +283,13 @@ impl<'a> Orchestrator<'a> {
                     execution.max_parallel_agents.min(ceiling)
                 }),
         );
+        if self
+            .review_continuation(&mut session, guidance.as_ref())
+            .await?
+        {
+            self.store.journal.borrow().defer_triage(session.run_id())?;
+            return Ok(session);
+        }
         let prepared = self.prepare_workspace(&mut session).await?;
         let staging = prepared.as_ref();
         let candidate = staging.map(Staging::candidate);
@@ -449,6 +461,7 @@ impl<'a> Orchestrator<'a> {
                             self.store.save(&session)?;
                         }
                         let peer = PeerTools {
+                            passive_inspection: false,
                             memory: &memory,
                             author: if phase == Phase::Work {
                                 "worker_1"
@@ -1470,10 +1483,30 @@ impl<'a> Orchestrator<'a> {
         } else {
             ConsultationPhase::Review
         };
-        let members = self
-            .participants(session, phase)
-            .map(|(id, role, agent)| (id, role, agent.clone()))
-            .collect::<Vec<_>>();
+        let continuation = matches!(
+            session.phase,
+            Phase::ContinuationReview | Phase::ContinuationDiscuss
+        );
+        let members = if continuation {
+            session
+                .stakeholders
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .map(|(index, agent)| {
+                    (
+                        format!("stakeholder_{}", index + 1),
+                        "stakeholder",
+                        agent.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.participants(session, phase)
+                .map(|(id, role, agent)| (id, role, agent.clone()))
+                .collect::<Vec<_>>()
+        };
         let limit = ipc::inbox_limit(self.config.context_window);
         let scope = traffic_scope(session);
         let mailbox = Mailbox::new(
@@ -1497,10 +1530,13 @@ impl<'a> Orchestrator<'a> {
                 &session.dialogue.current_task(),
             );
         }
-        let enabled = members.len() > 1;
+        let enabled = members.len() > 1 && !continuation;
         let roster = mailbox.roster();
         let mut panel = members.iter().map(|(id, role, agent)| {
             let mut prompt = format!("You are {role} {}. {}\nInspect the workspace and critique this phase's draft. The lead reviewer receives your final assessment. Put concrete findings and escalations there.", agent.name, agent.persona);
+            if continuation {
+                prompt.push_str("\nReview the follow-up prompt against your requirements. In the discussion round, respond to the other stakeholders' findings. Identify constraints, disagreements, and evidence needed. Treat reports as context and give a concise substantive response.");
+            }
             if enabled {
                 prompt.push_str(&format!("\nYour ID: {id}\nPhase roster:\n{roster}\nUse send_message to exchange evidence or focused questions with other participants. Incoming messages arrive at request boundaries, even after an earlier assessment.\n{}", ipc::BWP));
             }
@@ -1538,6 +1574,7 @@ impl<'a> Orchestrator<'a> {
                 width,
                 ipc: enabled,
                 tolerate_failures: enabled,
+                passive_inspection: continuation,
                 gate: None,
                 stakeholder_start: None,
                 memory: &memory,
@@ -1548,7 +1585,7 @@ impl<'a> Orchestrator<'a> {
                 staging: None,
                 admission_run: None,
                 triage_run: None,
-                jobs: Some(JobScope {
+                jobs: (!continuation).then_some(JobScope {
                     book: &book,
                     workers: &workers,
                     goal: &goal,
@@ -1558,6 +1595,32 @@ impl<'a> Orchestrator<'a> {
         )
         .await?;
         self.report_panel(scope, &mailbox, &panel, "Consultation report");
+        if continuation {
+            let bytes_per_report = ((16 * 1024) / panel.len().max(1)).min(4096);
+            let reports = panel
+                .iter()
+                .enumerate()
+                .map(|(index, agent)| {
+                    let report = agent.assessment.as_deref().unwrap_or_default().trim();
+                    ensure!(
+                        !report.is_empty(),
+                        "{} returned an empty continuation report",
+                        mailbox.id(index)
+                    );
+                    Ok((mailbox.id(index).to_owned(), clip(report, bytes_per_report)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let item = session
+                .continuation
+                .as_mut()
+                .context("Missing continuation request")?;
+            if session.phase == Phase::ContinuationReview {
+                item.initial_reports = reports;
+            } else {
+                item.discussion = reports;
+            }
+            return Ok(String::new());
+        }
         Ok(self.panel_reports(panel))
     }
 
@@ -1944,6 +2007,7 @@ impl<'a> Orchestrator<'a> {
             None
         };
         let peer = PeerTools {
+            passive_inspection: options.passive_inspection,
             route: options.ipc.then_some(Route { mailbox, sender }),
             ack: options.gate.map(|gate| (gate, sender)),
             memory: options.memory,
@@ -1980,6 +2044,11 @@ impl<'a> Orchestrator<'a> {
                 unreachable!("panel has no decision tool")
             }
             Ok(Step::Finished(result)) => {
+                ensure!(
+                    !options.passive_inspection || !result.trim().is_empty(),
+                    "{} returned an empty continuation report",
+                    peer.author
+                );
                 if options.jobs.is_some_and(|jobs| {
                     jobs.book.has_outstanding(peer.author) || jobs.book.has_receipts(peer.author)
                 }) {
@@ -2323,6 +2392,7 @@ impl<'a> Orchestrator<'a> {
             width: self.parallel_limit.get(),
             ipc: ipc_enabled,
             tolerate_failures: false,
+            passive_inspection: false,
             gate: gate.as_ref(),
             stakeholder_start: Some(workers.len()),
             memory: &memory,
@@ -2600,7 +2670,9 @@ impl<'a> Orchestrator<'a> {
                     VerdictKind::Rejected => Phase::Rejected,
                     VerdictKind::NeedsRevision
                         if self.config.orchestration.max_review_cycles != 0
-                            && session.cycle >= self.config.orchestration.max_review_cycles =>
+                            && session.continuation.as_ref().map_or(session.cycle, |item| {
+                                session.cycle.saturating_sub(item.cycle).saturating_add(1)
+                            }) >= self.config.orchestration.max_review_cycles =>
                     {
                         Phase::Exhausted
                     }
@@ -2709,6 +2781,7 @@ struct PanelAgent<'a> {
 
 #[derive(Clone, Copy)]
 struct PeerTools<'a> {
+    passive_inspection: bool,
     route: Option<Route<'a>>,
     ack: Option<(&'a PlanGate<'a>, usize)>,
     memory: &'a SharedMemory,
@@ -2740,12 +2813,18 @@ impl<'a> PeerTools<'a> {
     }
 
     fn permits(&self, tool: &str) -> bool {
-        self.jobs.is_none_or(|jobs| jobs.permits(tool))
+        (!self.passive_inspection
+            || matches!(
+                tool,
+                "read_file" | "list_directory" | "search_files" | "find_files" | "recall"
+            ))
+            && self.jobs.is_none_or(|jobs| jobs.permits(tool))
     }
 }
 
 #[derive(Clone, Copy)]
 struct PanelOptions<'a> {
+    passive_inspection: bool,
     access: Access,
     width: usize,
     ipc: bool,

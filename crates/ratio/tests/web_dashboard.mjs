@@ -75,6 +75,12 @@ test("run dashboard manages a live run, triage, and deep-linked MCP audit", { ti
         await forkGate;
         output = completion("Fork recorded.");
       }
+      else if (tools.has("submit_continuation")) {
+        assert.match(input.messages[1].content, /Review a dashboard follow-up/);
+        output = completion(null, call("submit_continuation", {
+          decision:"decline", reason:"The prior approval covers this follow-up.", plan:null,
+        }));
+      }
       else if (tools.has("ping")) output = completion(null,call("ping",{}));
       else if (tools.has("submit_team")) output = completion(null,call("submit_team",{
         goal:"Inspect project interfaces",message:"One worker",
@@ -646,6 +652,20 @@ tools = ["inspect"]
     assert.equal(await cache.getAttribute("data-token-count"), "7");
     assert.match(await cache.textContent(), /7\+$/);
     await page.setViewportSize({width:1440,height:900});
+    await page.locator("#controls").getByRole("button",{name:"Share",exact:true}).click();
+    await page.locator("#create-share").click();
+    await page.locator("#share-url").waitFor();
+    const continuationShare = new URL(await page.locator("#share-url").inputValue());
+    await page.locator("#close-share").click();
+    await page.locator("#controls").getByRole("button",{name:"Continue run",exact:true}).click();
+    await page.getByLabel("Follow-up prompt").fill("Review a dashboard follow-up");
+    await page.locator("#submit-action").click();
+    await page.getByText("The prior approval covers this follow-up.",{exact:true}).waitFor();
+    assert.match(page.url(), new RegExp("/run/" + run + "/overview"));
+    const continuedOverview = await fetch(new URL(publicPath + "/overview", continuationShare), {
+      headers: { Authorization: "Bearer " + shareToken(continuationShare) },
+    });
+    assert.equal((await continuedOverview.json()).continuation.decision.decision, "decline");
     await page.locator("#controls").getByRole("button",{name:"Fork",exact:true}).click();
     await page.getByLabel("Replacement request").fill("Inspect the forked evidence");
     await page.locator("#submit-action").click();
