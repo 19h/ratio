@@ -1638,6 +1638,7 @@ fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
     succeeded(&launch);
     let launch: Value = serde_json::from_slice(&launch.stdout).unwrap();
     let run_id = launch["run"]["run_id"].as_str().unwrap();
+    let log = PathBuf::from(launch["log"].as_str().unwrap());
     connection.recv_timeout(Duration::from_secs(8)).unwrap();
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -1656,7 +1657,12 @@ fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
             .args(extra)
             .output()
             .unwrap();
-        succeeded(&output);
+        assert!(
+            output.status.success(),
+            "control {action} failed: {}\nrunner log:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
         serde_json::from_slice::<Value>(&output.stdout).unwrap()
     };
     assert_eq!(control("status", &[])["run_id"], run_id);
@@ -1667,7 +1673,6 @@ fn detached_run_accepts_controls_and_can_resume_after_cancellation() {
     );
     assert_eq!(control("cancel", &[])["accepted"], true);
     server.join().unwrap();
-    let log = PathBuf::from(launch["log"].as_str().unwrap());
     assert!(
         std::fs::read_to_string(&log)
             .unwrap()
@@ -3046,7 +3051,7 @@ persona = "Own worker_3.txt."
 "#,
             // Direct runs check these in the live workspace, which is only a
             // Git repository in the staged variant.
-            verification = if staged && !cfg!(windows) {
+            verification = if staged {
                 "verification_commands = [\"git diff --check\"]"
             } else {
                 ""
@@ -3335,7 +3340,12 @@ persona = "Own worker_3.txt."
             if staged {
                 assert_eq!(recovered, 3);
             }
-            (decision("approved", "Verified."), false)
+            if staged && cfg!(windows) {
+                assert!(task.contains("workspace sandbox unavailable"), "{task}");
+                (decision("rejected", "Verification unavailable."), false)
+            } else {
+                (decision("approved", "Verified."), false)
+            }
         } else {
             (text("Coordinate assignments for all three workers."), false)
         };
@@ -3356,7 +3366,24 @@ persona = "Own worker_3.txt."
     );
     assert!(!temp.path().join("premature.txt").exists());
     assert!(!temp.path().join("unowned.txt").exists());
-    if unanimous {
+    if staged && cfg!(windows) {
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let store = ra::session::Store::reader(temp.path()).unwrap();
+        let run = store.runs().unwrap().remove(0);
+        let candidate = temp
+            .path()
+            .join(".ratio/staging")
+            .join(run.run_id)
+            .join("candidate");
+        for worker in 1..=3 {
+            let file = format!("worker_{worker}.txt");
+            assert!(!temp.path().join(&file).exists());
+            assert_eq!(
+                std::fs::read_to_string(candidate.join(file)).unwrap(),
+                worker.to_string()
+            );
+        }
+    } else if unanimous {
         succeeded(&output);
         for worker in 1..=3 {
             assert_eq!(
@@ -5665,7 +5692,7 @@ fn accepted_campaign_survives_failed_workspace_preparation() {
 }
 
 #[test]
-fn approved_run_continuation_restores_approval_and_runs_a_fresh_staged_cycle() {
+fn approved_run_continuation_restores_approval_and_runs_a_fresh_cycle() {
     let workspace = tempfile::tempdir().unwrap();
     let root = workspace.path();
     succeeded(
@@ -5698,10 +5725,12 @@ persona = "Check release requirements."
 phases = ["review"]
 "#;
     let configuration = if cfg!(windows) {
-        configuration.replace(
-            "verification_commands = [\"git diff --check\"]",
-            "verification_commands = []",
-        )
+        configuration
+            .replace("stage_workspace = true", "stage_workspace = false")
+            .replace(
+                "verification_commands = [\"git diff --check\"]",
+                "verification_commands = []",
+            )
     } else {
         configuration.to_owned()
     };
