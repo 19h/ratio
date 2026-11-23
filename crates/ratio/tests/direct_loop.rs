@@ -5547,3 +5547,57 @@ phases = ["review"]
     assert!(reader.metrics(&original.run_id).unwrap().provider_attempts > original_usage + 13);
     server.join().unwrap();
 }
+
+#[test]
+fn team_proposal_cut_short_by_the_output_cap_names_the_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        assert!(
+            request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == "submit_team"),
+            "team generation sends the submit_team schema"
+        );
+        (
+            200,
+            json!({"choices": [{"finish_reason":"length",
+                "message":{"role":"assistant","content":"I will now propose the team."}}],
+                "test_terminal": index == 2}),
+        )
+    });
+    let run = Command::new(ratio_binary())
+        .args([
+            "-C",
+            temp.path().to_str().unwrap(),
+            "--api-key",
+            "test-key",
+            "--model",
+            "test-model",
+            "--context-window",
+            "8192",
+            "--output-tokens",
+            "1024",
+            "--endpoint",
+            &endpoint,
+            "--goal",
+            "Write a status file.",
+            "--plan-only",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("provider stopped before returning the full proposal"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("finish_reason length"), "{stderr}");
+    assert!(
+        stderr.contains("output cap 1024 tokens"),
+        "the failure names the configured cap: {stderr}"
+    );
+    assert!(stderr.contains("raise output_tokens"), "{stderr}");
+    server.join().unwrap();
+}

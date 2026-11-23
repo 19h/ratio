@@ -185,8 +185,13 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
                     crate::context::clip(&previous.message, previous.message.len() / 3);
                 continue;
             }
-            Some("length" | "content_filter") => {
-                anyhow::bail!("provider stopped before returning the full proposal");
+            Some(reason @ ("length" | "content_filter")) => {
+                anyhow::bail!(
+                    "provider stopped before returning the full proposal (finish_reason \
+                     {reason}, output cap {} tokens): raise output_tokens, or use \
+                     fixed_team to skip team generation",
+                    config.output_tokens
+                );
             }
             _ => {}
         }
