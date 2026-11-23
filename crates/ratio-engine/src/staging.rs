@@ -136,10 +136,10 @@ impl Staging {
         let baseline = load(&self.root.join("baseline.json"))?;
         let current = snapshot(&candidate, Some(&baseline))?;
         copy_tree(&candidate, temp.path(), &current)?;
-        let origin = candidate.to_str().context("non-UTF-8 candidate location")?;
+        // Use a relative Git path so Windows verbatim paths cannot be parsed as remote hosts.
         git(
             temp.path(),
-            &["fetch", "--quiet", "--no-tags", origin, "HEAD"],
+            &["fetch", "--quiet", "--no-tags", "../candidate", "HEAD"],
         )?;
         git(temp.path(), &["reset", "--quiet", "--mixed", "FETCH_HEAD"])?;
         Ok(temp)
