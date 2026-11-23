@@ -2001,7 +2001,9 @@ fn calls(calls: &[Value]) -> (u16, Value) {
 fn succeeded(run: &Output) {
     assert!(
         run.status.success(),
-        "{}",
+        "{}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
 }
@@ -3343,6 +3345,8 @@ persona = "Own worker_3.txt."
             config.to_str().unwrap(),
             "--goal",
             "worker gate smoke test",
+            "--max-run-secs",
+            "30",
         ],
     );
     assert!(!temp.path().join("premature.txt").exists());
