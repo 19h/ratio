@@ -276,7 +276,9 @@ impl Ui {
                                 _ => {}
                             },
                             result = &mut request => break Some(result),
-                            Some(event) = self.events.recv() => self.view.push_event(event),
+                            Some(event) = self.events.recv() => {
+                                self.view.push_event(event);
+                            }
                         }
                     }
                 };
@@ -407,10 +409,22 @@ impl Ui {
                 }
                 Some(event) = self.events.recv() => {
                     redraw = true;
-                    self.view.push_event(event);
+                    let mut tool_started = self.view.push_event(event);
                     for _ in 0..127 {
                         let Ok(event) = self.events.try_recv() else { break };
-                        self.view.push_event(event);
+                        tool_started |= self.view.push_event(event);
+                        if tool_started {
+                            break;
+                        }
+                    }
+                    // An agent card keeps one live row and updates it in place, so a tool
+                    // that starts and finishes between frame ticks is overwritten before
+                    // any frame draws it. The drain stops at a tool start and paints it, so
+                    // every call gets a frame of its own; the cost is bounded by the number
+                    // of calls in flight, which is the same work the frame tick renders.
+                    if tool_started {
+                        self.draw(None, Mode::Running)?;
+                        redraw = false;
                     }
                 },
                 _ = workflow_tick.tick() => {
@@ -609,10 +623,11 @@ impl View {
         }
     }
 
-    fn push_event(&mut self, event: Event) {
+    /// Records one event, returning whether it started a tool call.
+    fn push_event(&mut self, event: Event) -> bool {
         if let Some(generation) = event.generation {
             self.agents.generation(generation);
-            return;
+            return false;
         }
         if let Some(network) = event.network {
             if let NetworkEvent::Roster(roster) = &network {
@@ -621,22 +636,24 @@ impl View {
                 }
             }
             self.network.ingest(network);
-            return;
+            return false;
         }
         if matches!(event.kind, Kind::Phase) {
             self.status.clone_from(&event.title);
         }
         if let Some(actor) = event.actor {
-            self.agents
+            let started = self
+                .agents
                 .observe(&actor, event.kind, &event.title, &event.body);
             self.push(
                 event.kind,
                 &format!("{actor} / {}", event.title),
                 &event.body,
             );
-        } else {
-            self.push(event.kind, &event.title, &event.body);
+            return started;
         }
+        self.push(event.kind, &event.title, &event.body);
+        false
     }
 
     fn push(&mut self, kind: Kind, title: &str, body: &str) {

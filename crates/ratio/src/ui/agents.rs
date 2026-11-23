@@ -90,7 +90,10 @@ impl Agents {
         }
     }
 
-    pub(super) fn observe(&mut self, actor: &str, kind: Kind, title: &str, body: &str) {
+    /// Records one observation, returning whether it started a tool call. The caller
+    /// paints those at once: a tool that starts and finishes inside one frame tick is
+    /// overwritten here before any frame shows it.
+    pub(super) fn observe(&mut self, actor: &str, kind: Kind, title: &str, body: &str) -> bool {
         let (state, color, running) = match kind {
             Kind::Tool if body.is_empty() => ("Tool running", Color::Yellow, true),
             Kind::Tool => ("Decision recorded", Color::Green, false),
@@ -100,9 +103,9 @@ impl Agents {
             Kind::Output => ("Tool result", Color::Green, false),
             Kind::Agent => ("Latest report", Color::LightMagenta, false),
             Kind::Info => ("Notice", Color::LightBlue, false),
-            _ => return,
+            _ => return false,
         };
-        self.record(actor, state, title, body, color, running);
+        self.record(actor, state, title, body, color, running)
     }
 
     pub(super) fn effect(&mut self, actor: &str, tool: &str, effect: EffectState) {
@@ -122,7 +125,7 @@ impl Agents {
         body: &str,
         color: Color,
         running: bool,
-    ) {
+    ) -> bool {
         let detail = if body.trim().is_empty() {
             clip(title, 240)
         } else if matches!(state, "Tool result" | "Tool refused") {
@@ -137,6 +140,7 @@ impl Agents {
             color,
             running,
         });
+        running
     }
 
     pub(super) fn render(&mut self, frame: &mut Frame<'_>, area: Rect) -> Rect {
@@ -330,5 +334,36 @@ mod tests {
                 "{preview} missing from {displayed}"
             );
         }
+    }
+
+    #[test]
+    fn a_tool_start_asks_for_a_frame_before_its_result_arrives() {
+        let mut agents = Agents::default();
+        assert!(
+            agents.observe("worker_1", Kind::Tool, "create_file · status.txt", ""),
+            "a running tool must ask for a frame"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 17)).unwrap();
+        terminal
+            .draw(|frame| {
+                agents.render(frame, frame.area());
+            })
+            .unwrap();
+        assert!(
+            terminal
+                .backend()
+                .to_string()
+                .contains("create_file · status.txt"),
+            "the frame a tool start forces must show that tool"
+        );
+        assert!(
+            !agents.observe(
+                "worker_1",
+                Kind::Output,
+                "create_file · status.txt",
+                "wrote status.txt"
+            ),
+            "a result must not force an extra frame"
+        );
     }
 }

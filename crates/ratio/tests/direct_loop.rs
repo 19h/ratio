@@ -3626,6 +3626,11 @@ fn tui_refines_and_approves_a_goal_then_displays_file_tools() {
     approved.store(true, Ordering::SeqCst);
     terminal.write_all(b"\x1b[<0;110;1M\x1b[<0;110;1m").unwrap();
     wait_for_screen(&mut terminal, &mut display, "Approved");
+    // The Activity tab paints each tool row the moment the worker starts it, so a tool
+    // that finishes inside one frame tick is on screen and not only in the journal.
+    for needle in ["create_file", "error:", "read_file", "edit_file"] {
+        wait_for_screen(&mut terminal, &mut display, needle);
+    }
     terminal.write_all(b"\t").unwrap();
     wait_for_screen(&mut terminal, &mut display, "Communication / Sequence");
     wait_for_screen(&mut terminal, &mut display, "Final verdict");
@@ -3643,9 +3648,8 @@ fn tui_refines_and_approves_a_goal_then_displays_file_tools() {
     succeeded(&run);
     assert!(String::from_utf8_lossy(&run.stdout).contains("VERDICT: APPROVED"));
     let screen = screen_text(&display);
-    // The Activity pane keeps one live row per agent and updates it in place, so
-    // a tool that starts and finishes between renders never reaches the screen.
-    // The durable record proves execution; the screen proves what the frames show.
+    // The screen above proves what the frames showed; the journal proves the run
+    // executed the calls, including the edit rejected for a stale line tag.
     let reader = ra::session::Store::reader(temp.path()).unwrap();
     let run = reader.runs().unwrap().remove(0);
     let audit = reader.audit(&run.run_id, Default::default(), 500).unwrap();
