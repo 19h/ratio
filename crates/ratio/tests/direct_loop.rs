@@ -422,6 +422,29 @@ fn provider_diagnostics_preserve_short_metadata_and_redact_credentials() {
 
 #[test]
 fn active_time_budget_still_interrupts_a_stalled_request() {
+    for check_only in [false, true] {
+        let run = stalled_provider(check_only);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let diagnostic = format!("stdout: {stdout}\nstderr: {stderr}");
+        if check_only {
+            assert_eq!(run.status.code(), Some(1), "{diagnostic}");
+            let report: Value = serde_json::from_slice(&run.stdout).unwrap();
+            assert_eq!(
+                report["checks"][0]["error"],
+                "run budget exhausted: active time"
+            );
+        } else {
+            assert_eq!(run.status.code(), Some(3), "{diagnostic}");
+            assert!(
+                stdout.contains("Run budget exhausted: active time"),
+                "{diagnostic}"
+            );
+        }
+    }
+}
+
+fn stalled_provider(check_only: bool) -> Output {
     let temp = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -429,17 +452,18 @@ fn active_time_budget_still_interrupts_a_stalled_request() {
     let server = thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
         read_mock_request(&mut socket);
-        stopped.recv_timeout(Duration::from_secs(5)).unwrap();
+        stopped.recv_timeout(Duration::from_secs(30)).unwrap();
     });
-    let run = cli(
-        temp.path(),
-        &endpoint,
-        &["--goal", "Inspect workspace", "--max-run-secs", "2"],
-    );
+    let mut options = vec!["--max-run-secs", "2"];
+    if check_only {
+        options.push("--check-provider");
+    } else {
+        options.extend(["--goal", "Inspect workspace"]);
+    }
+    let run = cli(temp.path(), &endpoint, &options);
     finished.send(()).unwrap();
-    assert_eq!(run.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&run.stdout).contains("Run budget exhausted: active time"));
     server.join().unwrap();
+    run
 }
 
 #[test]

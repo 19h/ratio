@@ -121,6 +121,8 @@ pub struct Completion {
 pub enum ApiError {
     #[error("model generation cancelled")]
     Cancelled,
+    #[error("run budget exhausted: active time")]
+    ActiveTimeBudget,
     #[error("provider rejected context (HTTP {status}): {detail}")]
     Context { status: u16, detail: String },
     #[error("provider returned HTTP {status}: {detail}")]
@@ -344,19 +346,12 @@ impl Api {
             tokio::pin!(cancelled);
             let completion =
                 self.complete_once(model, messages, tools, output_tokens, &tokens, &mut preview);
-            let result = async {
-                if let Some(remaining) = self.budget.remaining() {
-                    tokio::time::timeout(remaining, completion)
-                        .await
-                        .map_err(|_| anyhow::anyhow!("run budget exhausted: active time"))?
-                } else {
-                    completion.await
-                }
-            };
             let result = tokio::select! {
                 biased;
                 () = &mut cancelled => return Err(ApiError::Cancelled),
-                result = result => result,
+                // Wait for the same deadline the run uses to classify exhaustion.
+                () = self.budget.until_exhausted() => Err(ApiError::ActiveTimeBudget),
+                result = completion => result,
             };
             drop(preview);
             drop(tokens);
@@ -403,9 +398,7 @@ impl Api {
             tokio::select! {
                 biased;
                 () = &mut cancelled => return Err(ApiError::Cancelled),
-                () = self.budget.until_exhausted() => {
-                    return Err(anyhow::anyhow!("run budget exhausted: active time").into());
-                }
+                () = self.budget.until_exhausted() => return Err(ApiError::ActiveTimeBudget),
                 () = tokio::time::sleep(wait) => {}
             }
             attempt = attempt.saturating_add(1);
