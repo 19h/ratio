@@ -324,7 +324,7 @@ Use **Guide** when you know what the team should do differently. The text reache
 
 Automatic triage uses the lead reviewer to classify and route information within the existing run permissions. You can name agents in the note. A queued note is waiting for routing at a runner checkpoint. Delivery saves it for the recipient and places it after the tool history in the next model request. The inbox shows the routing decision and delivery receipts, and allows you to retry routing an undelivered note. Pending items are marked deferred if the run finishes before delivery. **Add worker** requests a separate, read-only onboarding phase followed by unanimous acknowledgement of the amended plan. The worker request links to its onboarding IPC.
 
-Use **Continue run** on an approved run to submit a follow-up. Each recorded stakeholder reviews the prompt and responds to the panel’s findings. The lead reviewer records the decision and rationale. If accepted, Ratio starts a new execution cycle with the continuation plan and the same run ID. If declined, the earlier approval still applies and you can submit a revised prompt. Each follow-up has fresh limits. Usage and prior approvals remain in the run history, which includes any active share link.
+Use **Continue run** on an approved run to submit a follow-up of up to 4,096 UTF-8 bytes. Each recorded stakeholder reviews the prompt and responds to the panel’s findings. The lead reviewer records the decision and rationale. If accepted, Ratio records the plan and automatically starts a new execution cycle under the same run ID. If declined, the prior approval remains on record and you can submit a revised prompt. Use **Resume saved** after an interruption or a failed stakeholder review to pick up from the latest checkpoint.
 
 ### Closing, resuming, and changing configuration
 
@@ -361,7 +361,7 @@ Point Funnel at the separate read-only port, `7351` in this example. Open the pr
 
 Anyone holding the link can view that run’s live activity and recorded history, including prompts, messages, tool arguments and outputs, and operator notes. The public listener serves only run-scoped reads and denies API access to controls, other runs, and the checkpoint archive.
 
-Each run has one active link. **Replace link** invalidates the previous URL, and **Revoke link** also disconnects active visitors. Links remain valid across dashboard restarts when the same workspace and public origin are used. To preview sharing locally, omit `--web-share-origin` and use a fixed `--web-share-port`.
+Each run has one active link. The link also shows any follow-up submitted through **Continue run**, including its prompt, stakeholder discussion, decision, and plan. **Replace link** invalidates the previous URL, and **Revoke link** also disconnects active visitors. Links remain valid across dashboard restarts when the same workspace and public origin are used. To preview sharing locally, omit `--web-share-origin` and use a fixed `--web-share-port`.
 
 ### Run journal
 
@@ -625,6 +625,8 @@ Omit a limit or set it to `0` for unlimited operation. A positive value sets the
 An agent that reaches `max_tool_rounds` is not stopped mid-task. Its tools close for the phase and it is asked for a report of what is complete, what remains, and what it verified. The lead reviewer keeps its decision tool, so it can still submit a plan or a verdict.
 
 Ratio records usage for all runs. Provider attempts include retries and compaction. Token reservations use estimated input plus requested output and reconcile against usage when reported. Definite rate-limit and context rejections without usage release the token reservation. Ambiguous failures retain it. The active clock stops after an acknowledged pause reaches a request boundary and running tools settle.
+
+Each follow-up submitted through **Continue run** gets fresh caps for provider attempts, metered tokens, active runtime, and review cycles. Stakeholder review and the lead decision count toward the follow-up’s usage. The dashboard and CLI metrics report cumulative usage for the run.
 
 After a run stops at its token, provider-attempt, or active-runtime limit, update the cap and use **Resume saved** or `--resume --run-id RUN_ID`. Ratio restores the checkpoint before the stop and keeps the same run ID, history, and accumulated usage.
 
