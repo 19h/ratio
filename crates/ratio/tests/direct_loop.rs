@@ -5601,3 +5601,84 @@ fn team_proposal_cut_short_by_the_output_cap_names_the_cap() {
     assert!(stderr.contains("raise output_tokens"), "{stderr}");
     server.join().unwrap();
 }
+
+#[test]
+fn proposal_owner_names_resolve_to_the_canonical_roster() {
+    let temp = tempfile::tempdir().unwrap();
+    let proposal = json!({
+        "goal":"Build a beacon and a team server.",
+        "message":"Two workers, one per binary.",
+        "stakeholders":[],
+        "reviewers":[],
+        "workers":[
+            {"name":"Beacon","persona":"Owns the implant."},
+            {"name":"Team Server","persona":"Owns the team server."}
+        ],
+        "acceptance":["the beacon checks in and runs a queued task"],
+        "campaign":{
+            "tasks":[
+                {"id":"beacon","worker":"Beacon","description":"Write the implant.",
+                 "depends_on":["server"],"acceptance":["the implant builds"]},
+                {"id":"server","worker":"Team Server","description":"Write the team server.",
+                 "depends_on":[],"acceptance":["the server builds"]}
+            ],
+            "ownership":{
+                "Beacon":[{"path":"src/beacon.rs","directory":false}],
+                "Team Server":[{"path":"src/server.rs","directory":false}]
+            },
+            "rationale":"Two binaries, two exclusive owners."
+        }
+    });
+    let (endpoint, server) = mock(move |index, request| {
+        assert!(
+            request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == "submit_team"),
+            "team generation sends the submit_team schema"
+        );
+        assert_eq!(
+            index, 0,
+            "a proposal with named owners needs no repair round"
+        );
+        let (status, mut response) = calls(&[tool("submit", "submit_team", proposal.clone())]);
+        response["test_terminal"] = json!(true);
+        (status, response)
+    });
+    let run = Command::new(ratio_binary())
+        .args([
+            "-C",
+            temp.path().to_str().unwrap(),
+            "--api-key",
+            "test-key",
+            "--model",
+            "test-model",
+            "--context-window",
+            "8192",
+            "--output-tokens",
+            "1024",
+            "--endpoint",
+            &endpoint,
+            "--goal",
+            "Build a beacon and a team server.",
+            "--plan-only",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    let draft: Value = serde_json::from_slice(&run.stdout).unwrap();
+    assert_eq!(draft["workers"][0]["name"], "Beacon");
+    assert_eq!(draft["campaign"]["tasks"][0]["worker"], "worker_1");
+    assert_eq!(draft["campaign"]["tasks"][1]["worker"], "worker_2");
+    assert_eq!(
+        draft["campaign"]["ownership"]["worker_1"][0]["path"],
+        "src/beacon.rs"
+    );
+    assert_eq!(
+        draft["campaign"]["ownership"]["worker_2"][0]["path"],
+        "src/server.rs"
+    );
+    server.join().unwrap();
+}

@@ -186,7 +186,7 @@ ra -C /path/to/project --plan-only 'Add a --version flag to the CLI'
 
 `--check-provider` prints one JSON record per model with `ok`, `tool_call`, `latency_ms`, and any provider error. `--plan-only` asks the model to propose a team for the request, prints the proposal as JSON, and exits. A printed proposal means the endpoint, key, model ID, and function calling all work. Neither command writes to the project.
 
-Ratio's built-in Campaign Architect uses the request, the profile's tool policy, and root project manifests to propose a goal, roster, draft task graph, and acceptance gates. During coordination the team can revise dependencies and ownership. Ratio freezes the resulting plan before workers acknowledge it.
+Ratio's built-in Campaign Architect uses the request, the profile's tool policy, and root project manifests to propose a goal, roster, draft task graph, and acceptance gates. Workers are addressed by position, as `worker_1` to `worker_N`. A proposal that names its owners with its own roster names is mapped onto those IDs, so the draft task graph and the frozen plan use the same identifiers. During coordination the team can revise dependencies and ownership. Ratio freezes the resulting plan before workers acknowledge it.
 
 If `verification_commands` is omitted, the generated campaign may select declared npm checks, Cargo tests, or Go tests when their runners are available. An explicit list controls verification, including `[]` to disable discovery. If `stage_workspace` is omitted, the campaign may select staging when an executable check is selected and the workspace is the root of a Git worktree with a commit. The configured `max_parallel_agents` remains the concurrency ceiling.
 

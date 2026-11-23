@@ -2,7 +2,7 @@ mod campaign;
 
 pub use campaign::{Campaign, Check, Execution};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -112,7 +112,7 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
     }));
     let worker_prompt = if generate {
         format!(
-            "Include 1 to 64 workers with name and persona, project acceptance criteria, and a campaign object with draft tasks, ownership, rationale, and supported settings. Roster size and concurrent slot count are separate.\nWorkspace capabilities: {}",
+            "Include 1 to 64 workers with name and persona, project acceptance criteria, and a campaign object with draft tasks, ownership, rationale, and supported settings. Roster size and concurrent slot count are separate. Every campaign task and ownership entry names its worker by a name from the workers array.\nWorkspace capabilities: {}",
             capabilities.as_ref().expect("generation capabilities")
         )
     } else {
@@ -239,6 +239,9 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
                         "each worker needs a unique name and assignment"
                     );
                 }
+                if let Some(campaign) = &mut draft.campaign {
+                    canonicalize_owners(campaign, &draft.workers);
+                }
                 draft.execution = Some(facts.as_ref().expect("generation facts").resolve(
                     config,
                     draft.campaign.as_ref(),
@@ -262,6 +265,40 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
     }
 }
 
+/// Ratio addresses workers by position, as `worker_1`..`worker_N`. A proposal
+/// that refers to its own workers by name in the draft campaign is rewritten to
+/// those IDs, so descriptive roster names stay usable in `workers` while the
+/// task graph and ownership map stay addressable.
+fn canonicalize_owners(campaign: &mut Campaign, workers: &[Worker]) {
+    let roster = (1..=workers.len())
+        .map(|index| format!("worker_{index}"))
+        .collect::<HashSet<_>>();
+    let by_name = workers
+        .iter()
+        .enumerate()
+        .map(|(index, worker)| (worker.name.to_lowercase(), format!("worker_{}", index + 1)))
+        .collect::<HashMap<_, _>>();
+    let canonical = |owner: &str| {
+        if roster.contains(owner) {
+            None
+        } else {
+            by_name.get(&owner.to_lowercase()).cloned()
+        }
+    };
+    for task in &mut campaign.tasks.0 {
+        if let Some(owner) = canonical(&task.worker) {
+            task.worker = owner;
+        }
+    }
+    campaign.ownership = std::mem::take(&mut campaign.ownership)
+        .into_iter()
+        .map(|(owner, paths)| match canonical(&owner) {
+            Some(id) => (id, paths),
+            None => (owner, paths),
+        })
+        .collect();
+}
+
 fn team_schema() -> Value {
     let participant = json!({"type":"object","properties":{
         "name":{"type":"string"},"persona":{"type":"string"},"phases":{"type":"array","minItems":1,
@@ -275,11 +312,11 @@ fn team_schema() -> Value {
         "acceptance":{"type":"array","minItems":1,"items":{"type":"string"}},
         "campaign":{"type":"object","additionalProperties":false,"properties":{
             "tasks":{"type":"array","maxItems":64,"items":{"type":"object","additionalProperties":false,
-                "properties":{"id":{"type":"string"},"worker":{"type":"string"},"description":{"type":"string"},
+                "properties":{"id":{"type":"string"},"worker":{"type":"string","description":"The owning worker: a name from the workers array, written exactly as there"},"description":{"type":"string"},
                     "depends_on":{"type":"array","items":{"type":"string"}},
                     "acceptance":{"type":"array","items":{"type":"string"}}},
                 "required":["id","worker","description","depends_on","acceptance"]}},
-            "ownership":{"type":"object","description":"Map each worker_N to an array of {path, directory} entries.",
+            "ownership":{"type":"object","description":"Map each worker, keyed by the same name used in workers, to an array of {path, directory} entries.",
                 "additionalProperties":{"type":"array","items":{"type":"object","additionalProperties":false,
                     "properties":{"path":{"type":"string"},"directory":{"type":"boolean"}},"required":["path","directory"]}}},
             "rationale":{"type":"string"},
