@@ -345,10 +345,16 @@ impl Api {
             let completion =
                 self.complete_once(model, messages, tools, output_tokens, &tokens, &mut preview);
             let result = async {
-                if let Some(remaining) = self.budget.remaining() {
-                    tokio::time::timeout(remaining, completion)
-                        .await
-                        .map_err(|_| anyhow::anyhow!("run budget exhausted: active time"))?
+                if self.budget.remaining().is_some() {
+                    // The run's own deadline watches this same expiry and turns it into a
+                    // graceful exhaustion. A wall-clock timeout armed from an earlier
+                    // snapshot wins that race by microseconds, so hand the moment over
+                    // instead of failing the request the run is ending on.
+                    tokio::select! {
+                        biased;
+                        () = self.budget.until_exhausted() => Err(ApiError::Cancelled),
+                        result = completion => result,
+                    }
                 } else {
                     completion.await
                 }
@@ -403,9 +409,7 @@ impl Api {
             tokio::select! {
                 biased;
                 () = &mut cancelled => return Err(ApiError::Cancelled),
-                () = self.budget.until_exhausted() => {
-                    return Err(anyhow::anyhow!("run budget exhausted: active time").into());
-                }
+                () = self.budget.until_exhausted() => return Err(ApiError::Cancelled),
                 () = tokio::time::sleep(wait) => {}
             }
             attempt = attempt.saturating_add(1);
