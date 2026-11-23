@@ -224,12 +224,24 @@ pub(crate) async fn refine_audited(
                     crate::context::clip(&previous.message, previous.message.len() / 3);
                 continue;
             }
-            Some("length" | "content_filter") => {
-                let reason = "provider stopped before returning the full proposal";
+            Some(finish @ ("length" | "content_filter")) => {
+                let reason = if finish == "length" {
+                    let fixed_team = if generate {
+                        ", or use --fixed-team to skip team generation for a run"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "provider stopped before returning the full proposal (finish_reason length, output cap {} tokens). Raise output_tokens or shorten the request{fixed_team}",
+                        config.output_tokens,
+                    )
+                } else {
+                    "provider stopped before returning the full proposal (finish_reason content_filter). The provider filtered the response".to_owned()
+                };
                 audit(Audit::Attempt {
                     message: &completion.message,
                     state: "failed",
-                    result: reason,
+                    result: &reason,
                 })?;
                 anyhow::bail!("{reason}");
             }

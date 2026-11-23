@@ -215,6 +215,7 @@ The start page and the **Start run** dialog report a profile that cannot be load
 | The provider rejects `max_completion_tokens` | The gateway predates that field. | Set `legacy_max_tokens = true` at the top level of the profile. |
 | The provider cannot stream | The endpoint returns JSON only. | Set `stream = false` under `[provider]`. |
 | The provider reports that the context is too long | `context_window` is larger than what the server accepts. | Lower `context_window` to the server's real limit. |
+| **Propose team** fails with `finish_reason length` | The proposal reached the configured output cap. Reasoning tokens may consume part of that cap. | Raise `output_tokens` within the context budget, shorten the request, or start the run with `--fixed-team`. |
 | The model answers in prose and never calls a tool | The model or server does not support function calling. | Choose a tool-capable model, or enable tool calling on the server. |
 | The browser shows `Invalid dashboard host` | The page was opened through `localhost` or another hostname. | Open the `http://127.0.0.1:PORT/...` URL exactly as printed. |
 | The browser shows `Open the private URL printed by ra --web` | This tab has no access token. Each dashboard start prints a new token, and each tab keeps its own. | Open the full printed URL, including `#access=...`. |

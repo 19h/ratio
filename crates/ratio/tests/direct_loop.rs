@@ -5188,6 +5188,38 @@ fn generated_campaign_defers_overlapping_draft_paths_to_worker_ipc() {
 }
 
 #[test]
+fn setup_reports_truncation_and_content_filter_separately() {
+    for (finish, requests) in [("length", 3), ("content_filter", 1)] {
+        let root = tempfile::tempdir().unwrap();
+        let (endpoint, server) = mock(move |index, _| {
+            (
+                200,
+                json!({"choices":[{"finish_reason":finish,
+                    "message":{"role":"assistant","content":"Partial proposal"}}],
+                    "test_terminal":index + 1 == requests}),
+            )
+        });
+        let output = generated_campaign_command(root.path(), &endpoint)
+            .args(["--goal", "Inspect the fixture", "--plan-only"])
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{error}");
+        assert!(
+            error.contains(&format!("finish_reason {finish}")),
+            "{error}"
+        );
+        assert_eq!(error.contains("output cap 2048 tokens"), finish == "length");
+        assert_eq!(error.contains("Raise output_tokens"), finish == "length");
+        assert_eq!(
+            error.contains("The provider filtered"),
+            finish == "content_filter"
+        );
+    }
+}
+
+#[test]
 fn setup_audits_proposal_repairs_and_preserves_manual_verification() {
     use ratio_engine::{audit::AuditFilter, session::Store};
 
