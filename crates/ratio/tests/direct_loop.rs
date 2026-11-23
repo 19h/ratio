@@ -3456,7 +3456,7 @@ fn tui_refines_and_approves_a_goal_then_displays_file_tools() {
         let messages = request["messages"].as_array().unwrap();
         let system = messages[0]["content"].as_str().unwrap();
         let task = messages[1]["content"].as_str().unwrap();
-        if system.starts_with("Help the user plan") {
+        if system.starts_with("You are the Ratio Campaign Architect") {
             assert!(request.get("tools").is_none());
             if index == 0 {
                 assert!(task.contains("Write a status file"));
@@ -4746,4 +4746,330 @@ fn provider_check_reports_reachability_tool_calls_and_redacted_errors() {
         error.contains("401") && !error.contains("test-key"),
         "{error}"
     );
+}
+
+fn generated_campaign_command(cwd: &Path, endpoint: &str) -> Command {
+    let mut command = Command::new(ratio_binary());
+    command
+        .env("XDG_CONFIG_HOME", cwd)
+        .env("APPDATA", cwd)
+        .args([
+            "-C",
+            cwd.to_str().unwrap(),
+            "--headless",
+            "--endpoint",
+            endpoint,
+            "--api-key",
+            "test-key",
+            "--model",
+            "test-model",
+            "--context-window",
+            "8192",
+            "--output-tokens",
+            "2048",
+            "--max-cycles",
+            "2",
+        ]);
+    command
+}
+
+#[test]
+fn generated_campaign_exports_a_strict_morph_style_profile() {
+    use clap::Parser;
+    use ra::config::{Cli, Config};
+
+    let root = tempfile::tempdir().unwrap();
+    let profile = root.path().join("base.toml");
+    std::fs::write(
+        &profile,
+        include_str!("../../../examples/morph-assist.toml"),
+    )
+    .unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        assert_eq!(index, 0);
+        let messages = request["messages"].to_string();
+        assert!(messages.contains("Ratio Campaign Architect"));
+        assert!(messages.contains("inspection_tools"));
+        let (status, mut response) = calls(&[tool(
+            "campaign",
+            "submit_team",
+            json!({
+                "goal":"Reconcile two independent records",
+                "message":"Prepared reconciliation",
+                "workers":[{"name":"Reconciler","persona":"Compare source totals"}],
+                "stakeholders":[], "reviewers":[],
+                "acceptance":["A discrepancy report identifies both sources"],
+                "campaign":{
+                    "rationale":"One shared ledger needs one owner",
+                    "tasks":[{"id":"compare","worker":"worker_1","description":"Compare totals",
+                        "depends_on":[],"acceptance":["Check both control totals"]}],
+                    "ownership":{"worker_1":[{"path":"report.md","directory":false}]},
+                    "prefer_staging":true,
+                    "max_parallel_agents":1
+                }
+            }),
+        )]);
+        response["test_terminal"] = json!(true);
+        (status, response)
+    });
+    let output = generated_campaign_command(root.path(), &endpoint)
+        .args([
+            "--config",
+            profile.to_str().unwrap(),
+            "--plan-only",
+            "--plan-format",
+            "toml",
+            "--goal",
+            "Compare two migration totals",
+        ])
+        .output()
+        .unwrap();
+    succeeded(&output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains("test-key"));
+    assert!(!root.path().join(".ratio").exists());
+    let export = root.path().join("campaign.toml");
+    std::fs::write(&export, text).unwrap();
+    let config = Config::load(Cli::parse_from([
+        "ra",
+        "--config",
+        export.to_str().unwrap(),
+        "--endpoint",
+        &endpoint,
+    ]))
+    .unwrap();
+    assert_eq!(config.workers[0].name, "Reconciler");
+    assert!(config.goal.unwrap().contains("Check both control totals"));
+    assert!(config.orchestration.require_task_graph);
+    assert_eq!(config.orchestration.stage_workspace, Some(false));
+    assert_eq!(config.orchestration.max_parallel_agents, 1);
+    assert!(config.mcp_servers["assist"].allow_all);
+    server.join().unwrap();
+}
+
+#[test]
+fn generated_campaign_freezes_discovered_verification_and_blocks_approval_on_failure() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = 'fixture'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("Cargo.lock"), "version = 4\n").unwrap();
+    // Deliberately has no Cargo targets. The discovered command must really run and fail.
+    let (endpoint, server) = mock(|index, request| {
+        let messages = request["messages"].to_string();
+        match index {
+            0 => {
+                assert!(messages.contains("cargo-test"));
+                calls(&[tool(
+                    "team",
+                    "submit_team",
+                    json!({
+                        "goal":"Inspect the fixture", "message":"Prepared review",
+                        "workers":[{"name":"Inspector","persona":"Inspect the manifest"}],
+                        "reviewers":[], "stakeholders":[], "acceptance":["Record the manifest result"],
+                        "campaign":{
+                            "tasks":[{"id":"draft","worker":"worker_1","description":"Inspect",
+                                "depends_on":[],"acceptance":["Check the manifest"]}],
+                            "ownership":{"worker_1":[]},"rationale":"One read-only owner"
+                        }
+                    }),
+                )])
+            }
+            1 => {
+                assert!(messages.contains("Draft campaign for coordination"));
+                text("Check whether the fixture has a Cargo target.")
+            }
+            2 => text("The runtime check should verify the manifest."),
+            3 => {
+                assert!(request["tools"].to_string().contains("verification_checks"));
+                calls(&[tool(
+                    "plan",
+                    "submit_plan",
+                    json!({
+                        "plan":"Check the manifest", "ownership":{"worker_1":[]},
+                        "tasks":[{"id":"inspect","worker":"worker_1","description":"Inspect",
+                            "depends_on":[],"acceptance":["Check the manifest"]}],
+                        "verification_checks":["cargo-test"]
+                    }),
+                )])
+            }
+            4 | 10 => {
+                assert!(messages.contains("Additional frozen verification checks"));
+                let schema = request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["function"]["name"] == "ack_plan")
+                    .unwrap();
+                let id = &schema["function"]["parameters"]["properties"]["plan_id"]["enum"][0];
+                calls(&[tool("ack", "ack_plan", json!({"plan_id":id}))])
+            }
+            5 | 11 => text("Inspected the fixture."),
+            6 => {
+                assert!(messages.contains("Workspace verification passed: false"));
+                calls(&[tool(
+                    "bad_verdict",
+                    "submit_verdict",
+                    json!({
+                        "verdict":"approved","assessment":"Attempted approval"
+                    }),
+                )])
+            }
+            7 => {
+                assert!(messages.contains("Verification failed"));
+                decision("needs_revision", "Review the Cargo manifest again.")
+            }
+            8 => text("The manifest is still malformed."),
+            9 => {
+                assert!(messages.contains("Previously frozen verification checks are retained"));
+                calls(&[tool(
+                    "plan",
+                    "submit_plan",
+                    json!({
+                        "plan":"Recheck the manifest", "ownership":{"worker_1":[]},
+                        "tasks":[{"id":"inspect","worker":"worker_1","description":"Inspect again",
+                            "depends_on":[],"acceptance":["Check the manifest"]}]
+                    }),
+                )])
+            }
+            12 => {
+                assert!(messages.contains("Workspace verification passed: false"));
+                decision("rejected", "Cargo verification failed again.")
+            }
+            _ => panic!("unexpected request {index}"),
+        }
+    });
+    let output = generated_campaign_command(root.path(), &endpoint)
+        .args(["--goal", "Inspect the fixture"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    server.join().unwrap();
+}
+
+#[test]
+fn accepted_campaign_survives_failed_workspace_preparation() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path();
+    for args in [
+        vec!["init", "--quiet"],
+        vec![
+            "-c",
+            "user.name=Ratio",
+            "-c",
+            "user.email=ratio@example.invalid",
+            "commit",
+            "--allow-empty",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+    ] {
+        succeeded(
+            &Command::new("git")
+                .current_dir(workspace)
+                .args(args)
+                .output()
+                .unwrap(),
+        );
+    }
+    let profile = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        profile.path(),
+        "[orchestration]\nverification_commands = ['git diff --check']\n",
+    )
+    .unwrap();
+    let staging = workspace.join(".ratio/staging");
+    std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+    std::fs::write(&staging, "blocks staging initialization").unwrap();
+    let (endpoint, server) = mock(|index, request| {
+        assert_eq!(index, 0);
+        assert!(
+            request["messages"]
+                .to_string()
+                .contains("git_root_with_head")
+        );
+        let (status, mut response) = calls(&[tool(
+            "team",
+            "submit_team",
+            json!({
+                "goal":"Inspect the staged fixture","message":"Prepared",
+                "workers":[{"name":"Inspector","persona":"Inspect the fixture"}],
+                "reviewers":[], "stakeholders":[], "acceptance":["Report the result"],
+                "campaign":{"tasks":[{"id":"inspect","worker":"worker_1","description":"Inspect",
+                    "depends_on":[],"acceptance":["Report the result"]}],
+                    "ownership":{"worker_1":[]},"rationale":"One scope","prefer_staging":true}
+            }),
+        )]);
+        response["test_terminal"] = json!(true);
+        (status, response)
+    });
+    let output = generated_campaign_command(workspace, &endpoint)
+        .args([
+            "--config",
+            profile.path().to_str().unwrap(),
+            "--goal",
+            "Inspect",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    server.join().unwrap();
+    let run = ra::session::Store::open(workspace).unwrap().load().unwrap();
+    assert_eq!(run.goal, "Inspect the staged fixture");
+    assert_eq!(run.phase, ra::session::Phase::Plan);
+
+    std::fs::remove_file(staging).unwrap();
+    // A changed profile must not change settings that were accepted before the failed open.
+    std::fs::write(
+        profile.path(),
+        "[orchestration]\nstage_workspace = false\nverification_commands = []\n",
+    )
+    .unwrap();
+    let (endpoint, server) = mock(|index, request| match index {
+        0 => {
+            assert!(!request["tools"].to_string().contains("submit_team"));
+            text("Inspect and verify the fixture.")
+        }
+        1 => text("One read-only inspection."),
+        2 => calls(&[tool(
+            "plan",
+            "submit_plan",
+            json!({
+                "plan":"Inspect the fixture","ownership":{"worker_1":[]},
+                "tasks":[{"id":"inspect","worker":"worker_1","description":"Inspect",
+                    "depends_on":[],"acceptance":["Report the result"]}]
+            }),
+        )]),
+        3 => {
+            let schema = request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["function"]["name"] == "ack_plan")
+                .unwrap();
+            let id = &schema["function"]["parameters"]["properties"]["plan_id"]["enum"][0];
+            calls(&[tool("ack", "ack_plan", json!({"plan_id":id}))])
+        }
+        4 => text("Inspected the fixture."),
+        5 => {
+            assert!(
+                request["messages"]
+                    .to_string()
+                    .contains("Verification passed: true")
+            );
+            decision("approved", "Fixture verified.")
+        }
+        _ => panic!("unexpected request {index}"),
+    });
+    succeeded(
+        &generated_campaign_command(workspace, &endpoint)
+            .args(["--config", profile.path().to_str().unwrap(), "--resume"])
+            .output()
+            .unwrap(),
+    );
+    assert!(workspace.join(".ratio/staging").join(run.run_id()).is_dir());
+    server.join().unwrap();
 }

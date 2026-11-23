@@ -163,6 +163,15 @@ impl Staging {
     }
 }
 
+pub(crate) fn is_root_with_head(workspace: &Path) -> bool {
+    git(
+        workspace,
+        &["rev-parse", "--is-inside-work-tree", "--show-prefix"],
+    )
+    .is_ok_and(|output| String::from_utf8_lossy(&output).trim_end() == "true")
+        && git(workspace, &["rev-parse", "--verify", "HEAD"]).is_ok()
+}
+
 pub(crate) fn git(workspace: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .current_dir(workspace)

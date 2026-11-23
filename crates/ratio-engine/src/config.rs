@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
@@ -40,6 +40,9 @@ pub struct Cli {
     /// Print the team proposal as JSON and exit.
     #[arg(long, conflicts_with_all = ["resume", "detached", "review_plan", "fixed_team"])]
     pub plan_only: bool,
+    /// Select the output format for --plan-only.
+    #[arg(long, value_enum, requires = "plan_only")]
+    pub plan_format: Option<PlanFormat>,
     /// Review and refine the team proposal in the TUI before starting.
     #[arg(long, conflicts_with_all = ["headless", "detached", "resume"])]
     pub review_plan: bool,
@@ -162,6 +165,12 @@ pub struct Cli {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+pub enum PlanFormat {
+    Json,
+    Toml,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 pub enum ControlOperation {
     Status,
     Pause,
@@ -171,7 +180,7 @@ pub enum ControlOperation {
     AddWorker,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
     goal: Option<String>,
@@ -194,14 +203,14 @@ struct FileConfig {
     skills: BTreeMap<String, Skill>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Skill {
     pub directory: PathBuf,
     pub description: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServer {
     pub command: PathBuf,
@@ -296,7 +305,7 @@ mod mcp_policy_tests {
     }
 }
 
-#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum McpLifetime {
     #[default]
@@ -308,7 +317,7 @@ fn default_mcp_protocol() -> String {
     "2025-11-25".into()
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Provider {
     pub api: ProviderApi,
@@ -346,7 +355,7 @@ fn valid_effort(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte))
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApi {
     #[default]
@@ -379,7 +388,7 @@ struct RoleConfig {
     reasoning_effort: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Orchestration {
     pub max_plan_attempts: usize,
@@ -394,8 +403,8 @@ pub struct Orchestration {
     pub parallel_stakeholders: bool,
     pub max_parallel_agents: usize,
     pub require_task_graph: bool,
-    pub stage_workspace: bool,
-    pub verification_commands: Vec<String>,
+    pub stage_workspace: Option<bool>,
+    pub verification_commands: Option<Vec<String>>,
     pub worker_system_prompt: Option<String>,
     pub reviewer_system_prompt: Option<String>,
     pub project_instructions: bool,
@@ -417,8 +426,8 @@ impl Default for Orchestration {
             parallel_stakeholders: true,
             max_parallel_agents: 8,
             require_task_graph: false,
-            stage_workspace: false,
-            verification_commands: Vec::new(),
+            stage_workspace: None,
+            verification_commands: None,
             worker_system_prompt: None,
             reviewer_system_prompt: None,
             project_instructions: true,
@@ -429,7 +438,7 @@ impl Default for Orchestration {
     }
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Constraints {
     required_tools: Vec<String>,
@@ -660,8 +669,8 @@ impl Config {
                 "stakeholders": names(&self.stakeholders),
             },
             "staging": {
-                "enabled": limits.stage_workspace,
-                "verification_commands": limits.verification_commands,
+                "enabled": limits.stage_workspace.unwrap_or_default(),
+                "verification_commands": limits.verification_commands.as_deref().unwrap_or_default(),
             },
             "instructions": {
                 "enabled": limits.project_instructions,
@@ -734,9 +743,87 @@ impl Config {
         Ok(cwd)
     }
 
+    pub fn export_campaign(&self, draft: &crate::setup::Draft) -> Result<String> {
+        let endpoint = reqwest::Url::parse(&self.endpoint).context("parse export endpoint")?;
+        ensure!(
+            self.provider.headers.is_empty()
+                && endpoint.username().is_empty()
+                && endpoint.password().is_none()
+                && endpoint.query().is_none()
+                && endpoint.fragment().is_none(),
+            "TOML export requires an endpoint without embedded credentials or query parameters and a profile without custom provider headers. Use the JSON preview for this profile."
+        );
+        let mut orchestration = self.orchestration.clone();
+        orchestration.require_task_graph |=
+            !draft.workers.is_empty() && !draft.acceptance.is_empty();
+        if let Some(execution) = &draft.execution {
+            orchestration.stage_workspace = Some(execution.stage_workspace);
+            orchestration.max_parallel_agents = execution.max_parallel_agents;
+            orchestration.verification_commands = Some(execution.verification_commands.clone());
+        }
+        let mut goal = draft.goal.clone();
+        if !draft.acceptance.is_empty() {
+            goal.push_str("\n\nStartup acceptance criteria:\n");
+            goal.push_str(&draft.acceptance.join("\n"));
+        }
+        if let Some(campaign) = &draft.campaign {
+            goal.push_str("\n\nDraft campaign for coordination:\n");
+            goal.push_str(&serde_json::to_string_pretty(campaign)?);
+        }
+        let file = FileConfig {
+            goal: Some(goal),
+            cwd: Some(self.cwd.clone()),
+            endpoint: Some(self.endpoint.clone()),
+            api_key: None,
+            model: (self.reviewer_model == self.worker_model).then(|| self.worker_model.clone()),
+            context_window: Some(self.context_window),
+            output_tokens: Some(self.output_tokens),
+            legacy_max_tokens: self.legacy_max_tokens,
+            provider: self.provider.clone(),
+            worker: RoleConfig {
+                model: (self.reviewer_model != self.worker_model)
+                    .then(|| self.worker_model.clone()),
+                reasoning_effort: self.worker_effort.clone(),
+            },
+            reviewer: RoleConfig {
+                model: (self.reviewer_model != self.worker_model)
+                    .then(|| self.reviewer_model.clone()),
+                reasoning_effort: self.reviewer_effort.clone(),
+            },
+            orchestration,
+            constraints: self.constraints.clone(),
+            stakeholders: draft.stakeholders.clone(),
+            reviewers: draft.reviewers.clone(),
+            workers: draft.workers.clone(),
+            mcp_servers: self.mcp_servers.clone(),
+            skills: self.skills.clone(),
+        };
+        let text = toml::to_string_pretty(&file).context("encode campaign profile")?;
+        ensure!(
+            self.api_key.as_ref().is_none_or(|key| !text.contains(key)),
+            "generated profile contains the configured API key"
+        );
+        // Ignore environment-backed argument overrides while checking the exported profile.
+        let cli = Cli::command().try_get_matches_from(["ra"])?;
+        let mut cli = Cli::from_arg_matches(&cli)?;
+        cli.endpoint = None;
+        cli.api_key = None;
+        cli.model = None;
+        cli.context_window = None;
+        Self::resolve(
+            cli,
+            toml::from_str(&text).context("decode exported campaign profile")?,
+        )?;
+        Ok(text)
+    }
+
     pub fn load(mut cli: Cli) -> Result<Self> {
         cli.config = Self::profile(cli.config.as_deref());
-        let mut file = Self::read_file(cli.config.as_deref())?;
+        let file = Self::read_file(cli.config.as_deref())?;
+        Self::resolve(cli, file)
+    }
+
+    fn resolve(cli: Cli, mut file: FileConfig) -> Result<Self> {
         ensure!(
             file.mcp_servers.len() <= 16,
             "configure at most 16 MCP servers"
@@ -841,15 +928,18 @@ impl Config {
             orchestration.max_run_secs = limit;
         }
         ensure!(file.workers.len() <= 64, "configure at most 64 workers");
+        let commands = orchestration
+            .verification_commands
+            .as_deref()
+            .unwrap_or_default();
         ensure!(
-            !orchestration.stage_workspace || !orchestration.verification_commands.is_empty(),
+            !orchestration.stage_workspace.unwrap_or_default() || !commands.is_empty(),
             "staged execution requires 1–16 nonempty verification commands of at most 4096 bytes each"
         );
         // Direct runs check the same commands in the live workspace.
         ensure!(
-            orchestration.verification_commands.len() <= 16
-                && orchestration
-                    .verification_commands
+            commands.len() <= 16
+                && commands
                     .iter()
                     .all(|command| !command.trim().is_empty() && command.len() <= 4096),
             "verification_commands accepts up to 16 nonempty commands of at most 4096 bytes each"

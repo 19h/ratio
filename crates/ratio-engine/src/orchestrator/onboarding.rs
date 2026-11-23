@@ -381,7 +381,7 @@ impl Orchestrator<'_> {
     ) -> PanelOptions<'a> {
         PanelOptions {
             access: Access::Inspect,
-            width: self.config.orchestration.max_parallel_agents,
+            width: self.parallel_limit.get(),
             ipc,
             tolerate_failures: false,
             gate,
@@ -565,7 +565,12 @@ impl Orchestrator<'_> {
                     &roster,
                     frozen.ownership,
                 )
-                .bind_graph(frozen.graph, session.cycle, &roster);
+                .bind_graph(frozen.graph, session.cycle, &roster)
+                .bind_checks(
+                    previous.additional_checks.clone(),
+                    session.cycle,
+                    &roster,
+                );
                 Ok(WorkerOnboarding {
                     worker,
                     plan,

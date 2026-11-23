@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use ra::{
     budget::Budget,
-    config::{Cli, Config, ControlOperation},
+    config::{Cli, Config, ControlOperation, PlanFormat},
     control,
     events::{GenerationControl, LiveGenerations, Reporter},
     orchestrator::Orchestrator,
@@ -182,6 +182,7 @@ async fn run(mut cli: Cli) -> Result<u8> {
     let managed = cli.managed_run;
     let dashboard_managed = cli.dashboard_managed;
     let plan_only = cli.plan_only;
+    let plan_format = cli.plan_format;
     let check_mcp = cli.check_mcp.clone();
     let check_provider = cli.check_provider;
     let config = Config::load(cli)?;
@@ -208,7 +209,10 @@ async fn run(mut cli: Cli) -> Result<u8> {
         let api = ra::api::Api::new(&config, Reporter::Terminal, budget)?;
         let proposal =
             ra::setup::refine(&config, &api, &draft, "Propose the team for this request.").await?;
-        println!("{}", serde_json::to_string_pretty(&proposal)?);
+        match plan_format.unwrap_or(PlanFormat::Json) {
+            PlanFormat::Json => println!("{}", serde_json::to_string_pretty(&proposal)?),
+            PlanFormat::Toml => print!("{}", config.export_campaign(&proposal)?),
+        }
         return Ok(0);
     }
     let store = Store::open(&config.cwd)?;

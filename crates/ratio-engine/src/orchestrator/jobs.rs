@@ -464,6 +464,7 @@ impl Orchestrator<'_> {
                 author: &actor,
                 final_review: false,
                 plan_workers: None,
+                campaign_execution: None,
                 ownership: None,
                 workspace: &job.workspace,
                 allow_approval: false,
@@ -550,7 +551,7 @@ impl Orchestrator<'_> {
         let book = context.scope.book;
         let actor = peer.author;
         let mut active = FuturesUnordered::new();
-        let width = self.config.orchestration.max_parallel_agents;
+        let width = self.parallel_limit.get();
         let control = self.reporter.generation_control();
         let paused = || control.as_ref().is_some_and(|state| state.borrow().paused);
         loop {

@@ -1,3 +1,7 @@
+mod campaign;
+
+pub use campaign::{Campaign, Check, Execution};
+
 use std::collections::HashSet;
 
 use anyhow::{Context, Result, ensure};
@@ -22,6 +26,10 @@ pub struct Draft {
     #[serde(default)]
     pub acceptance: Vec<String>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<Campaign>,
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<Execution>,
 }
 
 impl Draft {
@@ -33,14 +41,29 @@ impl Draft {
             workers: config.workers.clone(),
             acceptance: Vec::new(),
             message: String::new(),
+            campaign: None,
+            execution: None,
         }
     }
 
     pub fn into_session(self) -> Session {
-        let mut session = Session::new(self.goal);
+        let mut session = Session::new(self.goal.clone());
+        self.apply(&mut session);
+        session
+    }
+
+    pub(crate) fn apply(self, session: &mut Session) {
+        session.goal = self.goal;
+        if let Some(campaign) = &self.campaign {
+            session.dialogue.task.push_str(&format!(
+                "\nDraft campaign for coordination:\n{}",
+                serde_json::to_string(campaign).expect("serializable campaign")
+            ));
+        }
+        session.campaign_execution = self.execution;
         session.stakeholders = Some(self.stakeholders);
         session.reviewers = Some(self.reviewers);
-        session.require_task_graph = !self.acceptance.is_empty() && !self.workers.is_empty();
+        session.require_task_graph |= !self.acceptance.is_empty() && !self.workers.is_empty();
         if !self.acceptance.is_empty() {
             session.dialogue.task.push_str(&format!(
                 "\nStartup acceptance criteria:\n{}",
@@ -49,25 +72,50 @@ impl Draft {
         }
         session.workers = Some(self.workers);
         session.team_acceptance = self.acceptance;
-        session
     }
 }
 
 pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Result<Draft> {
     let generate = !config.fixed_team && config.workers.is_empty();
+    let facts = if generate {
+        let workspace = config.cwd.clone();
+        let discover_checks = config.orchestration.verification_commands.is_none();
+        let detect_staging = config.orchestration.stage_workspace.is_none();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                campaign::WorkspaceFacts::read(&workspace, discover_checks, detect_staging)
+            })
+            .await?,
+        )
+    } else {
+        None
+    };
+    let capabilities = facts.as_ref().map(|facts| json!({
+        "check_catalog": facts.checks,
+        "configured_checks": config.orchestration.verification_commands,
+        "staging_override": config.orchestration.stage_workspace,
+        "git_root_with_head": facts.git_root_with_head,
+        "max_parallel_agents": config.orchestration.max_parallel_agents,
+        "inspection_shell": config.orchestration.allow_inspection_shell,
+        "mcp_servers": config.mcp_servers.iter().map(|(name, server)| json!({
+            "name": name, "inspection_tools": server.inspection_tools,
+            "work_tools": server.tools, "allow_all": server.allow_all, "deny_tools": server.deny_tools,
+        })).collect::<Vec<_>>(),
+    }));
     let worker_prompt = if generate {
         format!(
-            "Include workers, an array of 1 to {} objects with name and persona. The persona assigns independent work and preliminary write scope. Include acceptance, an array of explicit project acceptance criteria. Prefer a single worker for tightly coupled tasks.",
-            config.orchestration.max_parallel_agents
+            "Include 1 to 64 workers with name and persona, project acceptance criteria, and a campaign object with draft tasks, ownership, rationale, and supported settings. Roster size and concurrent slot count are separate.\nWorkspace capabilities: {}",
+            capabilities.as_ref().expect("generation capabilities")
         )
     } else {
         "Retain the configured workers. Include project acceptance criteria in an acceptance array."
             .into()
     };
     let instructions = Message::system(format!(
-        "Help the user plan a Ratio coding task. Refine the goal to describe the requested outcome, scope and acceptance criteria. A lead reviewer is built in. Add specialist reviewers and stakeholders when distinct expertise would help. Reviewers check evidence and report findings. Stakeholders advise on domain requirements. They can participate in planning and/or review. Preserve configured reviewers and stakeholders. Never perform the work.\n\
+        "{}\nPreserve configured reviewers and stakeholders.\n\
          Include goal, reviewers, stakeholders, and message. goal and message are strings. reviewers and stakeholders are arrays, which may be empty, of objects with name, persona (the participant description), phases (an array of planning and/or review), and optional agent with a model string. Return the full current proposal after each refinement. Put your response or question in message.\n\
          {worker_prompt}\n{}\nWorkspace: {}\nConfigured constraints:\n{}{}",
+        campaign::ARCHITECT,
         if generate {
             "Return the proposal by calling submit_team alone."
         } else {
@@ -85,7 +133,7 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
     let mut correction = None;
     let mut repairs = 0;
     let schemas = if generate {
-        vec![team_schema(config.orchestration.max_parallel_agents)]
+        vec![team_schema()]
     } else {
         Vec::new()
     };
@@ -154,7 +202,7 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
                     "proposal plus configured participants exceeds the 64-person panel limit"
                 );
                 ensure!(
-                    (1..=config.orchestration.max_parallel_agents).contains(&draft.workers.len()),
+                    (1..=64).contains(&draft.workers.len()),
                     "return a worker roster within the requested count"
                 );
                 ensure!(
@@ -178,7 +226,13 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
                         "each worker needs a unique name and assignment"
                     );
                 }
+                draft.execution = Some(facts.as_ref().expect("generation facts").resolve(
+                    config,
+                    draft.campaign.as_ref(),
+                    &draft.workers,
+                )?);
             } else {
+                draft.campaign = None;
                 draft.workers.clone_from(&config.workers);
             }
             Ok(draft)
@@ -195,7 +249,7 @@ pub async fn refine(config: &Config, api: &Api, draft: &Draft, user: &str) -> Re
     }
 }
 
-fn team_schema(max_workers: usize) -> Value {
+fn team_schema() -> Value {
     let participant = json!({"type":"object","properties":{
         "name":{"type":"string"},"persona":{"type":"string"},"phases":{"type":"array","minItems":1,
         "items":{"type":"string","enum":["planning","review"]}}},"required":["name","persona","phases"]});
@@ -204,8 +258,22 @@ fn team_schema(max_workers: usize) -> Value {
         "goal":{"type":"string"},"message":{"type":"string"},
         "stakeholders":{"type":"array","items":participant},
         "reviewers":{"type":"array","items":participant},
-        "workers":{"type":"array","minItems":1,"maxItems":max_workers,"items":{"type":"object","properties":{"name":{"type":"string"},"persona":{"type":"string"}},"required":["name","persona"]}},
-        "acceptance":{"type":"array","minItems":1,"items":{"type":"string"}}},
+        "workers":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"object","properties":{"name":{"type":"string"},"persona":{"type":"string"}},"required":["name","persona"]}},
+        "acceptance":{"type":"array","minItems":1,"items":{"type":"string"}},
+        "campaign":{"type":"object","additionalProperties":false,"properties":{
+            "tasks":{"type":"array","maxItems":64,"items":{"type":"object","additionalProperties":false,
+                "properties":{"id":{"type":"string"},"worker":{"type":"string"},"description":{"type":"string"},
+                    "depends_on":{"type":"array","items":{"type":"string"}},
+                    "acceptance":{"type":"array","items":{"type":"string"}}},
+                "required":["id","worker","description","depends_on","acceptance"]}},
+            "ownership":{"type":"object","description":"Map each worker_N to an array of {path, directory} entries.",
+                "additionalProperties":{"type":"array","items":{"type":"object","additionalProperties":false,
+                    "properties":{"path":{"type":"string"},"directory":{"type":"boolean"}},"required":["path","directory"]}}},
+            "rationale":{"type":"string"},
+            "verification_checks":{"type":"array","items":{"type":"string"}},
+            "prefer_staging":{"type":"boolean"},
+            "max_parallel_agents":{"type":"integer","minimum":1}
+        },"required":["tasks","ownership","rationale"]}},
         "required":["goal","message","stakeholders","reviewers","workers","acceptance"]}}})
 }
 

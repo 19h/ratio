@@ -1,5 +1,9 @@
 use std::{
-    borrow::Cow, cell::RefCell, collections::HashSet, path::Path, sync::mpsc::Receiver,
+    borrow::Cow,
+    cell::{Cell, RefCell},
+    collections::HashSet,
+    path::Path,
+    sync::mpsc::Receiver,
     time::Duration,
 };
 
@@ -39,6 +43,7 @@ pub struct Orchestrator<'a> {
     mcp: crate::tools::mcp::Connections,
     /// Project instruction text pinned for the run being driven.
     instructions: RefCell<Option<String>>,
+    parallel_limit: Cell<usize>,
 }
 
 impl<'a> Orchestrator<'a> {
@@ -56,6 +61,7 @@ impl<'a> Orchestrator<'a> {
             budget,
             mcp: crate::tools::mcp::Connections::new(config.resume),
             instructions: RefCell::new(None),
+            parallel_limit: Cell::new(config.orchestration.max_parallel_agents),
         })
     }
 
@@ -79,34 +85,15 @@ impl<'a> Orchestrator<'a> {
         if !self.config.resume {
             self.store.archive_old_checkpoint()?;
         }
-        let resume_staging = session.budget_started;
         session.stopped = None;
         if !session.budget_started {
             session.require_task_graph |= self.config.orchestration.require_task_graph;
-            // Pinned once so resumed requests and every agent see the same text.
             session.instructions = self.config.project_instructions();
+            session.workspace_prepared = Some(false);
         }
         self.instructions.replace(session.instructions.clone());
-        if !resume_staging {
-            // Commands are pinned at the start, so a resumed run keeps its checks.
-            let commands = self.config.orchestration.verification_commands.clone();
-            if self.config.orchestration.stage_workspace {
-                session.staging_commands = Some(commands);
-            } else if !commands.is_empty() {
-                session.verification_commands = Some(commands);
-            }
-        }
-        let staging = if session.staging_commands.is_some() {
-            let cwd = self.config.cwd.clone();
-            let id = session.run_id().to_owned();
-            Some(
-                tokio::task::spawn_blocking(move || Staging::open(&cwd, &id, resume_staging))
-                    .await??,
-            )
-        } else {
-            None
-        };
         if session.phase == Phase::Publish {
+            let staging = self.prepare_workspace(&mut session).await?;
             if let Err(error) = self.publish(&mut session, staging.as_ref()) {
                 self.store.mark_stopped(session.run_id(), RunStop::Failed)?;
                 return Err(error);
@@ -133,7 +120,7 @@ impl<'a> Orchestrator<'a> {
         self.store.save(&session)?;
         let run_id = session.run_id().to_owned();
         let deadline = self.budget.until_exhausted();
-        let run = self.run_inner(session, guidance, staging.as_ref());
+        let run = self.run_inner(session, guidance);
         tokio::pin!(run, deadline);
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let outcome = loop {
@@ -176,14 +163,81 @@ impl<'a> Orchestrator<'a> {
         outcome
     }
 
+    async fn prepare_workspace(&self, session: &mut Session) -> Result<Option<Staging>> {
+        let prepared = session.workspace_prepared.unwrap_or(session.budget_started);
+        if !prepared {
+            let limits = &self.config.orchestration;
+            let (staged, commands) = session.campaign_execution.as_ref().map_or_else(
+                || {
+                    (
+                        limits.stage_workspace.unwrap_or_default(),
+                        limits.verification_commands.clone().unwrap_or_default(),
+                    )
+                },
+                |execution| {
+                    (
+                        execution.stage_workspace,
+                        execution.verification_commands.clone(),
+                    )
+                },
+            );
+            session.staging_commands = staged.then(|| commands.clone());
+            session.verification_commands = (!staged && !commands.is_empty()).then_some(commands);
+        }
+        let staging = if session.staging_commands.is_some() {
+            let workspace = self.config.cwd.clone();
+            let run_id = session.run_id().to_owned();
+            Some(
+                tokio::task::spawn_blocking(move || Staging::open(&workspace, &run_id, prepared))
+                    .await??,
+            )
+        } else {
+            None
+        };
+        if !prepared {
+            session.workspace_prepared = Some(true);
+            self.store.save(session)?;
+        }
+        Ok(staging)
+    }
+
+    fn freeze_campaign_plan(session: &mut Session, plan: FrozenSubmission) -> Result<String> {
+        let workers = session
+            .workers
+            .as_deref()
+            .context("missing worker roster")?;
+        for check in plan.additional_checks {
+            if !session
+                .frozen_campaign_checks
+                .iter()
+                .any(|existing| existing.id == check.id)
+            {
+                session.frozen_campaign_checks.push(check);
+            }
+        }
+        let frozen = WorkerPlan::freeze(
+            plan.text,
+            session.cycle,
+            session.plan_attempt,
+            workers,
+            plan.ownership,
+        )
+        .bind_graph(plan.graph, session.cycle, workers)
+        .bind_checks(
+            session.frozen_campaign_checks.clone(),
+            session.cycle,
+            workers,
+        );
+        let text = frozen.text.clone();
+        session.worker_plan = Some(frozen);
+        Ok(text)
+    }
+
     async fn run_inner(
         &self,
         mut session: Session,
         guidance: Option<Receiver<String>>,
-        staging: Option<&Staging>,
     ) -> Result<Session> {
-        let candidate = staging.map(Staging::candidate);
-        let workspace = candidate.as_deref().unwrap_or(&self.config.cwd);
         session.jobs.recover(self.job_limit())?;
         if session.dialogue.recover_interrupted_tool()? {
             self.progress("[resume] Recovered an interrupted tool call");
@@ -201,30 +255,33 @@ impl<'a> Orchestrator<'a> {
             )
             .await?;
             session.request = Some(session.goal.clone());
-            session.goal.clone_from(&proposal.goal);
-            session.require_task_graph = true;
-            session.workers = Some(proposal.workers.clone());
-            session.reviewers = Some(proposal.reviewers.clone());
-            session.stakeholders = Some(proposal.stakeholders.clone());
-            session.team_acceptance.clone_from(&proposal.acceptance);
-            let proposal_text = serde_json::to_string_pretty(&proposal)?;
+            let proposal_text = self.api.redact(&serde_json::to_string_pretty(&proposal)?);
+            let worker_count = proposal.workers.len();
+            proposal.apply(&mut session);
             session
                 .dialogue
-                .task
-                .push_str(&format!("\nStartup team proposal:\n{proposal_text}"));
-            session.dialogue.audit_note(
-                "lead_reviewer",
-                "proposal",
-                &self.api.redact(&proposal_text),
-            );
+                .audit_note("lead_reviewer", "proposal", &proposal_text);
             session.phase = Phase::Plan;
             self.store.save(&session)?;
             self.reporter.emit(
                 Kind::Agent,
-                format!("Proposed team / {} workers", proposal.workers.len()),
+                format!("Proposed team / {worker_count} workers"),
                 &proposal_text,
             );
         }
+        let ceiling = self.config.orchestration.max_parallel_agents;
+        self.parallel_limit.set(
+            session
+                .campaign_execution
+                .as_ref()
+                .map_or(ceiling, |execution| {
+                    execution.max_parallel_agents.min(ceiling)
+                }),
+        );
+        let prepared = self.prepare_workspace(&mut session).await?;
+        let staging = prepared.as_ref();
+        let candidate = staging.map(Staging::candidate);
+        let workspace = candidate.as_deref().unwrap_or(&self.config.cwd);
         session
             .stakeholders
             .get_or_insert_with(|| self.config.stakeholders.clone());
@@ -317,6 +374,20 @@ impl<'a> Orchestrator<'a> {
                             system.push_str("\nInclude one task per worker, explicit predecessor task IDs, and concrete acceptance criteria.");
                         }
                     }
+                    if phase == Phase::FreezePlan && !session.frozen_campaign_checks.is_empty() {
+                        system.push_str(&format!(
+                            "\nPreviously frozen verification checks are retained: {}",
+                            serde_json::to_string(&session.frozen_campaign_checks)?
+                        ));
+                    }
+                    let campaign_execution = session.campaign_execution.clone();
+                    if phase == Phase::FreezePlan
+                        && let Some(execution) = &campaign_execution
+                        && !execution.available_checks.is_empty()
+                    {
+                        system.push_str(&format!("\nStartup verification commands are retained. You may add verification_checks by catalog ID: {}",
+                            serde_json::to_string(&execution.available_checks)?));
+                    }
                     let mut repairs = 0;
                     let book = session.jobs.clone();
                     let workers = session.workers.clone().unwrap_or_default();
@@ -390,6 +461,7 @@ impl<'a> Orchestrator<'a> {
                             plan_workers: (phase == Phase::FreezePlan)
                                 .then_some(workers.as_slice()),
                             ownership: None,
+                            campaign_execution: campaign_execution.as_ref(),
                             workspace,
                             require_task_graph: session.require_task_graph,
                             repairing: repairs > 0,
@@ -428,25 +500,7 @@ impl<'a> Orchestrator<'a> {
                                     .clone();
                             }
                             Step::Plan(plan) => {
-                                let workers = session
-                                    .workers
-                                    .as_deref()
-                                    .context("missing worker roster")?;
-                                let frozen = WorkerPlan::freeze(
-                                    plan.text,
-                                    session.cycle,
-                                    session.plan_attempt,
-                                    workers,
-                                    plan.ownership,
-                                );
-                                session.worker_plan =
-                                    Some(frozen.bind_graph(plan.graph, session.cycle, workers));
-                                break session
-                                    .worker_plan
-                                    .as_ref()
-                                    .expect("recorded plan")
-                                    .text
-                                    .clone();
+                                break Self::freeze_campaign_plan(&mut session, plan)?;
                             }
                             Step::Repair(message) => {
                                 self.store.save(&session)?;
@@ -459,21 +513,7 @@ impl<'a> Orchestrator<'a> {
                                     let plan = self
                                         .recover_plan(&session, workspace, workers, &message)
                                         .await?;
-                                    let frozen = WorkerPlan::freeze(
-                                        plan.text,
-                                        session.cycle,
-                                        session.plan_attempt,
-                                        workers,
-                                        plan.ownership,
-                                    )
-                                    .bind_graph(
-                                        plan.graph,
-                                        session.cycle,
-                                        workers,
-                                    );
-                                    let text = frozen.text.clone();
-                                    session.worker_plan = Some(frozen);
-                                    break text;
+                                    break Self::freeze_campaign_plan(&mut session, plan)?;
                                 }
                                 ensure!(
                                     repairs < 2,
@@ -530,6 +570,17 @@ impl<'a> Orchestrator<'a> {
             } else {
                 session.verification_commands.clone()
             };
+            let mut commands = commands;
+            if phase == Phase::Work
+                && let Some(plan) = &session.worker_plan
+                && !plan.additional_checks.is_empty()
+            {
+                commands.get_or_insert_with(Vec::new).extend(
+                    plan.additional_checks
+                        .iter()
+                        .map(|check| check.command.clone()),
+                );
+            }
             let response = if let Some(commands) = commands {
                 let receipt = self.verify(staging, &commands).await?;
                 let subject = if staging.is_some() {
@@ -907,7 +958,7 @@ impl<'a> Orchestrator<'a> {
                 .plan_workers
                 .filter(|_| call.function.name == "submit_plan")
             {
-                let plan = parse_plan(&call, workers, peer.workspace, peer.require_task_graph)?;
+                let plan = parse_campaign_plan(&call, workers, peer)?;
                 self.reporter.agent(
                     peer.author,
                     Kind::Tool,
@@ -1064,7 +1115,14 @@ impl<'a> Orchestrator<'a> {
             schemas.push(verdict_schema());
         }
         if let Some(workers) = peer.plan_workers {
-            schemas.push(plan_schema(workers.len(), peer.require_task_graph));
+            let mut schema = plan_schema(workers.len(), peer.require_task_graph);
+            if let Some(execution) = peer.campaign_execution
+                && !execution.available_checks.is_empty()
+            {
+                schema["function"]["parameters"]["properties"]["verification_checks"] = json!({"type":"array", "uniqueItems":true, "items":{"type":"string",
+                        "enum":execution.available_checks.iter().map(|check| &check.id).collect::<Vec<_>>()}});
+            }
+            schemas.push(schema);
         }
         if wrap_up {
             schemas.retain(|schema| {
@@ -1307,9 +1365,7 @@ impl<'a> Orchestrator<'a> {
                         .any(|call| call.function.name == "submit_plan")
             }) {
                 if let [call] = tool_calls.as_slice() {
-                    if let Err(error) =
-                        parse_plan(call, workers, peer.workspace, peer.require_task_graph)
-                    {
+                    if let Err(error) = parse_campaign_plan(call, workers, peer) {
                         return Ok(repair(dialogue, format!("submit_plan: {error:#}")));
                     }
                 } else {
@@ -1466,7 +1522,7 @@ impl<'a> Orchestrator<'a> {
             agent.failed = mailbox.is_closed(index);
         }
         let width = if self.config.orchestration.parallel_stakeholders {
-            self.config.orchestration.max_parallel_agents
+            self.parallel_limit.get()
         } else {
             1
         };
@@ -1575,8 +1631,7 @@ impl<'a> Orchestrator<'a> {
                 };
                 let mut jobs_changed = false;
                 if !paused() {
-                    jobs_changed |=
-                        scheduler.start_tools(self.config.orchestration.max_parallel_agents);
+                    jobs_changed |= scheduler.start_tools(self.parallel_limit.get());
                     if scheduler.specialist_first() {
                         let free = options
                             .width
@@ -1895,6 +1950,7 @@ impl<'a> Orchestrator<'a> {
             author: mailbox.id(sender),
             final_review: false,
             plan_workers: None,
+            campaign_execution: None,
             ownership: options
                 .ownership
                 .and_then(|paths| paths.get(sender).map(Vec::as_slice)),
@@ -2158,6 +2214,10 @@ impl<'a> Orchestrator<'a> {
             if let Some(plan) = approved {
                 role.push_str("\nFrozen ownership by worker number, in roster order:\n");
                 role.push_str(&serde_json::to_string(&plan.ownership)?);
+                if !plan.additional_checks.is_empty() {
+                    role.push_str("\nAdditional frozen verification checks:\n");
+                    role.push_str(&serde_json::to_string(&plan.additional_checks)?);
+                }
                 if let Some(graph) = &plan.graph {
                     role.push_str("\nFrozen task graph and acceptance criteria:\n");
                     role.push_str(&serde_json::to_string(graph)?);
@@ -2248,7 +2308,7 @@ impl<'a> Orchestrator<'a> {
             } else {
                 Access::Inspect
             },
-            width: self.config.orchestration.max_parallel_agents,
+            width: self.parallel_limit.get(),
             ipc: ipc_enabled,
             tolerate_failures: false,
             gate: gate.as_ref(),
@@ -2643,6 +2703,7 @@ struct PeerTools<'a> {
     author: &'a str,
     final_review: bool,
     plan_workers: Option<&'a [Worker]>,
+    campaign_execution: Option<&'a crate::setup::Execution>,
     ownership: Option<&'a [WritePath]>,
     workspace: &'a Path,
     allow_approval: bool,
@@ -2777,6 +2838,7 @@ struct FrozenSubmission {
     text: String,
     ownership: Vec<Vec<WritePath>>,
     graph: Option<TaskGraph>,
+    additional_checks: Vec<crate::setup::Check>,
 }
 
 fn plan_schema(worker_count: usize, require_graph: bool) -> Value {
@@ -2814,6 +2876,51 @@ fn plan_schema(worker_count: usize, require_graph: bool) -> Value {
             .push(json!("tasks"));
     }
     schema
+}
+
+fn parse_campaign_plan(
+    call: &crate::api::ToolCall,
+    workers: &[Worker],
+    peer: PeerTools<'_>,
+) -> Result<FrozenSubmission> {
+    let mut arguments: serde_json::Map<String, Value> =
+        crate::api::tool_arguments(&call.function.arguments)?;
+    let Some(selection) = arguments.remove("verification_checks") else {
+        return parse_plan(call, workers, peer.workspace, peer.require_task_graph);
+    };
+    let execution = peer
+        .campaign_execution
+        .context("verification checks are not configurable in this run")?;
+    ensure!(
+        !execution.available_checks.is_empty(),
+        "verification check catalog is empty"
+    );
+    let ids: Vec<String> = serde_json::from_value(selection)?;
+    let mut checks = execution.additional_checks(&ids)?;
+    checks.retain(|check| !execution.verification_commands.contains(&check.command));
+    let mut call = call.clone();
+    call.function.arguments = serde_json::to_string(&arguments)?;
+    let mut plan = parse_plan(&call, workers, peer.workspace, peer.require_task_graph)?;
+    plan.additional_checks = checks;
+    Ok(plan)
+}
+
+pub(crate) fn validate_campaign_plan(
+    graph: &TaskGraph,
+    ownership: &std::collections::BTreeMap<String, Vec<WritePath>>,
+    workers: &[Worker],
+    workspace: &Path,
+) -> Result<()> {
+    let call = serde_json::from_value(json!({
+        "id": "draft",
+        "type": "function",
+        "function": {
+            "name": "submit_plan",
+            "arguments": json!({"plan":"Draft campaign", "tasks":graph, "ownership":ownership}).to_string()
+        }
+    }))?;
+    parse_plan(&call, workers, workspace, true)?;
+    Ok(())
 }
 
 fn parse_plan(
@@ -2969,5 +3076,6 @@ fn parse_plan(
         text: input.plan,
         ownership,
         graph: input.tasks,
+        additional_checks: Vec::new(),
     })
 }

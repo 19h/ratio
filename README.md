@@ -186,6 +186,17 @@ ra -C /path/to/project --plan-only 'Add a --version flag to the CLI'
 
 `--check-provider` prints one JSON record per model with `ok`, `tool_call`, `latency_ms`, and any provider error. `--plan-only` asks the model to propose a team for the request, prints the proposal as JSON, and exits. A printed proposal means the endpoint, key, model ID, and function calling all work. Neither command writes to the project.
 
+Ratio's built-in Campaign Architect uses the request, the profile's tool policy, and root project manifests to propose a goal, roster, draft task graph, and acceptance gates. During coordination the team can revise dependencies and ownership. Ratio freezes the resulting plan before workers acknowledge it.
+
+If `verification_commands` is omitted, the generated campaign may select declared npm checks, Cargo tests, or Go tests when their runners are available. An explicit list controls verification, including `[]` to disable discovery. If `stage_workspace` is omitted, the campaign may select staging when an executable check is selected and the workspace is the root of a Git worktree with a commit. The configured `max_parallel_agents` remains the concurrency ceiling.
+
+```sh
+ra -C PROJECT --config existing.toml --plan-only --plan-format toml 'Check the migration against the source records' > campaign.toml
+ra -C PROJECT --config campaign.toml --headless
+```
+
+The export captures startup settings, so Ratio still coordinates and freezes the plan on launch. Supply provider credentials through the usual environment or CLI inputs. Profiles with custom provider headers or URL credentials can use the JSON preview.
+
 ### When a run does not start
 
 The start page and the **Start run** dialog report a profile that cannot be loaded. Each run the dashboard starts also writes a log to `PROJECT/.ratio/runner-*.log`. A run that fails after starting shows a **Failure** entry on its Overview.

@@ -127,6 +127,13 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stopped: Option<RunStop>,
     pub(crate) budget_started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) campaign_execution: Option<crate::setup::Execution>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) frozen_campaign_checks: Vec<crate::setup::Check>,
+    /// Records whether the selected execution workspace was opened successfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_prepared: Option<bool>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_task_graph: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,6 +191,8 @@ pub struct WorkerPlan {
     pub attempt: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph: Option<TaskGraph>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) additional_checks: Vec<crate::setup::Check>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -218,6 +227,7 @@ impl WorkerPlan {
             ownership,
             attempt,
             graph: None,
+            additional_checks: Vec::new(),
         };
         plan.id = plan.digest(cycle, workers);
         plan
@@ -230,6 +240,17 @@ impl WorkerPlan {
         workers: &[Worker],
     ) -> Self {
         self.graph = graph;
+        self.id = self.digest(cycle, workers);
+        self
+    }
+
+    pub(crate) fn bind_checks(
+        mut self,
+        checks: Vec<crate::setup::Check>,
+        cycle: usize,
+        workers: &[Worker],
+    ) -> Self {
+        self.additional_checks = checks;
         self.id = self.digest(cycle, workers);
         self
     }
@@ -248,6 +269,12 @@ impl WorkerPlan {
         }
         if let Some(graph) = &self.graph {
             let part = serde_json::to_vec(graph).expect("serializable task graph");
+            sha.update(&(part.len() as u64).to_be_bytes());
+            sha.update(&part);
+        }
+        if !self.additional_checks.is_empty() {
+            let part = serde_json::to_vec(&self.additional_checks).expect("serializable checks");
+            sha.update(b"verification checks");
             sha.update(&(part.len() as u64).to_be_bytes());
             sha.update(&part);
         }
@@ -529,6 +556,9 @@ impl Session {
                     .as_nanos()
             ),
             budget_started: false,
+            campaign_execution: None,
+            frozen_campaign_checks: Vec::new(),
+            workspace_prepared: None,
             require_task_graph: false,
             parent_run_id: None,
             stopped: None,
