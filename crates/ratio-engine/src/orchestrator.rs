@@ -3125,14 +3125,16 @@ fn parse_plan_fields(
     #[serde(deny_unknown_fields)]
     struct Input {
         plan: String,
+        #[serde(deserialize_with = "crate::api::stringified")]
         ownership: BTreeMap<String, Vec<WritePath>>,
+        #[serde(default, deserialize_with = "crate::api::stringified")]
         tasks: Option<TaskGraph>,
     }
     ensure!(
         call.kind == "function" && call.function.name == "submit_plan" && !call.id.is_empty(),
         "expected submit_plan function call with an ID"
     );
-    let mut input: Input = serde_json::from_str(&call.function.arguments)?;
+    let mut input: Input = crate::api::tool_arguments(&call.function.arguments)?;
     ensure!(
         !require_graph || input.tasks.is_some(),
         "submit_plan requires a task graph"
